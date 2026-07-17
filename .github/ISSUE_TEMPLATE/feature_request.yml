@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an improvement without sharing real mail.
+body:
+  - type: markdown
+    attributes:
+      value: "Never attach real archives, messages, bodies, attachments, logs, or private diagnostics."
+  - type: textarea
+    id: need
+    attributes: { label: User need, description: Describe the workflow with synthetic examples. }
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes: { label: Proposed behavior }
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: This request preserves read-only, local-only, sanitization, and remote-content defaults.
+          required: true
