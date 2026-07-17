@@ -1,0 +1,22 @@
+diff --git a/src/msg.cpp b/src/msg.cpp
+--- a/src/msg.cpp
++++ b/src/msg.cpp
+@@ -1 +1,2 @@
+-extern "C" {
++#if 0
++extern "C" {
+@@ -431,0 +433,14 @@
++#else
++extern "C" {
++    #include "define.h"
++    #include "msg.h"
++    #include <stdio.h>
++}
++
++void write_msg_email(char *fname, pst_item* item, pst_file* pst) {
++    (void)fname;
++    (void)item;
++    (void)pst;
++    fprintf(stderr, "readpst: .msg output is disabled in the PST QuickView bundled build. Use EML extraction instead.\n");
++}
++#endif

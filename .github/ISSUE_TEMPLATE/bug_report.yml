@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible problem using synthetic data only.
+body:
+  - type: markdown
+    attributes:
+      value: "Do not upload real PST/EML/MSG files, message bodies, attachments, workspace databases, logs, or private screenshots. Review Diagnostics for paths and private data before sharing a sanitized excerpt."
+  - type: textarea
+    id: summary
+    attributes: { label: Summary, description: "What happened and what did you expect?" }
+    validations: { required: true }
+  - type: textarea
+    id: steps
+    attributes: { label: Sanitized reproduction steps, description: Use synthetic files and omit message content. }
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes: { label: Version and macOS, placeholder: "0.2.0-beta.x, macOS version, CPU" }
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed real mail, attachments, paths, account names, and credentials.
+          required: true

@@ -1,0 +1,51 @@
+# ReadPST/LibPST 0.6.76 Corresponding Source
+
+This directory is the Corresponding Source companion for the ReadPST sidecars
+bundled with PST QuickView. It contains the exact authoritative source archive,
+the local patch, and the build and verification material used for the bundled
+macOS x86_64 and arm64 binaries.
+
+- Component: ReadPST/LibPST 0.6.76
+- Component license: GPL-2.0-or-later
+- Authoritative source: https://www.five-ten-sg.com/libpst/packages/libpst-0.6.76.tar.gz
+- Source SHA-256: `3d291beebbdb48d2b934608bc06195b641da63d2a8f5e0d386f2e9d6d05a0b42`
+- Deployment targets: x86_64 macOS 10.13; arm64 macOS 11.0
+- Public companion location: @PUBLIC_DOWNLOAD_LOCATION@
+
+`LICENSE` is the unmodified GNU GPL version 2 text. The upstream archive also
+retains its own license, author, copyright, and generated-build notices.
+`COPYRIGHT_NOTICES.md` summarizes the principal upstream notices without
+replacing the notices in the archive.
+
+## Local modification
+
+`patches/0001-disable-msg-output.patch` disables ReadPST's optional `.msg`
+writer. PST QuickView invokes ReadPST only for EML extraction, so this removes
+the libgsf/glib requirement from the bundled command-line tool. No other local
+source patches are applied.
+
+## Rebuild
+
+Follow `build/BUILD_INSTRUCTIONS.md`. The exact build script validates the
+source and patch hashes, enforces the recorded Apple clang and SDK versions,
+builds both architecture slices, creates the universal binary, checks the
+version and architecture, rejects non-system dynamic libraries, and stages the
+outputs only after every check succeeds.
+
+`build/verify-macos-readpst-bundle.sh` is the exact repository verifier. It
+loads `scripts/macos-dylib-validation.sh` from this companion, so universal
+Mach-O architecture headers are not mistaken for dylib dependencies.
+`scripts/test-macos-dylib-validation.sh` provides the fixture-based regression
+check for thin, universal, prohibited-dependency, and malformed `otool` output.
+
+`DEPLOYMENT_TARGETS.txt` records the minimum for each standalone binary and
+each universal slice. The universal binary preserves different minimums per
+slice; it does not have one global deployment target.
+
+`SIDECAR_SHA256.txt` identifies the exact sidecars for which this companion was
+prepared. `MANIFEST.sha256` covers every companion file except the manifest
+itself. The deterministic companion archive is accompanied by its own `.sha256`
+file outside this directory.
+
+This source companion does not contain PST QuickView binaries, app bundles,
+DMGs, message files, signing material, private logs, or Git metadata.

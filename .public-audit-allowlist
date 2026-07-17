@@ -1,0 +1,12 @@
+# Extended regular expressions matched against path:line output for privacy-warning scans only.
+# High-confidence credential/auth scans can never be allowlisted. Entries must be anchored to an
+# approved exact path plus [0-9]+ line matcher; audit-public-repo.sh rejects broader path patterns.
+# Keep content matches narrow and explain every intentional public string in a comment.
+# Example: ^README\.md:[0-9]+:security@example\.com$
+# Deprecated aliases retained temporarily for private developer compatibility.
+^src-tauri/src/lib\.rs:[0-9]+:    const RICH_MSG_FIXTURE_LEGACY_ENV: &str = "PST_QUICKVIEW_TREVOR_MSG_FIXTURE";$
+^src-tauri/src/lib\.rs:[0-9]+:    const LEGACY_MSG_FIXTURE_LEGACY_ENV: &str = "PST_QUICKVIEW_FURMAN_MSG_FIXTURE";$
+^scripts/agent-check\.sh:[0-9]+:PST_QUICKVIEW_RICH_MSG_FIXTURE=.*PST_QUICKVIEW_TREVOR_MSG_FIXTURE.*$
+^scripts/agent-check\.sh:[0-9]+:PST_QUICKVIEW_LEGACY_MSG_FIXTURE=.*PST_QUICKVIEW_FURMAN_MSG_FIXTURE.*$
+# The release verifier searches packaged output for these forbidden identifiers.
+^scripts/verify-macos-release\.sh:[0-9]+:.*PST_QUICKVIEW_.*MSG_FIXTURE.*$
