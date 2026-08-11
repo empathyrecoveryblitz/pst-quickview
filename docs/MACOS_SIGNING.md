@@ -1,6 +1,6 @@
 # macOS Signing And Notarization Plan
 
-PST QuickView `0.2.0-beta.3` is an unsigned public-beta candidate. Do not claim it is signed or notarized
+PST QuickView `0.2.0-beta.3` is a published, unsigned public beta. Do not claim it is signed or notarized
 until every verification step below succeeds.
 
 Apple references:

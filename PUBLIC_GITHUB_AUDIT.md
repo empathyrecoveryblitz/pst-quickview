@@ -4,7 +4,7 @@ Audit refreshed: 2026-08-11. Scope: tracked files and all commits reachable from
 
 ## Decision
 
-The sanitized current tree can become a public-beta candidate after the unresolved items below receive human review. **The existing Git history is not safe to publish.** Reachable commits contain private external-drive paths, fixture names/identifiers, and message-derived names or text. Examples include commits `c3ba791225831b90f32c3d0e156a540c81aea94a`, `d94cbc192f6265f1ec99d6de4fe8533e4f64e0b3`, `885ff75104d08f66e4cdfa0cf60cfbbcaa985181`, and `72239a9fce46cab7a6cd3cd2b86c79622139dc04`, affecting historical versions of `README.md`, `AGENTS.md`, tests, scripts, and `src-tauri/src/lib.rs`.
+The sanitized beta.3 tree was exported into fresh public history and published as a prerelease. **The private development history is not safe to publish.** Reachable private commits contain external-drive paths, fixture names/identifiers, and message-derived names or text. Examples include commits `c3ba791225831b90f32c3d0e156a540c81aea94a`, `d94cbc192f6265f1ec99d6de4fe8533e4f64e0b3`, `885ff75104d08f66e4cdfa0cf60cfbbcaa985181`, and `72239a9fce46cab7a6cd3cd2b86c79622139dc04`, affecting historical versions of `README.md`, `AGENTS.md`, tests, scripts, and `src-tauri/src/lib.rs`.
 
 Use a fresh repository created from a reviewed, sanitized export. Keep this repository private as the development archive. Do not publish or rewrite this history without separate backup, review, and explicit approval.
 
@@ -40,12 +40,16 @@ commands, sidecar hashes, x86_64 macOS 10.13 and arm64 macOS 11.0 deployment
 targets, offline companion preparation script, and strict public-release
 verifier are now recorded. The accidental macOS 15.0 sidecar minimum was
 corrected through a verified source rebuild. Technical Corresponding Source
-companion preparation is complete. Public delivery is still
-incomplete until the regenerated companion archive and checksum are uploaded
-beside the DMG at the intended `0.2.0-beta.3` release location. Preparation and
-release verification now reject a stale companion URL. An upstream URL alone remains
-insufficient; see
-`docs/READPST_CORRESPONDING_SOURCE.md`.
+preparation and public delivery are complete for `v0.2.0-beta.3`. The published
+prerelease provides the universal DMG, the exact ReadPST Corresponding Source
+archive, and `SHA256SUMS.txt` together. Public access and the recorded hashes were
+verified after publication: the DMG is
+`b29ed3295e0bbbdcad4bd88621972a609c260601bda34808974c234a8785efad`, and the
+source archive is
+`a858ea017bb80516b42b14da8b624530968c70a6daf5bfc7fad628a631a88787`.
+Preparation and release verification reject a stale companion URL. An upstream
+URL alone remains insufficient; see `docs/READPST_CORRESPONDING_SOURCE.md`.
+The beta.2 tag, release, and assets remain preserved.
 
 ## Security and conduct reporting status
 
@@ -59,12 +63,9 @@ Resolved:
   acknowledgment target, an enforcement procedure, non-retaliation, and conflict handling for a
   report involving the sole maintainer.
 
-## Remaining publication work
+## Remaining post-publication validation
 
-- Upload the approved DMG and matching ReadPST Corresponding Source archive/checksum together.
-- Verify the recorded public download URLs after upload.
 - Complete a clean Intel Mac test without Homebrew or system ReadPST.
 - Complete a clean Apple Silicon Mac test without Homebrew or system ReadPST.
 - Review and approve synthetic screenshots.
-- Make an explicit signing/notarization decision; this candidate remains unsigned and unnotarized.
-- Obtain explicit final publication approval before any push, release, or upload.
+- Revisit signing and notarization for a future release; beta.3 remains unsigned and unnotarized.

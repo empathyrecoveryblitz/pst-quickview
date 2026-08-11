@@ -6,7 +6,7 @@
 
 <p align="center">
   A local-only macOS viewer and search tool for PST, EML, and MSG files.<br>
-  <strong>Current source: v0.2.0-beta.3 release candidate</strong>
+  <strong>Current release: v0.2.0-beta.3</strong>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
 
 PST QuickView provides a focused desktop interface for browsing and searching Outlook PST archives and standalone EML or MSG messages without sending mail data to a cloud service. Original source files remain read-only. PST archives are converted locally into persistent workspaces by the bundled ReadPST / LibPST 0.6.76 tooling, then indexed with SQLite and FTS5 for navigation and search.
 
-This source version is a beta release candidate. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
+This source version accompanies the published `v0.2.0-beta.3` prerelease. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
 
 ## Screenshots
 
@@ -117,7 +117,7 @@ The packaged beta includes ReadPST; Homebrew is not required to open PST files w
 - Single-PST Messages use cursor pagination. Multi-PST Messages and Conversations remain offset-based.
 - Virtualization bounds mounted DOM rows, but loaded result objects remain in memory until the search resets; page-data eviction is not implemented.
 - Keyboard navigation has source and local testing but is not presented as VoiceOver certification.
-- Broader clean-machine and user testing remain important for this beta candidate.
+- Broader clean-machine and user testing remain important for this beta.
 - PST conversion requires temporary local processing space and leaves a persistent local workspace for extracted EML files and the SQLite index until it is explicitly deleted. Large archives can require significant disk space and initial processing time.
 - Exported attachments remain untrusted files and should be handled with the same care as attachments from any other source.
 - Attachment export is one item at a time, and conversation quality depends on available Message-ID, References, In-Reply-To, participant, and subject data.
@@ -159,6 +159,7 @@ PST QuickView's original source code and application artwork are licensed under 
 See the [copyright notice](COPYRIGHT.md), [third-party notices](THIRD_PARTY_NOTICES.md), included [license texts](LICENSES/), and [ReadPST Corresponding Source documentation](docs/READPST_CORRESPONDING_SOURCE.md) for details.
 
 Every distributed DMG must provide equivalent access to the exact Corresponding Source used for its bundled ReadPST binary; an upstream URL alone is not sufficient.
+The `v0.2.0-beta.3` release publishes the DMG, verified ReadPST Corresponding Source archive, and `SHA256SUMS.txt` together.
 
 ---
 

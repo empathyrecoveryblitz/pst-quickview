@@ -33,10 +33,12 @@ and a clear source download location next to the DMG. An upstream URL alone does
 requirement.
 
 The official GPL version 2 text is included at `LICENSES/GPL-2.0-or-later.txt`. Offline companion
-preparation and verification tooling is complete. Public delivery is not complete until the exact
-generated companion archive and checksum are uploaded at the recorded location beside the DMG;
-that remains a public-binary release blocker. See `docs/READPST_CORRESPONDING_SOURCE.md` and run
-the documented `PUBLIC_RELEASE=1` verification before publication.
+preparation and verification tooling is complete. The `v0.2.0-beta.3` prerelease publishes the exact
+generated companion archive beside the DMG, with both hashes recorded in `SHA256SUMS.txt`. Public
+access to the archive and its SHA-256,
+`a858ea017bb80516b42b14da8b624530968c70a6daf5bfc7fad628a631a88787`, was verified after
+publication. Future binary releases must repeat the documented `PUBLIC_RELEASE=1` verification and
+provide equivalent source access. See `docs/READPST_CORRESPONDING_SOURCE.md`.
 
 ## Application dependencies
 
