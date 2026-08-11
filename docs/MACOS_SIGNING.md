@@ -1,6 +1,6 @@
 # macOS Signing And Notarization Plan
 
-PST QuickView `0.2.0-beta.2` is an unsigned public-beta candidate. Do not claim it is signed or notarized
+PST QuickView `0.2.0-beta.3` is an unsigned public-beta candidate. Do not claim it is signed or notarized
 until every verification step below succeeds.
 
 Apple references:
@@ -32,7 +32,7 @@ Example paths:
 
 ```sh
 APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app"
-DMG="src-tauri/target/universal-apple-darwin/release/bundle/dmg/PST QuickView_0.2.0-beta.2_universal.dmg"
+DMG="src-tauri/target/universal-apple-darwin/release/bundle/dmg/PST QuickView_0.2.0-beta.3_universal.dmg"
 IDENTITY="Developer ID Application: Example Company (TEAMID)"
 ```
 

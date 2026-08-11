@@ -1,12 +1,14 @@
 import {
   Fragment,
+  useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -19,9 +21,9 @@ import type {
   BackendError,
   CancelImportResult,
   CalendarItemDetails,
-  ConversationListResult,
-  ConversationMessageItem,
+  ConversationCountResult,
   ConversationMessagesResult,
+  ConversationPageResult,
   ConversationSummary,
   ConversationWorkspaceIssue,
   ConversationWorkspaceScope,
@@ -37,13 +39,14 @@ import type {
   ImportProgress,
   MessageDiagnostics,
   MessageDetail,
+  MessageCountResult,
   MessageListItem,
-  MessageListResult,
-  MultiMessageListResult,
+  MessagePageResult,
+  MultiMessageCountResult,
+  MultiMessagePageResult,
   PstOpenPlan,
   ReadpstStatus,
   SavePrintableHtmlResult,
-  SearchFilters,
   SourceEmlView,
   WorkspaceLocationMode,
   WorkspacePreflight,
@@ -52,7 +55,6 @@ import type {
   WorkspaceSummary,
 } from "./types";
 import packageInfo from "../package.json";
-import { conversationParticipantSummary } from "./conversationDisplay";
 import {
   appearanceStorageKey,
   applyAppearance,
@@ -72,17 +74,80 @@ import {
   storedSearchScope,
   type SearchScope,
 } from "./searchScopePreference";
+import {
+  appendUniqueByKey,
+  appliedSearchNonTextKey,
+  appliedSearchTextKey,
+  applySearchSnapshotImmediately,
+  backendSearchFilters,
+  buildAppliedFilterChips,
+  canClearAll,
+  cancellationForGeneration,
+  cancellationForOperation,
+  classifySearchEmptyState,
+  clearAllSearchDraft,
+  clearAppliedSearchSnapshot,
+  commitQueuedSearchSnapshot,
+  createAppliedSearchSnapshot,
+  createMessagePaginationState,
+  createSearchExactCountState,
+  createSearchOperationIdentity,
+  createSearchApplicationState,
+  defaultSearchFilterDraft,
+  emptySearchDraft,
+  getActiveFilterCount,
+  getMessagePaginationMode,
+  getRelevanceAvailability,
+  highlightTermsForSnapshot,
+  invalidateSearchApplication,
+  isAppliedSearchActive,
+  isExpandedConversationResponseCurrent,
+  isSearchCancellationError,
+  isSearchGenerationCurrent,
+  queueTextSearchSnapshot,
+  removeAppliedFilter,
+  replaceAppliedSearchDraft,
+  cursorForMessagePage,
+  settleMessagePagination,
+  settleSearchExactCount,
+  type AppliedFilterChipId,
+  type AppliedSearchSnapshot,
+  type AppliedSearchVersion,
+  type ConversationSearchSort as ConversationSort,
+  type MessageSearchSort as SortOrder,
+  type MessagePaginationMode,
+  type MessagePaginationState,
+  type SearchApplicationState,
+  type SearchDraft,
+  type SearchFilterDraft as AdvancedSearchFilters,
+  type SearchFolderScope as FolderScopeFilter,
+  type SearchExactCountState,
+  type SearchListMode as ListMode,
+  type SearchCancellationRequest,
+  type SearchOperationIdentity,
+} from "./searchRequest";
+import {
+  HighlightedText,
+  MessageResultsList,
+} from "./MessageResultsList";
+import { ConversationResultsList } from "./ConversationResultsList";
+import {
+  conversationStateKey,
+  type ExpandedConversationState,
+} from "./conversationResultsModel";
+import {
+  createResultNavigationState,
+  didResultNavigationContextChange,
+  resetResultNavigationMode,
+  setResultNavigationActiveKey,
+} from "./resultNavigation";
 
 type FolderNode = Folder & { children: FolderNode[] };
 type ImportAction = "import" | "open_existing" | "resume_index" | "reimport";
 type ReaderMode = "plain_text" | "sanitized_html";
 type SourceEmlMode = "rendered" | "plain_text" | "raw_source";
-type FolderScopeFilter = "current" | "current_subfolders" | "all";
-type SortOrder = "newest" | "oldest" | "sender_az" | "subject_az";
 type LayoutMode = "three_column" | "outlook";
 type MessageListDisplayMode = "subject_first" | "sender_first";
-type ListMode = "messages" | "conversations";
-type ConversationSort = "newest" | "oldest" | "subject";
 type AllOpenFolderSelection = {
   workspaceId: string | null;
   folderId: number | null;
@@ -155,13 +220,22 @@ type PrintablePreview = {
   defaultFilename: string;
   html: string;
 };
-type ExpandedConversationState = {
-  items: ConversationMessageItem[];
-  matchingMessageCount: number;
-  totalMessageCount: number;
-  showingEntireConversation: boolean;
-  loading: boolean;
-  error: string | null;
+type SearchLoadingState = SearchOperationIdentity & {
+  mode: ListMode;
+  requestId: number;
+};
+type PageRequestIdentity = SearchOperationIdentity & {
+  offset: number;
+  cursor?: string | null;
+  paginationMode?: MessagePaginationMode;
+  requestId: number;
+};
+type CountRequestIdentity = SearchOperationIdentity & {
+  mode: ListMode;
+  requestId: number;
+};
+type ExpandedConversationRequestIdentity = SearchOperationIdentity & {
+  requestId: number;
 };
 type SourceEmlContext =
   | { kind: "workspace"; workspaceId: string; messageId: number }
@@ -169,18 +243,6 @@ type SourceEmlContext =
 type PreviewWindowTarget =
   | { kind: "workspace"; workspaceId: string; messageId: number }
   | { kind: "standalone"; messagePath: string };
-type AdvancedSearchFilters = {
-  from: string;
-  recipients: string;
-  subject: string;
-  body: string;
-  attachment: string;
-  hasAttachments: "any" | "yes" | "no";
-  dateFrom: string;
-  dateTo: string;
-  folderScope: FolderScopeFilter;
-};
-
 const missingReadpstCommand = "brew install libpst";
 const workspaceLocationStorageKey = "pstQuickView.workspaceLocationMode";
 const paneWidthStorageKey = "pstQuickView.paneWidths";
@@ -189,6 +251,8 @@ const collapsedFolderPathsStorageKey = "pstQuickView.collapsedFolderPaths";
 const layoutModeStorageKey = "pstQuickView.layoutMode";
 const messageListDisplayStorageKey = "pstQuickView.messageListDisplayMode";
 const listModeStorageKey = "pstQuickView.listMode";
+const messageResultsInstructionsId = "message-results-keyboard-instructions";
+const conversationResultsInstructionsId = "conversation-results-keyboard-instructions";
 const recentPstsStorageKey = "pstQuickView.recentPsts";
 const previousSessionStorageKey = "pstQuickView.previousSession";
 const appVersion = packageInfo.version;
@@ -208,17 +272,12 @@ const messagePageSize = 250;
 const conversationPageSize = 100;
 const conversationMessagePageSize = 100;
 const searchDebounceMs = 350;
-const defaultAdvancedSearchFilters: AdvancedSearchFilters = {
-  from: "",
-  recipients: "",
-  subject: "",
-  body: "",
-  attachment: "",
-  hasAttachments: "any",
-  dateFrom: "",
-  dateTo: "",
-  folderScope: "current_subfolders",
-};
+const defaultAdvancedSearchFilters: AdvancedSearchFilters = defaultSearchFilterDraft;
+const advancedSearchToggleId = "advanced-search-toggle";
+const advancedSearchPanelId = "advanced-search-panel";
+const relevanceSortHelpId = "relevance-sort-help";
+const loadRemoteImagesActionLabel = "Load remote images for this message";
+const loadingRemoteImagesStatus = "Loading remote images for this message.";
 
 type PaneWidths = typeof defaultPaneWidths;
 
@@ -796,91 +855,6 @@ function cleanMessageSnippet(value: string | null | undefined): string {
     .trim();
 }
 
-function hasAdvancedFilterValues(filters: AdvancedSearchFilters): boolean {
-  return Boolean(
-    filters.from.trim() ||
-      filters.recipients.trim() ||
-      filters.subject.trim() ||
-      filters.body.trim() ||
-      filters.attachment.trim() ||
-      filters.hasAttachments !== "any" ||
-      filters.dateFrom ||
-      filters.dateTo ||
-      filters.folderScope !== "current_subfolders",
-  );
-}
-
-function backendSearchFilters(filters: AdvancedSearchFilters): SearchFilters {
-  const valueOrNull = (value: string) => value.trim() || null;
-  return {
-    from: valueOrNull(filters.from),
-    recipients: valueOrNull(filters.recipients),
-    subject: valueOrNull(filters.subject),
-    body: valueOrNull(filters.body),
-    attachment: valueOrNull(filters.attachment),
-    hasAttachments: filters.hasAttachments,
-    dateFrom: filters.dateFrom || null,
-    dateTo: filters.dateTo || null,
-  };
-}
-
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function queryHighlightTerms(query: string, filters: AdvancedSearchFilters): string[] {
-  const terms = new Set<string>();
-  const pushTerms = (value: string) => {
-    for (const match of value.match(/"([^"]+)"|[^\s:]+:[^\s]+|[^\s]+/g) ?? []) {
-      const typedValue = match.includes(":") && !match.startsWith('"') ? match.split(":").slice(1).join(":") : match;
-      const cleaned = typedValue.replace(/^"|"$/g, "").trim();
-      if (
-        cleaned &&
-        !/^(has|before|after)$/i.test(match.split(":")[0] ?? "") &&
-        !/^\d{4}-\d{2}-\d{2}$/.test(cleaned)
-      ) {
-        terms.add(cleaned);
-      }
-    }
-  };
-
-  pushTerms(query);
-  [
-    filters.from,
-    filters.recipients,
-    filters.subject,
-    filters.body,
-    filters.attachment,
-  ].forEach(pushTerms);
-
-  return Array.from(terms)
-    .flatMap((term) => (term.length > 24 ? term.split(/[^\w@.-]+/) : [term]))
-    .map((term) => term.trim())
-    .filter((term) => term.length >= 2 && term.length <= 80)
-    .slice(0, 12);
-}
-
-function HighlightedText({ text, terms }: { text: string; terms: string[] }): ReactNode {
-  if (!text || !terms.length) return text;
-  const pattern = terms
-    .map(escapeRegex)
-    .sort((a, b) => b.length - a.length)
-    .join("|");
-  if (!pattern) return text;
-
-  const matcher = new RegExp(`(${pattern})`, "gi");
-  const parts = text.split(matcher);
-  return parts.map((part, index) =>
-    index % 2 === 1 ? (
-      <mark className="match-highlight" key={`${part}-${index}`}>
-        {part}
-      </mark>
-    ) : (
-      part
-    ),
-  );
-}
-
 function initialWorkspaceLocationMode(): WorkspaceLocationMode {
   const stored = window.localStorage.getItem(workspaceLocationStorageKey);
   return stored === "app_support" ? "app_support" : "next_to_pst";
@@ -1352,6 +1326,22 @@ function stringifyWindowError(error: unknown): string {
   return getErrorMessage(error);
 }
 
+function sourceMessageFormatLabel(view: SourceEmlView | null): "EML" | "MSG" {
+  return view?.sourceFormat === "msg" ? "MSG" : "EML";
+}
+
+function rawSourcePrintNote(view: SourceEmlView): string {
+  return view.sourceFormat === "msg"
+    ? "Printed structured MSG properties and diagnostics. No remote resources were loaded."
+    : "Printed raw EML source text. No remote resources were loaded.";
+}
+
+function rawSourceSearchLabel(view: SourceEmlView): string {
+  return view.sourceFormat === "msg"
+    ? "Search structured MSG properties"
+    : "Search raw EML source";
+}
+
 function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
   const [sourceEmlView, setSourceEmlView] = useState<SourceEmlView | null>(null);
   const [sourceEmlMode, setSourceEmlMode] = useState<SourceEmlMode>("rendered");
@@ -1385,7 +1375,7 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
   async function loadSourceEml(allowRemoteResources = false) {
     setError(null);
     setSourceEmlStatus(
-      allowRemoteResources ? "Loading remote images for this EML." : "Loading message preview.",
+      allowRemoteResources ? loadingRemoteImagesStatus : "Loading message preview.",
     );
     try {
       const result =
@@ -1425,7 +1415,7 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
     if (sourceEmlMode === "raw_source") {
       bodyHtml = plainTextPrintBody(sourceEmlView.rawSource);
       bodyModeLabel = "Raw Source";
-      note = "Printed raw EML source text. No remote resources were loaded.";
+      note = rawSourcePrintNote(sourceEmlView);
     } else if (sourceEmlMode === "plain_text") {
       bodyHtml = plainTextPrintBody(formatBodyForDisplay(sourceEmlView.bodyText));
       bodyModeLabel = "Plain Text";
@@ -1502,8 +1492,9 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
   }
 
   async function saveSourceEmlAs() {
+    const sourceFormatLabel = sourceMessageFormatLabel(sourceEmlView);
     setError(null);
-    setSourceEmlStatus("Choose where to save the source EML.");
+    setSourceEmlStatus(`Choose where to save the source ${sourceFormatLabel}.`);
     setSourceEmlSaveResult(null);
     setPrintableSaveResult(null);
     setPrintStatus(null);
@@ -1519,12 +1510,12 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
             });
       setSourceEmlSaveResult(result);
       if (result.exported) {
-        setSourceEmlStatus(`Saved source EML to ${result.outputPath}`);
+        setSourceEmlStatus(`Saved source ${sourceFormatLabel} to ${result.outputPath}`);
       } else if (result.error) {
         setError(result.error);
         setSourceEmlStatus(null);
       } else {
-        setSourceEmlStatus("Save Source EML As... cancelled.");
+        setSourceEmlStatus(`Save Source ${sourceFormatLabel} As... cancelled.`);
       }
     } catch (err) {
       setError(getErrorMessage(err));
@@ -1608,7 +1599,9 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
   async function revealSavedEml(outputPath: string) {
     try {
       await invoke("reveal_saved_eml", { outputPath });
-      setSourceEmlStatus("Revealed saved source EML in Finder.");
+      setSourceEmlStatus(
+        `Revealed saved source ${sourceMessageFormatLabel(sourceEmlView)} in Finder.`,
+      );
     } catch (err) {
       setError(getErrorMessage(err));
     }
@@ -1629,7 +1622,9 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
         <header className="source-eml-header">
           <div>
             <h2>{sourceEmlView?.subject || "Message Preview"}</h2>
-            <p title={sourceEmlView?.sourcePath}>{sourceEmlView?.sourcePath ?? "Loading source EML."}</p>
+            <p title={sourceEmlView?.sourcePath}>
+              {sourceEmlView?.sourcePath ?? "Loading message source."}
+            </p>
           </div>
         </header>
 
@@ -1855,9 +1850,14 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
                 <>
                   {sourceEmlView.remoteImagesBlocked && !sourceEmlRemoteAllowed ? (
                     <div className="remote-image-notice">
-                      <span>Remote resources are blocked.</span>
-                      <button type="button" onClick={() => void loadSourceEml(true)}>
-                        Load remote resources for this EML
+                      <span>Remote images are blocked.</span>
+                      <button
+                        type="button"
+                        onClick={() => void loadSourceEml(true)}
+                        aria-label={loadRemoteImagesActionLabel}
+                        title={loadRemoteImagesActionLabel}
+                      >
+                        {loadRemoteImagesActionLabel}
                       </button>
                     </div>
                   ) : null}
@@ -1897,8 +1897,8 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
                     type="search"
                     value={sourceEmlRawSearch}
                     onChange={(event) => setSourceEmlRawSearch(event.target.value)}
-                    placeholder="Search raw source"
-                    aria-label="Search raw EML source"
+                    placeholder={rawSourceSearchLabel(sourceEmlView)}
+                    aria-label={rawSourceSearchLabel(sourceEmlView)}
                   />
                   <pre className="raw-source-text">
                     <HighlightedText text={sourceEmlView.rawSource} terms={sourceEmlRawTerms} />
@@ -1938,13 +1938,30 @@ function App() {
   );
   const [messages, setMessages] = useState<MessageListItem[]>([]);
   const [messageTotalCount, setMessageTotalCount] = useState(0);
+  const [messageHasMore, setMessageHasMore] = useState(false);
+  const [messageCountState, setMessageCountState] = useState<SearchExactCountState>(() =>
+    createSearchExactCountState(0),
+  );
   const [listMode, setListMode] = useState<ListMode>(initialListMode);
+  const [resultNavigation, setResultNavigation] = useState(createResultNavigationState);
+  const setMessageNavigationKey = useCallback((key: string | null) => {
+    setResultNavigation((current) => setResultNavigationActiveKey(current, "messages", key));
+  }, []);
+  const setConversationNavigationKey = useCallback((key: string | null) => {
+    setResultNavigation((current) =>
+      setResultNavigationActiveKey(current, "conversations", key),
+    );
+  }, []);
   const [activeSessionGeneration, setActiveSessionGeneration] = useState(0);
   const [initializingWorkspaceId, setInitializingWorkspaceId] = useState<string | null>(null);
   const [conversationSort, setConversationSort] = useState<ConversationSort>("newest");
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationTotalCount, setConversationTotalCount] = useState(0);
   const [conversationMatchingMessageCount, setConversationMatchingMessageCount] = useState(0);
+  const [conversationHasMore, setConversationHasMore] = useState(false);
+  const [conversationCountState, setConversationCountState] = useState<SearchExactCountState>(() =>
+    createSearchExactCountState(0),
+  );
   const [conversationIndexedWorkspaceCount, setConversationIndexedWorkspaceCount] = useState(0);
   const [conversationWorkspaceIssues, setConversationWorkspaceIssues] = useState<
     ConversationWorkspaceIssue[]
@@ -1954,7 +1971,6 @@ function App() {
   >({});
   const [selectedMessage, setSelectedMessage] = useState<MessageDetail | null>(null);
   const [search, setSearch] = useState("");
-  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [advancedSearchOpen, setAdvancedSearchOpen] = useState(false);
   const [searchFilters, setSearchFilters] = useState<AdvancedSearchFilters>(
     defaultAdvancedSearchFilters,
@@ -1963,9 +1979,35 @@ function App() {
   const [searchScope, setSearchScope] = useState<SearchScope>(() =>
     storedSearchScope(typeof window === "undefined" ? null : window.localStorage),
   );
-  const [isSearching, setIsSearching] = useState(false);
-  const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState(false);
-  const [isLoadingMoreConversations, setIsLoadingMoreConversations] = useState(false);
+  const [appliedSearchVersion, setAppliedSearchVersion] = useState<AppliedSearchVersion>(() => ({
+    snapshot: createAppliedSearchSnapshot(
+      { query: "", ...defaultAdvancedSearchFilters },
+      {
+        scope: searchScope,
+        activeWorkspaceId: null,
+        workspaceIds: [],
+        selectedWorkspaceId: null,
+        useMultiWorkspace: false,
+        singleWorkspaceId: null,
+        folderId: null,
+        includeSubfolders: true,
+        conversationScopes: [],
+        listMode,
+        messageSort: sortOrder,
+        conversationSort,
+        sessionGeneration: activeSessionGeneration,
+      },
+    ),
+    generation: 0,
+  }));
+  const [searchLoading, setSearchLoading] = useState<SearchLoadingState | null>(null);
+  const [messageLoadMoreRequest, setMessageLoadMoreRequest] =
+    useState<PageRequestIdentity | null>(null);
+  const [conversationLoadMoreRequest, setConversationLoadMoreRequest] =
+    useState<PageRequestIdentity | null>(null);
+  const [searchError, setSearchError] = useState<{ generation: number; message: string } | null>(
+    null,
+  );
   const [workspaceSearchCounts, setWorkspaceSearchCounts] = useState<WorkspaceSearchCount[]>([]);
   const [workspaceOperationStates, setWorkspaceOperationStates] = useState<
     Record<string, WorkspaceOperationState>
@@ -2043,14 +2085,139 @@ function App() {
   const paneLayoutRef = useRef<HTMLElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const previewScrollRef = useRef<HTMLDivElement | null>(null);
-  const messageSearchRequestIdRef = useRef(0);
-  const conversationSearchRequestIdRef = useRef(0);
+  const advancedSearchToggleRef = useRef<HTMLButtonElement | null>(null);
+  const searchApplicationRef = useRef<SearchApplicationState | null>(null);
+  if (searchApplicationRef.current == null) {
+    searchApplicationRef.current = createSearchApplicationState(appliedSearchVersion.snapshot);
+  }
+  const searchGenerationRef = useRef(appliedSearchVersion.generation);
+  const messagePaginationRef = useRef<MessagePaginationState>(
+    createMessagePaginationState(
+      appliedSearchVersion.snapshot,
+      appliedSearchVersion.generation,
+    ),
+  );
+  const searchDebounceTimerRef = useRef<number | null>(null);
+  const forceImmediateSearchApplyRef = useRef(false);
+  const topLevelSearchRequestSequenceRef = useRef(0);
+  const topLevelSearchRequestRef = useRef<SearchLoadingState | null>(null);
+  const messageCountRequestSequenceRef = useRef(0);
+  const messageCountRequestRef = useRef<CountRequestIdentity | null>(null);
+  const conversationCountRequestSequenceRef = useRef(0);
+  const conversationCountRequestRef = useRef<CountRequestIdentity | null>(null);
+  const messageLoadMoreRequestSequenceRef = useRef(0);
+  const conversationLoadMoreRequestSequenceRef = useRef(0);
+  const messageLoadMoreRequestRef = useRef<PageRequestIdentity | null>(null);
+  const conversationLoadMoreRequestRef = useRef<PageRequestIdentity | null>(null);
+  const expandedConversationRequestSequenceRef = useRef(0);
+  const expandedConversationRequestsRef = useRef<
+    Map<string, ExpandedConversationRequestIdentity>
+  >(new Map());
   const externalFileOpenChainRef = useRef<Promise<void>>(Promise.resolve());
   const externalPstQueueRef = useRef<string[]>([]);
   const externalPstProcessingRef = useRef(false);
   const activeExternalPstPathRef = useRef<string | null>(null);
   const externalBatchEnqueueRef = useRef<(batch: ExternalFileOpenBatch) => void>(() => undefined);
   const restorePromptTimerRef = useRef<number | null>(null);
+
+  function clearSearchDebounceTimer() {
+    if (searchDebounceTimerRef.current != null) {
+      window.clearTimeout(searchDebounceTimerRef.current);
+      searchDebounceTimerRef.current = null;
+    }
+  }
+
+  function forceNextSearchApplication() {
+    clearSearchDebounceTimer();
+    forceImmediateSearchApplyRef.current = true;
+  }
+
+  function cancelBackendSearch(request: SearchCancellationRequest) {
+    // Cancellation is advisory; the newer generation starts without waiting for this invoke.
+    void invoke("cancel_search_operation", {
+      searchGeneration: request.generation,
+      searchOperationId: request.operationId,
+    }).catch(() => undefined);
+  }
+
+  function publishSearchApplicationState(next: SearchApplicationState) {
+    const previous = searchApplicationRef.current;
+    searchApplicationRef.current = next;
+    if (
+      previous &&
+      previous.applied.generation === next.applied.generation &&
+      previous.applied.snapshot === next.applied.snapshot
+    ) {
+      return;
+    }
+
+    if (previous && previous.applied.generation !== next.applied.generation) {
+      cancelBackendSearch(cancellationForGeneration(previous.applied.generation));
+      if (
+        didResultNavigationContextChange(
+          previous.applied.snapshot,
+          next.applied.snapshot,
+          "messages",
+        )
+      ) {
+        setResultNavigation((current) => resetResultNavigationMode(current, "messages"));
+      }
+      if (
+        didResultNavigationContextChange(
+          previous.applied.snapshot,
+          next.applied.snapshot,
+          "conversations",
+        )
+      ) {
+        setResultNavigation((current) => resetResultNavigationMode(current, "conversations"));
+      }
+      const resultsContainer = messageListRef.current;
+      if (resultsContainer?.contains(document.activeElement)) {
+        try {
+          resultsContainer.focus({ preventScroll: true });
+        } catch {
+          resultsContainer.focus();
+        }
+      }
+    }
+
+    searchGenerationRef.current = next.applied.generation;
+    messagePaginationRef.current = createMessagePaginationState(
+      next.applied.snapshot,
+      next.applied.generation,
+    );
+    topLevelSearchRequestRef.current = null;
+    messageCountRequestRef.current = null;
+    conversationCountRequestRef.current = null;
+    messageLoadMoreRequestRef.current = null;
+    conversationLoadMoreRequestRef.current = null;
+    expandedConversationRequestsRef.current.clear();
+    setSearchLoading(null);
+    setMessageLoadMoreRequest(null);
+    setConversationLoadMoreRequest(null);
+    setSearchError(null);
+    setMessages([]);
+    setMessageTotalCount(0);
+    setMessageHasMore(false);
+    setMessageCountState(createSearchExactCountState(next.applied.generation));
+    setWorkspaceSearchCounts([]);
+    setConversations([]);
+    setConversationTotalCount(0);
+    setConversationMatchingMessageCount(0);
+    setConversationHasMore(false);
+    setConversationCountState(createSearchExactCountState(next.applied.generation));
+    setConversationIndexedWorkspaceCount(0);
+    setConversationWorkspaceIssues([]);
+    setExpandedConversations({});
+    setAppliedSearchVersion(next.applied);
+  }
+
+  function invalidateSearchLifecycle(snapshot?: AppliedSearchSnapshot) {
+    clearSearchDebounceTimer();
+    const current = searchApplicationRef.current;
+    if (!current) return;
+    publishSearchApplicationState(invalidateSearchApplication(current, snapshot));
+  }
 
   useEffect(() => {
     applyAppearance(appearance, document.documentElement);
@@ -2176,8 +2343,6 @@ function App() {
       })),
     [openPstSessions],
   );
-  const hasActiveAdvancedFilters = hasAdvancedFilterValues(searchFilters);
-  const isSearchActive = Boolean(search.trim() || hasActiveAdvancedFilters);
   const openWorkspaceIds = useMemo(
     () => openPstSessions.map((session) => session.workspace.id),
     [openPstSessions],
@@ -2223,9 +2388,15 @@ function App() {
         ? [workspace.id]
         : [];
   const isCrossPstSearch = searchScope !== "current";
-  const shouldUseMultiWorkspaceSearch = searchScope === "all_open" && allOpenSelectedWorkspaceId == null;
+  const shouldUseMultiWorkspaceSearch =
+    searchScope === "all_open" &&
+    allOpenSelectedWorkspaceId == null &&
+    openWorkspaceIds.length > 1;
   const singleSearchWorkspaceId =
-    searchScope === "all_open" ? allOpenSelectedWorkspaceId : (workspace?.id ?? null);
+    searchScope === "all_open"
+      ? (allOpenSelectedWorkspaceId ??
+        (openWorkspaceIds.length === 1 ? openWorkspaceIds[0] : null))
+      : (workspace?.id ?? null);
   const effectiveFolderId =
     searchScope === "all_open"
       ? allOpenSelectedFolderId
@@ -2279,13 +2450,74 @@ function App() {
     )
     .join("|");
   const activeSearchWorkspaceKey = activeSearchWorkspaceIds.join("|");
-  const messageListContextKey =
-    searchScope === "all_open"
-      ? `${activeSearchWorkspaceKey}:${allOpenSelectedFolderId ?? "all"}`
-      : (workspace?.id ?? "");
+  const draftSearchSnapshot = useMemo(
+    () =>
+      createAppliedSearchSnapshot(
+        { query: search, ...searchFilters },
+        {
+          scope: searchScope,
+          activeWorkspaceId: workspace?.id ?? null,
+          workspaceIds: activeSearchWorkspaceIds,
+          selectedWorkspaceId: singleSearchWorkspaceId,
+          useMultiWorkspace: shouldUseMultiWorkspaceSearch,
+          singleWorkspaceId: singleSearchWorkspaceId,
+          folderId: effectiveFolderId,
+          includeSubfolders: effectiveIncludeSubfolders,
+          conversationScopes,
+          listMode,
+          messageSort: sortOrder,
+          conversationSort,
+          sessionGeneration: activeSessionGeneration,
+        },
+      ),
+    [
+      activeSearchWorkspaceKey,
+      activeSessionGeneration,
+      conversationScopeKey,
+      conversationSort,
+      effectiveFolderId,
+      effectiveIncludeSubfolders,
+      listMode,
+      search,
+      searchFilters,
+      searchScope,
+      shouldUseMultiWorkspaceSearch,
+      singleSearchWorkspaceId,
+      sortOrder,
+      workspace?.id,
+    ],
+  );
+  const draftSearchTextKey = appliedSearchTextKey(draftSearchSnapshot);
+  const draftSearchNonTextKey = appliedSearchNonTextKey(draftSearchSnapshot);
+  const relevanceAvailability = getRelevanceAvailability(draftSearchSnapshot);
+  const appliedSearch = appliedSearchVersion.snapshot;
+  const activeAdvancedFilterCount = getActiveFilterCount(appliedSearch);
+  const isSearchActive = isAppliedSearchActive(appliedSearch);
+  const isSearching =
+    searchLoading?.generation === appliedSearchVersion.generation &&
+    searchLoading.mode === appliedSearch.listMode;
+  const isLoadingMoreMessages =
+    messageLoadMoreRequest?.generation === appliedSearchVersion.generation;
+  const isLoadingMoreConversations =
+    conversationLoadMoreRequest?.generation === appliedSearchVersion.generation;
+  const activeSearchError =
+    searchError?.generation === appliedSearchVersion.generation ? searchError.message : null;
+  const appliedIsCrossPstSearch = appliedSearch.scope === "all_open";
+  const appliedSelectedWorkspaceId = appliedIsCrossPstSearch
+    ? appliedSearch.selectedWorkspaceId
+    : appliedSearch.activeWorkspaceId;
+  const appliedSelectedSession = appliedSelectedWorkspaceId
+    ? openPstSessions.find(
+        (session) => session.workspace.id === appliedSelectedWorkspaceId,
+      ) ?? null
+    : null;
+  const appliedSelectedFolder =
+    appliedSelectedSession && appliedSearch.folderId != null
+      ? appliedSelectedSession.folders.find((folder) => folder.id === appliedSearch.folderId) ?? null
+      : null;
   const highlightTerms = useMemo(
-    () => queryHighlightTerms(search, searchFilters),
-    [search, searchFilters],
+    () => highlightTermsForSnapshot(appliedSearch),
+    [appliedSearch],
   );
   const collapsedFolderPathList = useMemo(
     () => Array.from(collapsedFolderPaths).sort(),
@@ -2656,8 +2888,15 @@ function App() {
     const skipped: SavedWorkspaceSession[] = [];
 
     try {
+      const currentSearch = searchApplicationRef.current;
+      if (currentSearch) {
+        const resetSnapshot = clearAppliedSearchSnapshot(
+          replaceAppliedSearchDraft(currentSearch.applied.snapshot, emptySearchDraft()),
+          searchScope,
+        );
+        invalidateSearchLifecycle(resetSnapshot);
+      }
       setSearch("");
-      setDebouncedSearch("");
       setAdvancedSearchOpen(false);
       setSearchFilters(defaultAdvancedSearchFilters);
       setAllOpenFolderSelection({ workspaceId: null, folderId: null });
@@ -2731,6 +2970,7 @@ function App() {
   }
 
   function startFreshPreviousSession() {
+    invalidateSearchLifecycle();
     window.localStorage.removeItem(previousSessionStorageKey);
     setSavedSession(null);
     setRestorePromptVisible(false);
@@ -2782,6 +3022,13 @@ function App() {
     window.localStorage.setItem(recentPstsStorageKey, JSON.stringify(recentPsts));
   }, [recentPsts]);
 
+  useLayoutEffect(() => {
+    if (sortOrder === draftSearchSnapshot.messageSort) return;
+    // Conversation and multi-workspace ranking need separate designs; never send stale relevance.
+    forceNextSearchApplication();
+    setSortOrder(draftSearchSnapshot.messageSort);
+  }, [draftSearchSnapshot.messageSort, sortOrder]);
+
   useEffect(() => {
     if (!sessionPersistenceReady) return;
     const nextSession = savedSessionFromOpenSessions(openPstSessions, workspace?.id ?? null);
@@ -2801,10 +3048,43 @@ function App() {
     return () => window.removeEventListener("resize", clampToWindow);
   }, []);
 
-  useEffect(() => {
-    const timeout = window.setTimeout(() => setDebouncedSearch(search), searchDebounceMs);
-    return () => window.clearTimeout(timeout);
-  }, [search]);
+  useLayoutEffect(() => {
+    clearSearchDebounceTimer();
+    const current = searchApplicationRef.current;
+    if (!current) return;
+
+    const forceImmediate = forceImmediateSearchApplyRef.current;
+    forceImmediateSearchApplyRef.current = false;
+    if (
+      forceImmediate ||
+      appliedSearchNonTextKey(current.applied.snapshot) !== draftSearchNonTextKey
+    ) {
+      const immediate = applySearchSnapshotImmediately(current, draftSearchSnapshot);
+      publishSearchApplicationState(immediate.state);
+      return;
+    }
+
+    const queued = queueTextSearchSnapshot(current, draftSearchSnapshot);
+    searchApplicationRef.current = queued.state;
+    if (queued.token == null) return;
+
+    const timeout = window.setTimeout(() => {
+      if (searchDebounceTimerRef.current === timeout) {
+        searchDebounceTimerRef.current = null;
+      }
+      const pending = searchApplicationRef.current;
+      if (!pending) return;
+      const committed = commitQueuedSearchSnapshot(pending, queued.token!);
+      publishSearchApplicationState(committed.state);
+    }, searchDebounceMs);
+    searchDebounceTimerRef.current = timeout;
+    return () => {
+      window.clearTimeout(timeout);
+      if (searchDebounceTimerRef.current === timeout) {
+        searchDebounceTimerRef.current = null;
+      }
+    };
+  }, [draftSearchNonTextKey, draftSearchTextKey]);
 
   useEffect(() => {
     if (!notice) return;
@@ -2820,6 +3100,8 @@ function App() {
 
   useEffect(
     () => () => {
+      clearSearchDebounceTimer();
+      cancelBackendSearch(cancellationForGeneration(searchGenerationRef.current));
       for (const timeout of workspaceOperationDismissTimersRef.current.values()) {
         window.clearTimeout(timeout);
       }
@@ -2828,37 +3110,47 @@ function App() {
     [],
   );
 
-  useEffect(() => {
-    if (!workspace && activeSearchWorkspaceIds.length === 0) {
+  useLayoutEffect(() => {
+    if (restoreStatus) return;
+    const request = appliedSearchVersion;
+    const snapshot = request.snapshot;
+    const canLoadMessages = snapshot.useMultiWorkspace
+      ? snapshot.workspaceIds.length > 0
+      : snapshot.singleWorkspaceId != null;
+    const canLoadConversations = snapshot.conversationScopes.length > 0;
+
+    if (
+      (snapshot.listMode === "messages" && !canLoadMessages) ||
+      (snapshot.listMode === "conversations" && !canLoadConversations)
+    ) {
+      if (!isSearchGenerationCurrent(request.generation, searchGenerationRef.current)) return;
       setMessages([]);
       setMessageTotalCount(0);
+      setMessageHasMore(false);
+      setMessageCountState(createSearchExactCountState(request.generation));
       setWorkspaceSearchCounts([]);
       setConversations([]);
       setConversationTotalCount(0);
       setConversationMatchingMessageCount(0);
+      setConversationHasMore(false);
+      setConversationCountState(createSearchExactCountState(request.generation));
+      setConversationIndexedWorkspaceCount(0);
       setConversationWorkspaceIssues([]);
       setExpandedConversations({});
+      setSearchLoading(null);
+      setMessageLoadMoreRequest(null);
+      setConversationLoadMoreRequest(null);
       return;
     }
 
-    if (listMode === "conversations") {
-      void loadConversationsPage(false);
+    if (snapshot.listMode === "conversations") {
+      void loadConversationsPage(false, request);
+      void loadConversationCount(request);
     } else {
-      void loadMessagesPage(false);
+      void loadMessagesPage(false, request);
+      void loadMessageCount(request);
     }
-  }, [
-    activeSessionGeneration,
-    listMode,
-    messageListContextKey,
-    conversationScopeKey,
-    searchScope,
-    effectiveFolderId,
-    effectiveIncludeSubfolders,
-    debouncedSearch,
-    searchFilters,
-    sortOrder,
-    conversationSort,
-  ]);
+  }, [appliedSearchVersion, restoreStatus]);
 
   useEffect(() => {
     if (!selectedMessage) return;
@@ -2992,10 +3284,14 @@ function App() {
     if (resetMessageList) {
       setMessages([]);
       setMessageTotalCount(0);
+      setMessageHasMore(false);
+      setMessageCountState(createSearchExactCountState(searchGenerationRef.current));
       setWorkspaceSearchCounts([]);
       setConversations([]);
       setConversationTotalCount(0);
       setConversationMatchingMessageCount(0);
+      setConversationHasMore(false);
+      setConversationCountState(createSearchExactCountState(searchGenerationRef.current));
       setConversationWorkspaceIssues([]);
       setExpandedConversations({});
       setSelectedMessage(null);
@@ -3051,6 +3347,7 @@ function App() {
         (session) => session.workspace.id !== workspaceId,
       );
       const nextActive = await invoke<WorkspaceSummary | null>("close_workspace", { workspaceId });
+      invalidateSearchLifecycle();
       setOpenPstSessions(remainingSessions);
       clearWorkspaceOperationState(workspaceId);
       if (pendingWorkspaceFlowOwnerId === workspaceId) {
@@ -3075,53 +3372,106 @@ function App() {
     }
   }
 
-  async function loadMessagesPage(append: boolean) {
-    if (!shouldUseMultiWorkspaceSearch && !singleSearchWorkspaceId) return;
-    if (shouldUseMultiWorkspaceSearch && activeSearchWorkspaceIds.length === 0) return;
+  async function loadMessagesPage(append: boolean, request: AppliedSearchVersion) {
+    const snapshot = request.snapshot;
+    if (snapshot.listMode !== "messages") return;
+    if (!snapshot.useMultiWorkspace && !snapshot.singleWorkspaceId) return;
+    if (snapshot.useMultiWorkspace && snapshot.workspaceIds.length === 0) return;
+    if (!isSearchGenerationCurrent(request.generation, searchGenerationRef.current)) return;
 
-    const requestId = messageSearchRequestIdRef.current + 1;
-    messageSearchRequestIdRef.current = requestId;
-    const queriedWorkspaceIds = shouldUseMultiWorkspaceSearch
-      ? activeSearchWorkspaceIds
-      : singleSearchWorkspaceId
-        ? [singleSearchWorkspaceId]
+    const queriedWorkspaceIds = snapshot.useMultiWorkspace
+      ? snapshot.workspaceIds
+      : snapshot.singleWorkspaceId
+        ? [snapshot.singleWorkspaceId]
         : [];
+    const paginationMode = getMessagePaginationMode(snapshot);
     const offset = append ? messages.length : 0;
+    const requestCursor = cursorForMessagePage(
+      messagePaginationRef.current,
+      request.generation,
+      append,
+    );
+    if (append && paginationMode === "cursor" && !requestCursor) return;
+    if (
+      !append &&
+      topLevelSearchRequestRef.current?.generation === request.generation &&
+      topLevelSearchRequestRef.current.mode === "messages"
+    ) {
+      return;
+    }
+    let requestIdentity: SearchLoadingState | PageRequestIdentity;
     if (append) {
-      setIsLoadingMoreMessages(true);
+      const pending = messageLoadMoreRequestRef.current;
+      if (pending?.generation === request.generation) return;
+      const requestId = messageLoadMoreRequestSequenceRef.current + 1;
+      requestIdentity = {
+        ...createSearchOperationIdentity(request.generation, "message-load-more", requestId),
+        offset,
+        cursor: requestCursor,
+        paginationMode,
+        requestId,
+      };
+      messageLoadMoreRequestSequenceRef.current = requestIdentity.requestId;
+      messageLoadMoreRequestRef.current = requestIdentity;
+      setMessageLoadMoreRequest(requestIdentity);
     } else {
-      setIsSearching(true);
+      const requestId = topLevelSearchRequestSequenceRef.current + 1;
+      requestIdentity = {
+        ...createSearchOperationIdentity(request.generation, "message-page", requestId),
+        mode: "messages",
+        requestId,
+      };
+      topLevelSearchRequestSequenceRef.current = requestIdentity.requestId;
+      topLevelSearchRequestRef.current = requestIdentity;
+      setSearchLoading(requestIdentity);
+      setSearchError(null);
     }
 
+    const requestIsCurrent = () => {
+      if (!isSearchGenerationCurrent(request.generation, searchGenerationRef.current)) return false;
+      const activeRequest = append
+        ? messageLoadMoreRequestRef.current
+        : topLevelSearchRequestRef.current;
+      return activeRequest?.requestId === requestIdentity.requestId;
+    };
+    const singleWorkspaceSession = snapshot.singleWorkspaceId
+      ? openPstSessions.find((session) => session.workspace.id === snapshot.singleWorkspaceId) ?? null
+      : null;
+
     try {
-      const result = shouldUseMultiWorkspaceSearch
-        ? await invoke<MultiMessageListResult>("search_messages_multi", {
-            workspaceIds: activeSearchWorkspaceIds,
-            query: debouncedSearch.trim() || null,
-            searchFilters: backendSearchFilters(searchFilters),
-            sortOrder,
+      const result = snapshot.useMultiWorkspace
+        ? await invoke<MultiMessagePageResult>("search_messages_multi", {
+            workspaceIds: snapshot.workspaceIds,
+            query: snapshot.query || null,
+            searchFilters: backendSearchFilters(snapshot),
+            sortOrder: snapshot.messageSort,
             limit: messagePageSize,
             offset,
+            searchGeneration: request.generation,
+            searchOperationId: requestIdentity.operationId,
           })
-        : await invoke<MessageListResult>("list_messages", {
-            workspaceId: singleSearchWorkspaceId,
-            folderId: effectiveFolderId,
-            query: debouncedSearch.trim() || null,
-            includeSubfolders: effectiveIncludeSubfolders,
-            searchFilters: backendSearchFilters(searchFilters),
-            sortOrder,
+        : await invoke<MessagePageResult>("list_messages", {
+            workspaceId: snapshot.singleWorkspaceId,
+            folderId: snapshot.folderId,
+            query: snapshot.query || null,
+            includeSubfolders: snapshot.includeSubfolders,
+            searchFilters: backendSearchFilters(snapshot),
+            sortOrder: snapshot.messageSort,
             limit: messagePageSize,
-            offset,
+            cursor: requestCursor,
+            searchGeneration: request.generation,
+            searchOperationId: requestIdentity.operationId,
           });
+      if (!requestIsCurrent()) return;
+      if (result.paginationMode !== paginationMode) {
+        throw new Error("Search pagination mode did not match the active request.");
+      }
+      if (paginationMode === "cursor" && result.hasMore && !result.nextCursor) {
+        throw new Error("Search pagination could not continue safely.");
+      }
 
-      if (messageSearchRequestIdRef.current !== requestId) return;
-
-      const singleWorkspaceSession =
-        singleSearchWorkspaceId != null
-          ? openPstSessions.find((session) => session.workspace.id === singleSearchWorkspaceId) ?? null
-          : null;
       const normalizedResult =
-        !shouldUseMultiWorkspaceSearch && searchScope === "all_open" && singleWorkspaceSession
+        !snapshot.useMultiWorkspace && snapshot.scope === "all_open" && singleWorkspaceSession
           ? {
               ...result,
               items: result.items.map((item) => ({
@@ -3132,12 +3482,23 @@ function App() {
               })),
             }
           : result;
-      const multiResult = shouldUseMultiWorkspaceSearch ? (result as MultiMessageListResult) : null;
-      setMessageTotalCount(result.totalCount);
-      setWorkspaceSearchCounts(multiResult?.perWorkspaceCounts ?? []);
-      setMessages((current) =>
-        append ? [...current, ...normalizedResult.items] : normalizedResult.items,
+      messagePaginationRef.current = settleMessagePagination(
+        messagePaginationRef.current,
+        searchGenerationRef.current,
+        request.generation,
+        result.paginationMode,
+        result.hasMore,
+        result.nextCursor,
       );
+      setMessageHasMore(result.hasMore);
+      setMessages((current) =>
+        append
+          ? appendUniqueByKey(current, normalizedResult.items, (item) =>
+              `${item.workspaceId ?? snapshot.singleWorkspaceId ?? snapshot.activeWorkspaceId}:${item.id}`,
+            )
+          : normalizedResult.items,
+      );
+      setSearchError(null);
       if (!append) {
         setSelectedMessage((current) => {
           if (
@@ -3145,8 +3506,8 @@ function App() {
             normalizedResult.items.some(
               (item) =>
                 item.id === current.id &&
-                (item.workspaceId ?? singleSearchWorkspaceId ?? workspace?.id) ===
-                  (current.workspaceId ?? workspace?.id),
+                (item.workspaceId ?? snapshot.singleWorkspaceId ?? snapshot.activeWorkspaceId) ===
+                  (current.workspaceId ?? snapshot.activeWorkspaceId),
             )
           ) {
             return current;
@@ -3160,63 +3521,252 @@ function App() {
         });
       }
     } catch (err) {
-      if (messageSearchRequestIdRef.current === requestId) setError(getErrorMessage(err));
+      if (isSearchCancellationError(err)) return;
+      if (requestIsCurrent()) {
+        setSearchError({ generation: request.generation, message: getErrorMessage(err) });
+      }
     } finally {
-      if (messageSearchRequestIdRef.current === requestId) {
-        setIsSearching(false);
-        setIsLoadingMoreMessages(false);
-        setInitializingWorkspaceId((current) =>
-          current && queriedWorkspaceIds.includes(current) ? null : current,
-        );
+      if (!requestIsCurrent()) return;
+      if (append) {
+        messageLoadMoreRequestRef.current = null;
+        setMessageLoadMoreRequest(null);
+      } else {
+        topLevelSearchRequestRef.current = null;
+        setSearchLoading(null);
+      }
+      setInitializingWorkspaceId((current) =>
+        current && queriedWorkspaceIds.includes(current) ? null : current,
+      );
+    }
+  }
+
+  async function loadMessageCount(request: AppliedSearchVersion) {
+    const snapshot = request.snapshot;
+    if (snapshot.listMode !== "messages") return;
+    if (!snapshot.useMultiWorkspace && !snapshot.singleWorkspaceId) return;
+    if (snapshot.useMultiWorkspace && snapshot.workspaceIds.length === 0) return;
+    if (!isSearchGenerationCurrent(request.generation, searchGenerationRef.current)) return;
+    if (messageCountRequestRef.current?.generation === request.generation) return;
+
+    const requestId = messageCountRequestSequenceRef.current + 1;
+    const requestIdentity: CountRequestIdentity = {
+      ...createSearchOperationIdentity(request.generation, "message-count", requestId),
+      mode: "messages",
+      requestId,
+    };
+    messageCountRequestSequenceRef.current = requestId;
+    messageCountRequestRef.current = requestIdentity;
+    setMessageTotalCount(0);
+    setWorkspaceSearchCounts([]);
+    setMessageCountState(createSearchExactCountState(request.generation, "pending"));
+
+    const requestIsCurrent = () =>
+      isSearchGenerationCurrent(request.generation, searchGenerationRef.current) &&
+      messageCountRequestRef.current?.requestId === requestIdentity.requestId;
+
+    try {
+      const result = snapshot.useMultiWorkspace
+        ? await invoke<MultiMessageCountResult>("count_messages_multi", {
+            workspaceIds: snapshot.workspaceIds,
+            query: snapshot.query || null,
+            searchFilters: backendSearchFilters(snapshot),
+            searchGeneration: request.generation,
+            searchOperationId: requestIdentity.operationId,
+          })
+        : await invoke<MessageCountResult>("count_messages", {
+            workspaceId: snapshot.singleWorkspaceId,
+            folderId: snapshot.folderId,
+            query: snapshot.query || null,
+            includeSubfolders: snapshot.includeSubfolders,
+            searchFilters: backendSearchFilters(snapshot),
+            searchGeneration: request.generation,
+            searchOperationId: requestIdentity.operationId,
+          });
+      if (!requestIsCurrent()) return;
+      setMessageTotalCount(result.totalCount);
+      setWorkspaceSearchCounts(
+        snapshot.useMultiWorkspace
+          ? (result as MultiMessageCountResult).perWorkspaceCounts
+          : [],
+      );
+      setMessageCountState((current) =>
+        settleSearchExactCount(current, searchGenerationRef.current, request.generation, "ready"),
+      );
+    } catch (err) {
+      if (!requestIsCurrent()) return;
+      if (isSearchCancellationError(err)) {
+        setMessageCountState(createSearchExactCountState(request.generation));
+        return;
+      }
+      setMessageCountState((current) =>
+        settleSearchExactCount(
+          current,
+          searchGenerationRef.current,
+          request.generation,
+          "unavailable",
+        ),
+      );
+    } finally {
+      if (requestIsCurrent()) {
+        messageCountRequestRef.current = null;
       }
     }
   }
 
-  async function loadConversationsPage(append: boolean) {
-    if (!conversationScopes.length) return;
+  async function loadConversationsPage(append: boolean, request: AppliedSearchVersion) {
+    const snapshot = request.snapshot;
+    if (snapshot.listMode !== "conversations" || !snapshot.conversationScopes.length) return;
+    if (!isSearchGenerationCurrent(request.generation, searchGenerationRef.current)) return;
 
-    const requestId = conversationSearchRequestIdRef.current + 1;
-    conversationSearchRequestIdRef.current = requestId;
-    const queriedWorkspaceIds = conversationScopes.map((scope) => scope.workspaceId);
+    const queriedWorkspaceIds = snapshot.conversationScopes.map((scope) => scope.workspaceId);
     const offset = append ? conversations.length : 0;
+    if (
+      !append &&
+      topLevelSearchRequestRef.current?.generation === request.generation &&
+      topLevelSearchRequestRef.current.mode === "conversations"
+    ) {
+      return;
+    }
+    let requestIdentity: SearchLoadingState | PageRequestIdentity;
     if (append) {
-      setIsLoadingMoreConversations(true);
+      const pending = conversationLoadMoreRequestRef.current;
+      if (pending?.generation === request.generation) return;
+      const requestId = conversationLoadMoreRequestSequenceRef.current + 1;
+      requestIdentity = {
+        ...createSearchOperationIdentity(
+          request.generation,
+          "conversation-load-more",
+          requestId,
+        ),
+        offset,
+        requestId,
+      };
+      conversationLoadMoreRequestSequenceRef.current = requestIdentity.requestId;
+      conversationLoadMoreRequestRef.current = requestIdentity;
+      setConversationLoadMoreRequest(requestIdentity);
     } else {
-      setIsSearching(true);
+      const requestId = topLevelSearchRequestSequenceRef.current + 1;
+      requestIdentity = {
+        ...createSearchOperationIdentity(request.generation, "conversation-page", requestId),
+        mode: "conversations",
+        requestId,
+      };
+      topLevelSearchRequestSequenceRef.current = requestIdentity.requestId;
+      topLevelSearchRequestRef.current = requestIdentity;
+      setSearchLoading(requestIdentity);
+      setSearchError(null);
       setExpandedConversations({});
     }
 
+    const requestIsCurrent = () => {
+      if (!isSearchGenerationCurrent(request.generation, searchGenerationRef.current)) return false;
+      const activeRequest = append
+        ? conversationLoadMoreRequestRef.current
+        : topLevelSearchRequestRef.current;
+      return activeRequest?.requestId === requestIdentity.requestId;
+    };
+
     try {
-      const result = await invoke<ConversationListResult>("list_conversations", {
-        scopes: conversationScopes,
-        query: debouncedSearch.trim() || null,
-        searchFilters: backendSearchFilters(searchFilters),
-        conversationSort,
+      const result = await invoke<ConversationPageResult>("list_conversations", {
+        scopes: snapshot.conversationScopes,
+        query: snapshot.query || null,
+        searchFilters: backendSearchFilters(snapshot),
+        conversationSort: snapshot.conversationSort,
         limit: conversationPageSize,
         offset,
+        searchGeneration: request.generation,
+        searchOperationId: requestIdentity.operationId,
       });
-      if (conversationSearchRequestIdRef.current !== requestId) return;
+      if (!requestIsCurrent()) return;
 
-      setConversationTotalCount(result.totalCount);
-      setConversationMatchingMessageCount(result.matchingMessageCount);
+      setConversationHasMore(result.hasMore);
       setConversationIndexedWorkspaceCount(result.indexedWorkspaceCount);
       setConversationWorkspaceIssues(result.unindexedWorkspaces);
-      setConversations((current) => (append ? [...current, ...result.items] : result.items));
+      setConversations((current) =>
+        append
+          ? appendUniqueByKey(
+              current,
+              result.items,
+              (item) => `${item.workspaceId}:${item.conversationId}`,
+            )
+          : result.items,
+      );
+      setSearchError(null);
     } catch (err) {
-      if (conversationSearchRequestIdRef.current === requestId) setError(getErrorMessage(err));
-    } finally {
-      if (conversationSearchRequestIdRef.current === requestId) {
-        setIsSearching(false);
-        setIsLoadingMoreConversations(false);
-        setInitializingWorkspaceId((current) =>
-          current && queriedWorkspaceIds.includes(current) ? null : current,
-        );
+      if (isSearchCancellationError(err)) return;
+      if (requestIsCurrent()) {
+        setSearchError({ generation: request.generation, message: getErrorMessage(err) });
       }
+    } finally {
+      if (!requestIsCurrent()) return;
+      if (append) {
+        conversationLoadMoreRequestRef.current = null;
+        setConversationLoadMoreRequest(null);
+      } else {
+        topLevelSearchRequestRef.current = null;
+        setSearchLoading(null);
+      }
+      setInitializingWorkspaceId((current) =>
+        current && queriedWorkspaceIds.includes(current) ? null : current,
+      );
     }
   }
 
-  function conversationKey(workspaceId: string, conversationId: string): string {
-    return `${workspaceId}:${conversationId}`;
+  async function loadConversationCount(request: AppliedSearchVersion) {
+    const snapshot = request.snapshot;
+    if (snapshot.listMode !== "conversations" || !snapshot.conversationScopes.length) return;
+    if (!isSearchGenerationCurrent(request.generation, searchGenerationRef.current)) return;
+    if (conversationCountRequestRef.current?.generation === request.generation) return;
+
+    const requestId = conversationCountRequestSequenceRef.current + 1;
+    const requestIdentity: CountRequestIdentity = {
+      ...createSearchOperationIdentity(request.generation, "conversation-count", requestId),
+      mode: "conversations",
+      requestId,
+    };
+    conversationCountRequestSequenceRef.current = requestId;
+    conversationCountRequestRef.current = requestIdentity;
+    setConversationTotalCount(0);
+    setConversationMatchingMessageCount(0);
+    setConversationCountState(createSearchExactCountState(request.generation, "pending"));
+
+    const requestIsCurrent = () =>
+      isSearchGenerationCurrent(request.generation, searchGenerationRef.current) &&
+      conversationCountRequestRef.current?.requestId === requestIdentity.requestId;
+
+    try {
+      const result = await invoke<ConversationCountResult>("count_conversations", {
+        scopes: snapshot.conversationScopes,
+        query: snapshot.query || null,
+        searchFilters: backendSearchFilters(snapshot),
+        searchGeneration: request.generation,
+        searchOperationId: requestIdentity.operationId,
+      });
+      if (!requestIsCurrent()) return;
+      setConversationTotalCount(result.totalCount);
+      setConversationMatchingMessageCount(result.matchingMessageCount);
+      setConversationCountState((current) =>
+        settleSearchExactCount(current, searchGenerationRef.current, request.generation, "ready"),
+      );
+    } catch (err) {
+      if (!requestIsCurrent()) return;
+      if (isSearchCancellationError(err)) {
+        setConversationCountState(createSearchExactCountState(request.generation));
+        return;
+      }
+      setConversationCountState((current) =>
+        settleSearchExactCount(
+          current,
+          searchGenerationRef.current,
+          request.generation,
+          "unavailable",
+        ),
+      );
+    } finally {
+      if (requestIsCurrent()) {
+        conversationCountRequestRef.current = null;
+      }
+    }
   }
 
   async function loadConversationMessages(
@@ -3224,12 +3774,25 @@ function App() {
     showEntireConversation: boolean,
     append = false,
   ) {
-    const key = conversationKey(conversation.workspaceId, conversation.conversationId);
+    const request = appliedSearchVersion;
+    const snapshot = request.snapshot;
+    if (snapshot.listMode !== "conversations") return;
+    if (!isSearchGenerationCurrent(request.generation, searchGenerationRef.current)) return;
+    const key = conversationStateKey(conversation.workspaceId, conversation.conversationId);
     const current = expandedConversations[key];
-    const scope = conversationScopes.find(
+    const scope = snapshot.conversationScopes.find(
       (candidate) => candidate.workspaceId === conversation.workspaceId,
     );
     if (!scope) return;
+    const pending = expandedConversationRequestsRef.current.get(key);
+    if (pending?.generation === request.generation) return;
+    const requestId = expandedConversationRequestSequenceRef.current + 1;
+    const requestIdentity = {
+      ...createSearchOperationIdentity(request.generation, "expanded-conversation", requestId),
+      requestId,
+    };
+    expandedConversationRequestSequenceRef.current = requestIdentity.requestId;
+    expandedConversationRequestsRef.current.set(key, requestIdentity);
 
     setExpandedConversations((states) => ({
       ...states,
@@ -3249,43 +3812,87 @@ function App() {
         conversationId: conversation.conversationId,
         folderId: scope.folderId,
         includeSubfolders: scope.includeSubfolders,
-        query: debouncedSearch.trim() || null,
-        searchFilters: backendSearchFilters(searchFilters),
+        query: snapshot.query || null,
+        searchFilters: backendSearchFilters(snapshot),
         showEntireConversation,
         limit: conversationMessagePageSize,
         offset: append ? current?.items.length ?? 0 : 0,
+        searchGeneration: request.generation,
+        searchOperationId: requestIdentity.operationId,
       });
+      const activeRequest = expandedConversationRequestsRef.current.get(key);
+      if (
+        !isExpandedConversationResponseCurrent(
+          request.generation,
+          searchGenerationRef.current,
+          requestIdentity.requestId,
+          activeRequest?.requestId,
+          activeRequest != null,
+        )
+      ) {
+        return;
+      }
+      expandedConversationRequestsRef.current.delete(key);
       setExpandedConversations((states) => ({
         ...states,
-        [key]: {
-          items: append ? [...(states[key]?.items ?? []), ...result.items] : result.items,
-          matchingMessageCount: result.matchingMessageCount,
-          totalMessageCount: result.totalMessageCount,
-          showingEntireConversation: result.showingEntireConversation,
-          loading: false,
-          error: null,
-        },
+        ...(states[key]
+          ? {
+              [key]: {
+                items: append
+                  ? appendUniqueByKey(
+                      states[key].items,
+                      result.items,
+                      (item) => `${conversation.workspaceId}:${item.id}`,
+                    )
+                  : result.items,
+                matchingMessageCount: result.matchingMessageCount,
+                totalMessageCount: result.totalMessageCount,
+                showingEntireConversation: result.showingEntireConversation,
+                loading: false,
+                error: null,
+              },
+            }
+          : {}),
       }));
     } catch (err) {
+      if (isSearchCancellationError(err)) return;
+      const activeRequest = expandedConversationRequestsRef.current.get(key);
+      if (
+        !isExpandedConversationResponseCurrent(
+          request.generation,
+          searchGenerationRef.current,
+          requestIdentity.requestId,
+          activeRequest?.requestId,
+          activeRequest != null,
+        )
+      ) {
+        return;
+      }
+      expandedConversationRequestsRef.current.delete(key);
       setExpandedConversations((states) => ({
         ...states,
-        [key]: {
-          ...(states[key] ?? {
-            items: [],
-            matchingMessageCount: conversation.matchingMessageCount,
-            totalMessageCount: conversation.totalMessageCount,
-            showingEntireConversation: showEntireConversation,
-          }),
-          loading: false,
-          error: getErrorMessage(err),
-        },
+        ...(states[key]
+          ? {
+              [key]: {
+                ...states[key],
+                loading: false,
+                error: getErrorMessage(err),
+              },
+            }
+          : {}),
       }));
     }
   }
 
   function toggleConversation(conversation: ConversationSummary) {
-    const key = conversationKey(conversation.workspaceId, conversation.conversationId);
+    const key = conversationStateKey(conversation.workspaceId, conversation.conversationId);
     if (expandedConversations[key]) {
+      const pending = expandedConversationRequestsRef.current.get(key);
+      if (pending) {
+        const cancellation = cancellationForOperation(pending, searchGenerationRef.current);
+        if (cancellation) cancelBackendSearch(cancellation);
+      }
+      expandedConversationRequestsRef.current.delete(key);
       setExpandedConversations((states) => {
         const next = { ...states };
         delete next[key];
@@ -3297,6 +3904,12 @@ function App() {
   }
 
   function clearWorkspaceState() {
+    const currentSearch = searchApplicationRef.current;
+    if (currentSearch) {
+      invalidateSearchLifecycle(
+        clearAppliedSearchSnapshot(currentSearch.applied.snapshot, searchScope),
+      );
+    }
     progressEventsEnabledRef.current = false;
     operationWorkspaceIdRef.current = null;
     activeWorkspaceIdRef.current = null;
@@ -3314,22 +3927,25 @@ function App() {
     setInitializingWorkspaceId(null);
     setMessages([]);
     setMessageTotalCount(0);
+    setMessageHasMore(false);
+    setMessageCountState(createSearchExactCountState(searchGenerationRef.current));
     setWorkspaceSearchCounts([]);
     setConversations([]);
     setConversationTotalCount(0);
     setConversationMatchingMessageCount(0);
+    setConversationHasMore(false);
+    setConversationCountState(createSearchExactCountState(searchGenerationRef.current));
     setConversationIndexedWorkspaceCount(0);
     setConversationWorkspaceIssues([]);
     setExpandedConversations({});
     setSelectedMessage(null);
     setSearch("");
-    setDebouncedSearch("");
     setAdvancedSearchOpen(false);
     setSearchFilters(defaultAdvancedSearchFilters);
     setSortOrder("newest");
-    setIsSearching(false);
-    setIsLoadingMoreMessages(false);
-    setIsLoadingMoreConversations(false);
+    setSearchLoading(null);
+    setMessageLoadMoreRequest(null);
+    setConversationLoadMoreRequest(null);
     setExportResults({});
     setExportingAttachmentId(null);
     resetPrintableStatus();
@@ -4153,7 +4769,7 @@ function App() {
 
     setError(null);
     setSourceEmlStatus(
-      allowRemoteResources ? "Loading remote images for this message." : "Opening standalone message.",
+      allowRemoteResources ? loadingRemoteImagesStatus : "Opening standalone message.",
     );
     setIsLoadingSourceEml(true);
     try {
@@ -4215,7 +4831,7 @@ function App() {
     if (sourceEmlMode === "raw_source") {
       bodyHtml = plainTextPrintBody(sourceEmlView.rawSource);
       bodyModeLabel = "Raw Source";
-      note = "Printed raw EML source text. No remote resources were loaded.";
+      note = rawSourcePrintNote(sourceEmlView);
     } else if (sourceEmlMode === "plain_text") {
       bodyHtml = plainTextPrintBody(formatBodyForDisplay(sourceEmlView.bodyText));
       bodyModeLabel = "Plain Text";
@@ -4306,7 +4922,7 @@ function App() {
   async function revealSavedEml(outputPath: string) {
     try {
       await invoke("reveal_saved_eml", { outputPath });
-      setSourceEmlStatus("Revealed saved source EML in Finder.");
+      setSourceEmlStatus("Revealed saved source message in Finder.");
     } catch (err) {
       setError(getErrorMessage(err));
     }
@@ -4517,6 +5133,7 @@ function App() {
       });
       addDeleteStatus(deletedWorkspaceId, "Delete command returned");
       if (result.deleted && !result.existsAfter) {
+        invalidateSearchLifecycle();
         clearWorkspaceOperationState(deletedWorkspaceId);
         setWorkspaceDeleteToast({
           workspaceId: deletedWorkspaceId,
@@ -4635,6 +5252,57 @@ function App() {
     setSearchFilters((current) => ({ ...current, [key]: value }));
   }
 
+  function applySearchDraftToControls(nextDraft: SearchDraft) {
+    const { query, ...filters } = nextDraft;
+    setSearch(query);
+    setSearchFilters(filters);
+  }
+
+  function removeSearchChip(id: AppliedFilterChipId) {
+    const removal = removeAppliedFilter(draftSearchSnapshot, id);
+    if (!removal.changed) return;
+
+    forceNextSearchApplication();
+    applySearchDraftToControls(removal.draft);
+    if (removal.scope !== searchScope) {
+      setSearchScope(removal.scope);
+    }
+    if (id === "folderScope") {
+      setIncludeSubfolders(true);
+      rememberIncludeSubfolders(true);
+    }
+    if (removal.clearFolderSelection) {
+      if (draftSearchSnapshot.scope === "all_open") {
+        setAllOpenFolderSelection({ workspaceId: null, folderId: null });
+      } else {
+        selectCurrentWorkspaceFolder(null);
+      }
+    }
+  }
+
+  function clearAllSearch() {
+    const cleared = clearAllSearchDraft(draftSearchSnapshot);
+    if (!cleared.changed) return;
+
+    forceNextSearchApplication();
+    applySearchDraftToControls(cleared.draft);
+    setSortOrder(cleared.messageSort);
+    setConversationSort(cleared.conversationSort);
+    setIncludeSubfolders(true);
+    rememberIncludeSubfolders(true);
+    if (cleared.clearAllOpenFolderSelection) {
+      setAllOpenFolderSelection({ workspaceId: null, folderId: null });
+    }
+  }
+
+  function handleAdvancedSearchKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    setAdvancedSearchOpen(false);
+    window.requestAnimationFrame(() => advancedSearchToggleRef.current?.focus());
+  }
+
   function rememberWorkspaceFolderSelection(selection: WorkspaceFolderSelection) {
     setOpenPstSessions((current) =>
       current.map((session) =>
@@ -4715,18 +5383,6 @@ function App() {
       ...current,
       folderScope: checked ? "current_subfolders" : "current",
     }));
-  }
-
-  function clearSearchText() {
-    setSearch("");
-    setDebouncedSearch("");
-  }
-
-  function clearSearchFilters() {
-    setSearchFilters({
-      ...defaultAdvancedSearchFilters,
-      folderScope: includeSubfolders ? "current_subfolders" : "current",
-    });
   }
 
   function startPaneResize(
@@ -4829,24 +5485,26 @@ function App() {
 
   const selectedFolder = folders.find((folder) => folder.id === selectedFolderId);
   const displayedFolderName =
-    searchScope === "all_open"
-      ? allOpenSelectedWorkspaceId
-        ? `${pstDisplayName(allOpenSelectedSession?.workspace ?? null)} - ${
-            allOpenSelectedFolderId == null
+    appliedIsCrossPstSearch
+      ? appliedSelectedWorkspaceId
+        ? `${pstDisplayName(appliedSelectedSession?.workspace ?? null)} - ${
+            appliedSearch.folderId == null
               ? "All Mail"
-              : allOpenSelectedFolder?.name ?? "Folder"
+              : appliedSelectedFolder?.name ?? "Folder"
           }`
         : "All Open PSTs"
-      : searchFilters.folderScope === "all" || selectedFolderId == null
+      : appliedSearch.folderScope === "all" || appliedSearch.folderId == null
       ? "All Mail"
-      : selectedFolder?.name ?? "Messages";
+      : appliedSelectedFolder?.name ?? selectedFolder?.name ?? "Messages";
   const progress = visibleWorkspaceOperation?.progress ?? null;
   const workspaceOperationNotice = visibleWorkspaceOperation?.notice ?? null;
   const workspaceOperationError = visibleWorkspaceOperation?.error ?? null;
-  const displayedError = workspaceOperationError ?? error;
+  const displayedError = workspaceOperationError ?? activeSearchError ?? error;
   const displayedSetupCommand = workspaceOperationError
     ? visibleWorkspaceOperation?.setupCommand ?? null
-    : setupCommand;
+    : activeSearchError
+      ? null
+      : setupCommand;
   const displayedNotice = workspaceOperationNotice ?? notice;
   const deleteResult = visibleWorkspaceOperation?.deleteResult ?? null;
   const deleteStatuses = activeWorkspaceOperation?.deleteStatuses ?? [];
@@ -4904,70 +5562,121 @@ function App() {
   const deleteResolved =
     deleteResult != null &&
     ((deleteResult.deleted && !deleteResult.existsAfter) || deleteResult.alreadyMissing);
-  const activeFilterChips = [
-    search.trim() ? `Search: ${search.trim()}` : null,
-    searchScope === "all_open"
-      ? `PST scope: All Open PSTs (${formatCount(openPstSessions.length)})`
-      : null,
-    searchFilters.from.trim() ? `From: ${searchFilters.from.trim()}` : null,
-    searchFilters.recipients.trim() ? `To/Cc/Bcc: ${searchFilters.recipients.trim()}` : null,
-    searchFilters.subject.trim() ? `Subject: ${searchFilters.subject.trim()}` : null,
-    searchFilters.body.trim() ? `Body: ${searchFilters.body.trim()}` : null,
-    searchFilters.attachment.trim() ? `Attachment: ${searchFilters.attachment.trim()}` : null,
-    searchFilters.hasAttachments === "yes"
-      ? "Has attachments"
-      : searchFilters.hasAttachments === "no"
-        ? "No attachments"
+  const activeFilterChips = buildAppliedFilterChips(appliedSearch, {
+    workspaceCount: appliedSearch.workspaceIds.length,
+    workspaceLabel:
+      appliedIsCrossPstSearch && appliedSelectedWorkspaceId
+        ? pstDisplayName(appliedSelectedSession?.workspace ?? null)
         : null,
-    searchFilters.dateFrom || searchFilters.dateTo
-      ? `Date: ${searchFilters.dateFrom || "Any"} - ${searchFilters.dateTo || "Any"}`
-      : null,
-    searchScope === "all_open"
-      ? allOpenSelectedWorkspaceId
-        ? `Folder: ${pstDisplayName(allOpenSelectedSession?.workspace ?? null)} / ${
-            allOpenSelectedFolderId == null
-              ? "All Mail"
-              : allOpenSelectedFolder?.name ?? "Selected folder"
-          }${allOpenSelectedFolderId != null && includeSubfolders ? " + subfolders" : ""}`
-        : "Folder scope: All Mail in each open PST"
-      : searchFilters.folderScope === "all"
-      ? "Scope: All Mail"
-      : searchFilters.folderScope === "current"
-        ? "Scope: Current folder"
-        : selectedFolderId != null
-          ? "Scope: Current folder + subfolders"
-          : null,
-  ].filter((chip): chip is string => Boolean(chip));
-  const hasMoreMessages = messages.length < messageTotalCount;
-  const hasMoreConversations = conversations.length < conversationTotalCount;
-  const resultScopeSuffix = searchScope === "all_open"
-    ? ` across ${formatCount(activeSearchWorkspaceIds.length)} PST${
-        activeSearchWorkspaceIds.length === 1 ? "" : "s"
+    folderLabel:
+      appliedSearch.folderId == null
+        ? "All Mail"
+        : appliedSelectedFolder?.name ?? "Selected folder",
+  });
+  const canClearAppliedSearch = canClearAll(appliedSearch);
+  const activeMessageCountStatus =
+    messageCountState.generation === appliedSearchVersion.generation
+      ? messageCountState.status
+      : "idle";
+  const activeConversationCountStatus =
+    conversationCountState.generation === appliedSearchVersion.generation
+      ? conversationCountState.status
+      : "idle";
+  const hasMoreMessages = messageHasMore;
+  const hasMoreConversations = conversationHasMore;
+  const resultScopeSuffix = appliedIsCrossPstSearch
+    ? ` across ${formatCount(appliedSearch.workspaceIds.length)} PST${
+        appliedSearch.workspaceIds.length === 1 ? "" : "s"
       }`
     : "";
   const messageResultSummaryText =
-    messageTotalCount === 0
-      ? `0 results${resultScopeSuffix}`
-      : messages.length === messageTotalCount
-        ? `Showing ${formatCount(messages.length)} of ${formatCount(messageTotalCount)} results${resultScopeSuffix}`
-        : `Showing 1-${formatCount(messages.length)} of ${formatCount(messageTotalCount)} results${resultScopeSuffix}`;
+    activeMessageCountStatus === "ready"
+      ? messageTotalCount === 0
+        ? `0 results${resultScopeSuffix}`
+        : messages.length === messageTotalCount
+          ? `Showing ${formatCount(messages.length)} of ${formatCount(messageTotalCount)} results${resultScopeSuffix}`
+          : `Showing 1-${formatCount(messages.length)} of ${formatCount(messageTotalCount)} results${resultScopeSuffix}`
+      : activeMessageCountStatus === "unavailable"
+        ? `Showing ${formatCount(messages.length)} result${messages.length === 1 ? "" : "s"}${resultScopeSuffix}; exact count unavailable`
+        : activeMessageCountStatus === "pending"
+          ? messages.length
+            ? `Showing ${formatCount(messages.length)} result${messages.length === 1 ? "" : "s"}${resultScopeSuffix}; counting total...`
+            : `Showing results${resultScopeSuffix}; counting total...`
+          : `Message results${resultScopeSuffix}`;
   const conversationResultSummaryText =
-    conversationTotalCount === 0
-      ? `0 matching messages in 0 conversations${resultScopeSuffix}`
-      : `${formatCount(conversationMatchingMessageCount)} matching message${
-          conversationMatchingMessageCount === 1 ? "" : "s"
-        } in ${formatCount(conversationTotalCount)} conversation${
-          conversationTotalCount === 1 ? "" : "s"
-        }${resultScopeSuffix}`;
+    activeConversationCountStatus === "ready"
+      ? conversationTotalCount === 0
+        ? `0 matching messages in 0 conversations${resultScopeSuffix}`
+        : `${formatCount(conversationMatchingMessageCount)} matching message${
+            conversationMatchingMessageCount === 1 ? "" : "s"
+          } in ${formatCount(conversationTotalCount)} conversation${
+            conversationTotalCount === 1 ? "" : "s"
+          }${resultScopeSuffix}`
+      : activeConversationCountStatus === "unavailable"
+        ? `Showing ${formatCount(conversations.length)} conversation${
+            conversations.length === 1 ? "" : "s"
+          }${resultScopeSuffix}; exact count unavailable`
+        : activeConversationCountStatus === "pending"
+          ? conversations.length
+            ? `Showing ${formatCount(conversations.length)} conversation${
+                conversations.length === 1 ? "" : "s"
+              }${resultScopeSuffix}; counting totals...`
+            : `Showing conversations${resultScopeSuffix}; counting totals...`
+          : `Conversation results${resultScopeSuffix}`;
   const resultSummaryText =
-    listMode === "conversations" ? conversationResultSummaryText : messageResultSummaryText;
+    appliedSearch.listMode === "conversations"
+      ? conversationResultSummaryText
+      : messageResultSummaryText;
   const isInitializingMessageList =
     workspace != null && initializingWorkspaceId === workspace.id;
+  const isResultsBusy =
+    isInitializingMessageList ||
+    isSearching ||
+    (appliedSearch.listMode === "messages"
+      ? isLoadingMoreMessages
+      : isLoadingMoreConversations);
+  const searchEmptyState = classifySearchEmptyState({
+    hasWorkspace: workspace != null,
+    isSearchActive,
+    isLoading: isInitializingMessageList || isSearching,
+    resultCount:
+      appliedSearch.listMode === "conversations" ? conversations.length : messages.length,
+    listMode: appliedSearch.listMode,
+    scope: appliedSearch.scope,
+    activeFilterCount: activeAdvancedFilterCount,
+    errorGeneration: searchError?.generation ?? null,
+    currentGeneration: appliedSearchVersion.generation,
+  });
+  const conversationReindexRequired =
+    appliedSearch.listMode === "conversations" &&
+    conversationWorkspaceIssues.length > 0 &&
+    conversationIndexedWorkspaceCount === 0 &&
+    searchEmptyState.kind !== "loading" &&
+    searchEmptyState.kind !== "failed";
   const paneLayoutStyle = {
     "--folder-pane-width": `${paneWidths.folder}px`,
     "--message-pane-width": `${paneWidths.message}px`,
     "--outlook-message-height": `${paneWidths.outlookMessage}px`,
   } as CSSProperties;
+  const messageResultsMeasurementIdentity = [
+    appearance,
+    layoutMode,
+    messageListDisplayMode,
+    foldersHidden ? "folders-hidden" : "folders-visible",
+    paneWidths.folder,
+    paneWidths.message,
+    paneWidths.outlookMessage,
+    appliedIsCrossPstSearch ? "cross-pst" : "single-pst",
+  ].join(":");
+  const conversationResultsMeasurementIdentity = [
+    appearance,
+    layoutMode,
+    foldersHidden ? "folders-hidden" : "folders-visible",
+    paneWidths.folder,
+    paneWidths.message,
+    paneWidths.outlookMessage,
+    appliedIsCrossPstSearch ? "cross-pst" : "single-pst",
+  ].join(":");
   const workspaceSummaryText = workspace
     ? [
         workspaceSize?.workspaceLocationLabel ?? workspace.workspaceLocationLabel,
@@ -5004,13 +5713,33 @@ function App() {
               aria-label="Search emails"
             />
             <button
+              id={advancedSearchToggleId}
+              ref={advancedSearchToggleRef}
               type="button"
-              className={advancedSearchOpen || hasActiveAdvancedFilters ? "filter-toggle active" : "filter-toggle"}
+              className={
+                advancedSearchOpen || activeAdvancedFilterCount > 0
+                  ? "filter-toggle active"
+                  : "filter-toggle"
+              }
               onClick={() => setAdvancedSearchOpen((open) => !open)}
               disabled={!workspace || isBusy}
               title="Show advanced search filters."
+              aria-expanded={advancedSearchOpen}
+              aria-controls={advancedSearchPanelId}
+              aria-label={
+                activeAdvancedFilterCount > 0
+                  ? `Advanced search, ${activeAdvancedFilterCount} active filter${
+                      activeAdvancedFilterCount === 1 ? "" : "s"
+                    }`
+                  : "Advanced search, no active filters"
+              }
             >
-              Advanced
+              <span>Advanced</span>
+              {activeAdvancedFilterCount > 0 ? (
+                <span className="filter-count" aria-hidden="true">
+                  {activeAdvancedFilterCount}
+                </span>
+              ) : null}
             </button>
             <label className="scope-control">
               <span>Scope</span>
@@ -5025,7 +5754,13 @@ function App() {
             </label>
           </div>
           {advancedSearchOpen ? (
-            <div className="advanced-search-panel" role="group" aria-label="Advanced search filters">
+            <div
+              id={advancedSearchPanelId}
+              className="advanced-search-panel"
+              role="group"
+              aria-labelledby={advancedSearchToggleId}
+              onKeyDown={handleAdvancedSearchKeyDown}
+            >
               <label>
                 <span>From</span>
                 <input
@@ -5117,8 +5852,13 @@ function App() {
                 </select>
               </label>
               <div className="advanced-search-actions">
-                <button type="button" onClick={clearSearchFilters} disabled={!workspace || isBusy}>
-                  Clear Filters
+                <button
+                  type="button"
+                  onClick={clearAllSearch}
+                  disabled={!workspace || isBusy || !canClearAppliedSearch}
+                  aria-label="Clear all search filters and sorting"
+                >
+                  Clear All
                 </button>
               </div>
             </div>
@@ -5444,33 +6184,51 @@ function App() {
       ) : null}
 
       {isSearchActive ? (
-        <section className="search-summary" aria-live="polite">
-          <strong>
-            {isSearching ? "Searching..." : resultSummaryText}
-          </strong>
+        <section className="search-summary">
+          <strong>{isSearching ? "Searching..." : resultSummaryText}</strong>
+          <span className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+            {isSearching
+              ? "Searching."
+              : appliedSearch.listMode === "conversations"
+                ? "Conversation results ready."
+                : "Message results ready."}
+          </span>
           <div className="filter-chips">
             {activeFilterChips.map((chip) => (
-              <span key={chip}>{chip}</span>
+              <button
+                type="button"
+                className="filter-chip"
+                key={chip.id}
+                onClick={() => removeSearchChip(chip.id)}
+                disabled={isBusy}
+                aria-label={chip.removeLabel}
+                title={chip.text}
+              >
+                <span className="filter-chip-text">{chip.text}</span>
+                <span className="filter-chip-remove" aria-hidden="true">
+                  x
+                </span>
+              </button>
             ))}
-            {isCrossPstSearch
+            {appliedIsCrossPstSearch
               ? workspaceSearchCounts
                   .filter((count) => count.count > 0)
                   .map((count) => (
-                    <span key={count.workspaceId}>
+                    <span className="result-count-chip" key={count.workspaceId}>
                       {count.pstDisplayName}: {formatCount(count.count)}
                     </span>
                   ))
               : null}
           </div>
           <div className="search-summary-actions">
-            {search.trim() ? (
-              <button type="button" onClick={clearSearchText} disabled={isBusy}>
-                Clear Search
-              </button>
-            ) : null}
-            {hasActiveAdvancedFilters ? (
-              <button type="button" onClick={clearSearchFilters} disabled={isBusy}>
-                Clear Filters
+            {canClearAppliedSearch && !advancedSearchOpen ? (
+              <button
+                type="button"
+                onClick={clearAllSearch}
+                disabled={isBusy}
+                aria-label="Clear all search filters and sorting"
+              >
+                Clear All
               </button>
             ) : null}
           </div>
@@ -6028,7 +6786,7 @@ function App() {
           <div className="pane-heading message-pane-heading">
             <div className="message-heading-title">
               <h2>
-                {listMode === "conversations" ? "Conversations - " : ""}
+                {appliedSearch.listMode === "conversations" ? "Conversations - " : ""}
                 {isSearchActive ? `Search Results - ${displayedFolderName}` : displayedFolderName}
               </h2>
               <span title={resultSummaryText}>
@@ -6056,284 +6814,139 @@ function App() {
                       <option value="subject">Subject A-Z</option>
                     </select>
                   ) : (
-                    <select
-                      value={sortOrder}
-                      onChange={(event) => setSortOrder(event.target.value as SortOrder)}
-                      disabled={isBusy}
-                    >
-                      <option value="newest">Newest first</option>
-                      <option value="oldest">Oldest first</option>
-                      <option value="sender_az">Sender A-Z</option>
-                      <option value="subject_az">Subject A-Z</option>
-                    </select>
+                    <>
+                      <select
+                        value={draftSearchSnapshot.messageSort}
+                        onChange={(event) => {
+                          const requested = event.target.value as SortOrder;
+                          setSortOrder(
+                            requested === "relevance" && !relevanceAvailability.available
+                              ? "newest"
+                              : requested,
+                          );
+                        }}
+                        disabled={isBusy}
+                        aria-describedby={relevanceSortHelpId}
+                      >
+                        <option value="newest">Newest first</option>
+                        <option
+                          value="relevance"
+                          disabled={!relevanceAvailability.available}
+                          title={relevanceAvailability.explanation}
+                        >
+                          Relevance
+                        </option>
+                        <option value="oldest">Oldest first</option>
+                        <option value="sender_az">Sender A-Z</option>
+                        <option value="subject_az">Subject A-Z</option>
+                      </select>
+                      <span className="visually-hidden" id={relevanceSortHelpId}>
+                        {relevanceAvailability.explanation}
+                      </span>
+                    </>
                   )}
                 </label>
               ) : null}
             </div>
           </div>
-          <div className="message-list" ref={messageListRef}>
-            {listMode === "conversations" && conversationWorkspaceIssues.length ? (
-              <div className="conversation-index-warning">
-                <strong>Conversation data is not indexed for this workspace.</strong>
-                {conversationWorkspaceIssues.map((issue) => (
-                  <div key={issue.workspaceId}>
-                    <span title={issue.workspacePath}>{issue.pstDisplayName}</span>
-                    <button
-                      type="button"
-                      onClick={() => void reindexExistingEmls(issue.workspaceId)}
-                      disabled={!issue.canReindex || isBusy}
-                    >
-                      Reindex Existing EMLs
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-            {listMode === "conversations"
-              ? conversations.map((conversation) => {
-                  const key = conversationKey(
-                    conversation.workspaceId,
-                    conversation.conversationId,
-                  );
-                  const participantSummary = conversationParticipantSummary(
-                    conversation.participants,
-                    conversation.latestSender,
-                  );
-                  const participantTitle =
-                    conversation.participants.length > 0
-                      ? conversation.participants.join(", ")
-                      : conversation.latestSender || "(No sender)";
-                  const expanded = expandedConversations[key];
-                  const expectedExpandedCount = expanded?.showingEntireConversation
-                    ? expanded.totalMessageCount
-                    : expanded?.matchingMessageCount;
-                  return (
-                    <div className="conversation-group" key={key}>
-                      <button
-                        type="button"
-                        className={`conversation-row ${expanded ? "expanded" : ""}`}
-                        onClick={() => toggleConversation(conversation)}
-                        aria-expanded={Boolean(expanded)}
-                      >
-                        <span className="conversation-toggle" aria-hidden="true">
-                          {expanded ? "v" : ">"}
-                        </span>
-                        <span className="conversation-main">
-                          <span className="conversation-subject-line">
-                            <span className="conversation-subject">
-                              {conversation.subject || "(No subject)"}
-                            </span>
-                            {isCrossPstSearch ? (
-                              <span className="message-workspace" title={conversation.workspacePath}>
-                                {conversation.pstDisplayName}
-                              </span>
-                            ) : null}
-                          </span>
-                          <span
-                            className="conversation-participants"
-                            title={participantTitle}
-                            aria-label={`Participants: ${participantTitle}`}
-                          >
-                            {participantSummary}
-                          </span>
-                          <span className="conversation-snippet">
-                            <HighlightedText
-                              text={cleanMessageSnippet(conversation.snippet)}
-                              terms={highlightTerms}
-                            />
-                          </span>
-                        </span>
-                        <span className="conversation-meta">
-                          <span title={conversation.latestDate || undefined}>
-                            {formatMessageDate(conversation.latestDate)}
-                          </span>
-                          <span>
-                            {formatCount(conversation.matchingMessageCount)} match
-                            {conversation.matchingMessageCount === 1 ? "" : "es"} / {formatCount(
-                              conversation.totalMessageCount,
-                            )}
-                          </span>
-                          {conversation.hasAttachments ? <span>Attachments</span> : null}
-                        </span>
-                      </button>
-                      {expanded ? (
-                        <div className="conversation-expanded">
-                          {expanded.items.map((message) => {
-                            const isSelectedRow =
-                              selectedMessage?.id === message.id &&
-                              (selectedMessage.workspaceId ?? workspace?.id) ===
-                                conversation.workspaceId;
-                            return (
-                              <button
-                                type="button"
-                                key={`${conversation.workspaceId}-${message.id}`}
-                                className={`conversation-message-row ${
-                                  isSelectedRow ? "selected" : ""
-                                } ${message.matchesScope ? "" : "context-message"}`}
-                                onClick={() => void openMessage(message.id, conversation.workspaceId)}
-                                onDoubleClick={() =>
-                                  void openMessagePreviewWindow(message, conversation.workspaceId)
-                                }
-                              >
-                                <span className="conversation-message-sender">
-                                  {message.sender || "(No sender)"}
-                                </span>
-                                <span className="conversation-message-date" title={message.date}>
-                                  {formatMessageDate(message.date)}
-                                </span>
-                                <span className="conversation-message-folder">
-                                  {message.folderPath || message.folderName}
-                                  {!message.matchesScope ? " - context" : ""}
-                                </span>
-                                {message.attachmentCount > 0 ? (
-                                  <span className="conversation-message-attachments">
-                                    {formatCount(message.attachmentCount)} attachment
-                                    {message.attachmentCount === 1 ? "" : "s"}
-                                  </span>
-                                ) : null}
-                              </button>
-                            );
-                          })}
-                          {expanded.loading ? <p className="list-count-note">Loading messages...</p> : null}
-                          {expanded.error ? (
-                            <p className="conversation-error">{expanded.error}</p>
-                          ) : null}
-                          <div className="conversation-actions">
-                            {!expanded.showingEntireConversation &&
-                            expanded.totalMessageCount > expanded.matchingMessageCount ? (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void loadConversationMessages(conversation, true, false)
-                                }
-                                disabled={expanded.loading}
-                              >
-                                Show Entire Conversation
-                              </button>
-                            ) : null}
-                            {expanded.items.length < (expectedExpandedCount ?? 0) ? (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void loadConversationMessages(
-                                    conversation,
-                                    expanded.showingEntireConversation,
-                                    true,
-                                  )
-                                }
-                                disabled={expanded.loading}
-                              >
-                                Load More Messages
-                              </button>
-                            ) : null}
-                          </div>
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })
-              : messages.map((message) => {
-              const displayDate = formatMessageDate(message.date);
-              const displaySnippet = cleanMessageSnippet(message.snippet);
-              const rowWorkspaceId = message.workspaceId ?? workspace?.id;
-              const isSelectedRow =
-                selectedMessage?.id === message.id &&
-                (rowWorkspaceId ?? null) === (selectedMessage.workspaceId ?? workspace?.id ?? null);
-              const primaryText =
-                messageListDisplayMode === "sender_first"
-                  ? message.sender || "(No sender)"
-                  : message.subject || "(No subject)";
-              const secondaryText =
-                messageListDisplayMode === "sender_first"
-                  ? message.subject || "(No subject)"
-                  : message.sender || "(No sender)";
-              return (
-                <button
-                  type="button"
-                  key={`${rowWorkspaceId ?? "workspace"}-${message.id}`}
-                  className={`message-row ${isSelectedRow ? "selected" : ""}`}
-                  onClick={() => void openMessage(message.id, rowWorkspaceId)}
-                  onDoubleClick={() => void openMessagePreviewWindow(message, rowWorkspaceId)}
-                >
-                  <span className="message-subject">
-                    {primaryText}
-                    {message.attachmentCount > 0 ? (
-                      <span className="attachment-dot">📎 {formatCount(message.attachmentCount)}</span>
-                    ) : null}
-                  </span>
-                  {isCrossPstSearch && message.pstDisplayName ? (
-                    <span className="message-workspace" title={message.workspacePath || undefined}>
-                      {message.pstDisplayName}
-                      {message.folderPath ? ` - ${message.folderPath}` : ""}
-                    </span>
-                  ) : null}
-                  <span className="message-meta">{secondaryText}</span>
-                  <span className="message-snippet" title={message.snippet || undefined}>
-                    <HighlightedText text={displaySnippet} terms={highlightTerms} />
-                  </span>
-                  <span className="message-date" title={message.date || undefined}>
-                    {displayDate}
-                  </span>
-                </button>
-              );
-            })}
-            {listMode === "conversations" && !conversations.length ? (
-              <p className="empty-state">
-                {isInitializingMessageList
-                  ? "Loading messages..."
-                  : isSearching
-                    ? "Searching..."
-                  : conversationWorkspaceIssues.length && conversationIndexedWorkspaceCount === 0
-                    ? "Reindex existing EMLs to enable Conversation View."
-                    : isSearchActive
-                      ? "No conversations match this search."
-                      : "No conversations to show."}
-              </p>
-            ) : null}
-            {listMode === "messages" && !messages.length ? (
-              <p className="empty-state">
-                {isInitializingMessageList
-                  ? "Loading messages..."
-                  : isSearching
-                    ? "Searching..."
-                  : isSearchActive
-                    ? "No results match this search."
-                    : "No messages to show."}
-              </p>
-            ) : null}
-            {listMode === "conversations" && hasMoreConversations ? (
-              <div className="load-more-row">
-                <button
-                  type="button"
-                  onClick={() => void loadConversationsPage(true)}
-                  disabled={isSearching || isLoadingMoreConversations}
-                >
-                  {isLoadingMoreConversations
-                    ? "Loading..."
-                    : `Load More (${formatCount(
-                        conversationTotalCount - conversations.length,
-                      )} remaining)`}
-                </button>
-                <span>{conversationResultSummaryText}</span>
-              </div>
-            ) : listMode === "conversations" && conversations.length ? (
-              <p className="list-count-note">{conversationResultSummaryText}</p>
-            ) : listMode === "messages" && hasMoreMessages ? (
-              <div className="load-more-row">
-                <button
-                  type="button"
-                  onClick={() => void loadMessagesPage(true)}
-                  disabled={isSearching || isLoadingMoreMessages}
-                >
-                  {isLoadingMoreMessages
-                    ? "Loading..."
-                    : `Load More (${formatCount(messageTotalCount - messages.length)} remaining)`}
-                </button>
-                <span>{resultSummaryText}</span>
-              </div>
-            ) : listMode === "messages" && messages.length ? (
-              <p className="list-count-note">{messageResultSummaryText}</p>
-            ) : null}
+          <span
+            className="visually-hidden"
+            id={
+              appliedSearch.listMode === "messages"
+                ? messageResultsInstructionsId
+                : conversationResultsInstructionsId
+            }
+          >
+            {appliedSearch.listMode === "messages"
+              ? "Use Up and Down Arrow keys to move through results. Press Enter to open a message."
+              : "Use Up and Down Arrow keys to move. Use Right and Left Arrow keys to expand, collapse, and return to a conversation."}
+          </span>
+          <div
+            className="message-list"
+            ref={messageListRef}
+            aria-busy={isResultsBusy}
+            aria-describedby={
+              appliedSearch.listMode === "messages"
+                ? messageResultsInstructionsId
+                : conversationResultsInstructionsId
+            }
+            aria-label={
+              appliedSearch.listMode === "messages" ? "Message results" : "Conversation results"
+            }
+            role={appliedSearch.listMode === "messages" ? "list" : "tree"}
+            tabIndex={-1}
+          >
+            {appliedSearch.listMode === "conversations"
+              ? (
+                <ConversationResultsList
+                  activeNavigationKey={resultNavigation.conversations}
+                  cleanSnippet={cleanMessageSnippet}
+                  conversationReindexRequired={conversationReindexRequired}
+                  conversations={conversations}
+                  emptyState={searchEmptyState}
+                  exactCountStatus={activeConversationCountStatus}
+                  exactTotalCount={conversationTotalCount}
+                  expandedConversations={expandedConversations}
+                  formatCount={formatCount}
+                  formatDate={formatMessageDate}
+                  hasMore={hasMoreConversations}
+                  highlightTerms={highlightTerms}
+                  isBusy={isBusy}
+                  isCrossPstSearch={appliedIsCrossPstSearch}
+                  isLoadingMore={isLoadingMoreConversations}
+                  isSearching={isSearching}
+                  measurementIdentity={conversationResultsMeasurementIdentity}
+                  onLoadMoreConversation={(conversation, showingEntireConversation) =>
+                    void loadConversationMessages(conversation, showingEntireConversation, true)
+                  }
+                  onLoadMoreConversations={() =>
+                    void loadConversationsPage(true, appliedSearchVersion)
+                  }
+                  onOpenMessage={openMessage}
+                  onOpenPreview={openMessagePreviewWindow}
+                  onActiveNavigationKeyChange={setConversationNavigationKey}
+                  onReindexWorkspace={(workspaceId) => void reindexExistingEmls(workspaceId)}
+                  onShowEntireConversation={(conversation) =>
+                    void loadConversationMessages(conversation, true, false)
+                  }
+                  onToggleConversation={toggleConversation}
+                  resetIdentity={appliedSearchVersion.generation}
+                  resultSummaryText={conversationResultSummaryText}
+                  scrollContainerRef={messageListRef}
+                  selectedMessageId={selectedMessage?.id ?? null}
+                  selectedWorkspaceId={selectedMessage?.workspaceId ?? workspace?.id ?? null}
+                  workspaceIssues={conversationWorkspaceIssues}
+                />
+              )
+              : (
+                <MessageResultsList
+                  activeNavigationKey={resultNavigation.messages}
+                  activeWorkspaceId={workspace?.id ?? null}
+                  cleanSnippet={cleanMessageSnippet}
+                  displayMode={messageListDisplayMode}
+                  emptyState={searchEmptyState}
+                  exactCountStatus={activeMessageCountStatus}
+                  exactTotalCount={messageTotalCount}
+                  formatCount={formatCount}
+                  formatDate={formatMessageDate}
+                  hasMore={hasMoreMessages}
+                  highlightTerms={highlightTerms}
+                  isCrossPstSearch={appliedIsCrossPstSearch}
+                  isLoadingMore={isLoadingMoreMessages}
+                  isSearching={isSearching}
+                  measurementIdentity={messageResultsMeasurementIdentity}
+                  messages={messages}
+                  onLoadMore={() => void loadMessagesPage(true, appliedSearchVersion)}
+                  onActiveNavigationKeyChange={setMessageNavigationKey}
+                  onOpenMessage={openMessage}
+                  onOpenPreview={openMessagePreviewWindow}
+                  resetIdentity={appliedSearchVersion.generation}
+                  resultSummaryText={messageResultSummaryText}
+                  scrollContainerRef={messageListRef}
+                  selectedMessageId={selectedMessage?.id ?? null}
+                  selectedWorkspaceId={selectedMessage?.workspaceId ?? workspace?.id ?? null}
+                />
+              )}
           </div>
         </section>
 
@@ -6542,8 +7155,10 @@ function App() {
                         <button
                           type="button"
                           onClick={() => setRemoteImagesAllowedMessageId(selectedMessage.id)}
+                          aria-label={loadRemoteImagesActionLabel}
+                          title={loadRemoteImagesActionLabel}
                         >
-                          Load remote images for this message
+                          {loadRemoteImagesActionLabel}
                         </button>
                       </div>
                     ) : null}
@@ -7154,9 +7769,14 @@ function App() {
               <>
                 {sourceEmlView.remoteImagesBlocked && !sourceEmlRemoteAllowed ? (
                   <div className="remote-image-notice">
-                    <span>Remote resources are blocked.</span>
-                    <button type="button" onClick={() => void loadSourceEmlForCurrentContext(true)}>
-                      Load remote resources for this message
+                    <span>Remote images are blocked.</span>
+                    <button
+                      type="button"
+                      onClick={() => void loadSourceEmlForCurrentContext(true)}
+                      aria-label={loadRemoteImagesActionLabel}
+                      title={loadRemoteImagesActionLabel}
+                    >
+                      {loadRemoteImagesActionLabel}
                     </button>
                   </div>
                 ) : null}

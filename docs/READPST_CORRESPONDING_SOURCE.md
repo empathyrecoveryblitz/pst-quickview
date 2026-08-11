@@ -49,10 +49,10 @@ HTTPS asset location explicitly:
 scripts/prepare-readpst-corresponding-source.sh \
   /absolute/path/to/libpst-0.6.76.tar.gz \
   /absolute/output/readpst-corresponding-source-0.6.76 \
-  https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.2/readpst-corresponding-source-0.6.76.tar.gz
+  https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.3/readpst-corresponding-source-0.6.76.tar.gz
 ```
 
-This is the intended `0.2.0-beta.2` release asset URL. It is recorded metadata,
+This is the intended `0.2.0-beta.3` release asset URL. It is recorded metadata,
 not proof that the asset has been published; public delivery remains pending
 until the archive is uploaded and independently accessible. The script refuses
 existing output, verifies the exact intended URL plus the source and patch inputs, copies exact
@@ -111,7 +111,7 @@ deterministic archive contents, archive SHA-256, and concrete HTTPS publication
 location. For this beta, the location must be:
 
 ```text
-https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.2/readpst-corresponding-source-0.6.76.tar.gz
+https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.3/readpst-corresponding-source-0.6.76.tar.gz
 ```
 
 After verification, upload the companion archive and checksum beside the DMG at

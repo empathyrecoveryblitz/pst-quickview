@@ -13,7 +13,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -30,9 +30,29 @@ use tauri::{
 use walkdir::WalkDir;
 
 mod calendar_msg;
+mod search;
+mod search_cancellation;
+mod search_pagination;
+#[cfg(test)]
+mod search_stress;
 mod threading;
 
 use calendar_msg::CalendarItemDetails;
+use search::{
+    build_message_query_source, conversation_sort_clause, message_keyset_condition,
+    message_sort_clause, query_source_with_condition, resolve_message_keyset_boundary,
+    search_match_context_from_row, search_match_select_sql, validate_conversation_sort,
+    validate_message_sort_workspace_count, MessageQuerySource, MessageSearchCriteria, MessageSort,
+    SearchFilters, SearchMatchContext, SearchValidationError,
+};
+use search_cancellation::{
+    is_sqlite_interrupt, SearchCancellationError, SearchCancellationRegistry,
+    SearchOperationCategory, SearchOperationGuard, SEARCH_CANCELLED_CODE,
+};
+use search_pagination::{
+    opaque_hash, MessageCursorContext, MessageCursorPosition, SearchCursorCodec, SearchCursorError,
+    UNSUPPORTED_SEARCH_CURSOR_CODE,
+};
 
 use threading::{
     assign_threads, extract_email_addresses, extract_message_ids, normalize_thread_subject,
@@ -83,6 +103,8 @@ const MESSAGE_FORMAT_PROBE_BYTES: usize = 64 * 1024;
 pub struct AppError {
     message: String,
     setup_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 impl AppError {
@@ -90,6 +112,23 @@ impl AppError {
         Self {
             message: message.into(),
             setup_command: None,
+            code: None,
+        }
+    }
+
+    fn coded(message: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            message: message.into(),
+            setup_command: None,
+            code: Some(code),
+        }
+    }
+
+    fn search_cancelled() -> Self {
+        Self {
+            message: "Search cancelled.".to_string(),
+            setup_command: None,
+            code: Some(SEARCH_CANCELLED_CODE),
         }
     }
 
@@ -99,6 +138,7 @@ impl AppError {
             setup_command: Some(format!(
                 "{MISSING_READPST_INSTRUCTIONS} Command: {SETUP_COMMAND}"
             )),
+            code: None,
         }
     }
 }
@@ -119,7 +159,33 @@ impl From<std::io::Error> for AppError {
 
 impl From<rusqlite::Error> for AppError {
     fn from(error: rusqlite::Error) -> Self {
+        if is_sqlite_interrupt(&error) {
+            Self::search_cancelled()
+        } else {
+            Self::new(error.to_string())
+        }
+    }
+}
+
+impl From<SearchCancellationError> for AppError {
+    fn from(error: SearchCancellationError) -> Self {
+        if error == SearchCancellationError::Cancelled {
+            Self::search_cancelled()
+        } else {
+            Self::new(error.to_string())
+        }
+    }
+}
+
+impl From<SearchValidationError> for AppError {
+    fn from(error: SearchValidationError) -> Self {
         Self::new(error.to_string())
+    }
+}
+
+impl From<SearchCursorError> for AppError {
+    fn from(error: SearchCursorError) -> Self {
+        Self::coded(error.to_string(), error.code())
     }
 }
 
@@ -201,6 +267,8 @@ struct MessageListItem {
     has_attachments: bool,
     attachment_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    search_match_context: Option<SearchMatchContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workspace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pst_display_name: Option<String>,
@@ -210,8 +278,18 @@ struct MessageListItem {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MessageListResult {
+struct MessagePageResult {
     items: Vec<MessageListItem>,
+    requested_offset: i64,
+    returned_count: usize,
+    has_more: bool,
+    next_cursor: Option<String>,
+    pagination_mode: &'static str,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageCountResult {
     total_count: i64,
 }
 
@@ -254,12 +332,20 @@ struct ConversationWorkspaceIssue {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConversationListResult {
+struct ConversationPageResult {
     items: Vec<ConversationSummary>,
-    total_count: i64,
-    matching_message_count: i64,
+    requested_offset: i64,
+    returned_count: usize,
+    has_more: bool,
     indexed_workspace_count: usize,
     unindexed_workspaces: Vec<ConversationWorkspaceIssue>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationCountResult {
+    total_count: i64,
+    matching_message_count: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -289,23 +375,20 @@ struct WorkspaceSearchCount {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MultiMessageListResult {
+struct MultiMessagePageResult {
     items: Vec<MessageListItem>,
-    total_count: i64,
-    per_workspace_counts: Vec<WorkspaceSearchCount>,
+    requested_offset: i64,
+    returned_count: usize,
+    has_more: bool,
+    next_cursor: Option<String>,
+    pagination_mode: &'static str,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SearchFilters {
-    from: Option<String>,
-    recipients: Option<String>,
-    subject: Option<String>,
-    body: Option<String>,
-    attachment: Option<String>,
-    has_attachments: Option<String>,
-    date_from: Option<String>,
-    date_to: Option<String>,
+struct MultiMessageCountResult {
+    total_count: i64,
+    per_workspace_counts: Vec<WorkspaceSearchCount>,
 }
 
 #[derive(Clone, Serialize)]
@@ -523,6 +606,13 @@ struct CancelImportResult {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CancelSearchResult {
+    cancelled_operations: usize,
+    interrupted_connections: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceSize {
     workspace_path: String,
     workspace_location_mode: String,
@@ -682,6 +772,8 @@ struct AppState {
     cancel_import_requested: AtomicBool,
     readpst_pid: Mutex<Option<u32>>,
     external_file_opens: Mutex<ExternalFileOpenState>,
+    search_cancellations: Arc<SearchCancellationRegistry>,
+    search_cursor_codec: SearchCursorCodec,
 }
 
 #[derive(Default)]
@@ -1020,10 +1112,14 @@ pub fn run() {
             activate_workspace,
             close_workspace,
             cancel_import,
+            cancel_search_operation,
             list_folders,
             list_messages,
+            count_messages,
             search_messages_multi,
+            count_messages_multi,
             list_conversations,
+            count_conversations,
             get_conversation_messages,
             get_message,
             get_message_diagnostics,
@@ -1326,7 +1422,7 @@ fn open_existing_workspace_from_session(
 
     validate_session_workspace_path(&pst_path, &workspace_path, &workspace_id, location_mode)?;
 
-    let conn = open_workspace_db(&workspace_path)?;
+    let conn = open_workspace_db_for_upgrade(&workspace_path)?;
     let message_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
     let import_status = metadata_value(&conn, "import_status")?
@@ -1490,9 +1586,33 @@ fn cancel_import(state: State<AppState>) -> AppResult<CancelImportResult> {
 }
 
 #[tauri::command]
+fn cancel_search_operation(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    search_generation: u64,
+    search_operation_id: Option<String>,
+) -> AppResult<CancelSearchResult> {
+    let outcome = if let Some(operation_id) = search_operation_id {
+        state.search_cancellations.cancel_operation(
+            window.label(),
+            search_generation,
+            &operation_id,
+        )?
+    } else {
+        state
+            .search_cancellations
+            .cancel_generation(window.label(), search_generation)?
+    };
+    Ok(CancelSearchResult {
+        cancelled_operations: outcome.operations,
+        interrupted_connections: outcome.handles,
+    })
+}
+
+#[tauri::command]
 fn list_folders(state: State<AppState>, workspace_id: String) -> AppResult<Vec<Folder>> {
     let workspace = resolve_workspace_for_id(&state, &workspace_id)?;
-    let conn = open_workspace_db(&workspace)?;
+    let conn = open_workspace_db_for_read(&workspace)?;
 
     let mut statement = conn.prepare(
         "SELECT f.id,
@@ -1534,9 +1654,20 @@ fn list_folders(state: State<AppState>, workspace_id: String) -> AppResult<Vec<F
     Ok(folders)
 }
 
+async fn run_search_worker<T, F>(operation: SearchOperationGuard, work: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&SearchOperationGuard) -> AppResult<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || work(&operation))
+        .await
+        .map_err(|_| AppError::new("Search worker could not complete."))?
+}
+
 #[tauri::command]
-fn list_messages(
-    state: State<AppState>,
+async fn list_messages(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
     workspace_id: String,
     folder_id: Option<i64>,
     query: Option<String>,
@@ -1544,98 +1675,221 @@ fn list_messages(
     search_filters: Option<SearchFilters>,
     sort_order: Option<String>,
     limit: Option<i64>,
-    offset: Option<i64>,
-) -> AppResult<MessageListResult> {
+    cursor: Option<String>,
+    search_generation: u64,
+    search_operation_id: String,
+) -> AppResult<MessagePageResult> {
+    let operation = state.search_cancellations.begin_operation(
+        window.label(),
+        search_generation,
+        &search_operation_id,
+        SearchOperationCategory::MessagePage,
+    )?;
+    let criteria = MessageSearchCriteria::from_inputs(query, search_filters)?;
+    validate_message_sort_workspace_count(sort_order.as_deref(), 1)?;
     let workspace = resolve_workspace_for_id(&state, &workspace_id)?;
-    let conn = open_workspace_db(&workspace)?;
-    let criteria = MessageSearchCriteria::from_inputs(query, search_filters);
-    query_messages(
-        &conn,
-        folder_id,
-        include_subfolders,
-        &criteria,
-        sort_order.as_deref(),
-        limit,
-        offset,
-    )
+    let cursor_codec = state.search_cursor_codec.clone();
+    run_search_worker(operation, move |operation| {
+        let conn = open_workspace_db_for_search(&workspace, operation)?;
+        query_messages_cursor_page(
+            &conn,
+            &workspace,
+            &workspace_id,
+            folder_id,
+            include_subfolders,
+            &criteria,
+            sort_order.as_deref(),
+            limit,
+            cursor.as_deref(),
+            search_generation,
+            &cursor_codec,
+            Some(operation),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-fn search_messages_multi(
-    state: State<AppState>,
+async fn count_messages(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    workspace_id: String,
+    folder_id: Option<i64>,
+    query: Option<String>,
+    include_subfolders: bool,
+    search_filters: Option<SearchFilters>,
+    search_generation: u64,
+    search_operation_id: String,
+) -> AppResult<MessageCountResult> {
+    let operation = state.search_cancellations.begin_operation(
+        window.label(),
+        search_generation,
+        &search_operation_id,
+        SearchOperationCategory::MessageCount,
+    )?;
+    let criteria = MessageSearchCriteria::from_inputs(query, search_filters)?;
+    let workspace = resolve_workspace_for_id(&state, &workspace_id)?;
+    run_search_worker(operation, move |operation| {
+        let conn = open_workspace_db_for_search(&workspace, operation)?;
+        Ok(MessageCountResult {
+            total_count: query_message_count(
+                &conn,
+                folder_id,
+                include_subfolders,
+                &criteria,
+                Some(operation),
+            )?,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn search_messages_multi(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
     workspace_ids: Vec<String>,
     query: Option<String>,
     search_filters: Option<SearchFilters>,
     sort_order: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> AppResult<MultiMessageListResult> {
-    let page_limit = limit
-        .unwrap_or(DEFAULT_MESSAGE_PAGE_SIZE)
-        .clamp(1, MAX_MESSAGE_PAGE_SIZE) as usize;
-    let page_offset = offset.unwrap_or(0).max(0) as usize;
-    let criteria = MessageSearchCriteria::from_inputs(query, search_filters);
+    cursor: Option<String>,
+    search_generation: u64,
+    search_operation_id: String,
+) -> AppResult<MultiMessagePageResult> {
+    let operation = state.search_cancellations.begin_operation(
+        window.label(),
+        search_generation,
+        &search_operation_id,
+        SearchOperationCategory::MessagePage,
+    )?;
+    ensure_multi_workspace_cursor_absent(cursor.as_deref())?;
+    let criteria = MessageSearchCriteria::from_inputs(query, search_filters)?;
     let sort_order_value = sort_order.unwrap_or_else(|| "newest".to_string());
-
     let mut seen = HashSet::new();
     let mut workspaces = Vec::new();
     for workspace_id in workspace_ids {
+        operation.check_cancelled()?;
         if !seen.insert(workspace_id.clone()) {
             continue;
         }
         workspaces.push(active_workspace_for_id(&state, &workspace_id)?);
     }
 
-    if workspaces.is_empty() {
-        return Ok(MultiMessageListResult {
-            items: Vec::new(),
-            total_count: 0,
-            per_workspace_counts: Vec::new(),
-        });
+    validate_message_sort_workspace_count(Some(&sort_order_value), workspaces.len())?;
+    run_search_worker(operation, move |operation| {
+        query_multi_workspace_message_page(
+            workspaces,
+            &criteria,
+            &sort_order_value,
+            limit,
+            offset,
+            operation,
+        )
+    })
+    .await
+}
+
+fn ensure_multi_workspace_cursor_absent(cursor: Option<&str>) -> AppResult<()> {
+    if cursor.is_some() {
+        return Err(AppError::coded(
+            "Cursor pagination is not supported for multi-workspace searches.",
+            UNSUPPORTED_SEARCH_CURSOR_CODE,
+        ));
     }
+    Ok(())
+}
 
-    struct WorkspaceCursor {
-        active: ActiveWorkspace,
-        conn: Connection,
-        pst_display_name: String,
-        total_count: i64,
-        next_offset: i64,
-        buffer: VecDeque<MessageListItem>,
-        exhausted: bool,
-    }
-
-    impl WorkspaceCursor {
-        fn fill(&mut self, criteria: &MessageSearchCriteria, sort_order: &str) -> AppResult<()> {
-            if self.exhausted || !self.buffer.is_empty() {
-                return Ok(());
-            }
-
-            let result = query_messages(
-                &self.conn,
-                None,
-                false,
-                criteria,
-                Some(sort_order),
-                Some(DEFAULT_MESSAGE_PAGE_SIZE),
-                Some(self.next_offset),
-            )?;
-            self.total_count = result.total_count;
-            self.next_offset += result.items.len() as i64;
-            self.exhausted = result.items.is_empty() || self.next_offset >= result.total_count;
-            self.buffer = result.items.into();
-            Ok(())
+#[tauri::command]
+async fn count_messages_multi(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    workspace_ids: Vec<String>,
+    query: Option<String>,
+    search_filters: Option<SearchFilters>,
+    search_generation: u64,
+    search_operation_id: String,
+) -> AppResult<MultiMessageCountResult> {
+    let operation = state.search_cancellations.begin_operation(
+        window.label(),
+        search_generation,
+        &search_operation_id,
+        SearchOperationCategory::MessageCount,
+    )?;
+    let criteria = MessageSearchCriteria::from_inputs(query, search_filters)?;
+    let mut seen = HashSet::new();
+    let mut workspaces = Vec::new();
+    for workspace_id in workspace_ids {
+        operation.check_cancelled()?;
+        if seen.insert(workspace_id.clone()) {
+            workspaces.push(active_workspace_for_id(&state, &workspace_id)?);
         }
     }
+    run_search_worker(operation, move |operation| {
+        count_multi_workspace_messages(workspaces, &criteria, operation)
+    })
+    .await
+}
 
+struct MessageWorkspaceCursor {
+    active: ActiveWorkspace,
+    conn: Connection,
+    pst_display_name: String,
+    next_offset: i64,
+    buffer: VecDeque<MessageListItem>,
+    exhausted: bool,
+}
+
+impl MessageWorkspaceCursor {
+    fn fill(
+        &mut self,
+        criteria: &MessageSearchCriteria,
+        sort_order: &str,
+        operation: &SearchOperationGuard,
+    ) -> AppResult<()> {
+        operation.check_cancelled()?;
+        if self.exhausted || !self.buffer.is_empty() {
+            return Ok(());
+        }
+        let page = query_messages_page(
+            &self.conn,
+            None,
+            false,
+            criteria,
+            Some(sort_order),
+            Some(DEFAULT_MESSAGE_PAGE_SIZE),
+            Some(self.next_offset),
+            Some(operation),
+        )?;
+        self.next_offset += page.returned_count as i64;
+        self.exhausted = !page.has_more;
+        self.buffer = page.items.into();
+        Ok(())
+    }
+}
+
+fn query_multi_workspace_message_page(
+    workspaces: Vec<ActiveWorkspace>,
+    criteria: &MessageSearchCriteria,
+    sort_order: &str,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    operation: &SearchOperationGuard,
+) -> AppResult<MultiMessagePageResult> {
+    let page_limit = limit
+        .unwrap_or(DEFAULT_MESSAGE_PAGE_SIZE)
+        .clamp(1, MAX_MESSAGE_PAGE_SIZE) as usize;
+    let page_offset = offset.unwrap_or(0).max(0) as usize;
     let mut cursors = workspaces
         .into_iter()
         .map(|active| {
-            let conn = open_workspace_db(&active.path)?;
-            Ok(WorkspaceCursor {
+            operation.check_cancelled()?;
+            let conn = open_workspace_db_for_search(&active.path, operation)?;
+            Ok(MessageWorkspaceCursor {
                 pst_display_name: pst_display_name(&active),
                 active,
                 conn,
-                total_count: 0,
                 next_offset: 0,
                 buffer: VecDeque::new(),
                 exhausted: false,
@@ -1643,25 +1897,12 @@ fn search_messages_multi(
         })
         .collect::<AppResult<Vec<_>>>()?;
 
-    for cursor in &mut cursors {
-        cursor.fill(&criteria, &sort_order_value)?;
-    }
-
-    let total_count = cursors.iter().map(|cursor| cursor.total_count).sum();
-    let per_workspace_counts = cursors
-        .iter()
-        .map(|cursor| WorkspaceSearchCount {
-            workspace_id: cursor.active.id.clone(),
-            pst_display_name: cursor.pst_display_name.clone(),
-            count: cursor.total_count,
-        })
-        .collect::<Vec<_>>();
-
     let mut skipped = 0usize;
-    let mut items = Vec::with_capacity(page_limit);
-    while items.len() < page_limit {
+    let mut items = Vec::with_capacity(page_limit + 1);
+    while items.len() < page_limit + 1 {
+        operation.check_cancelled()?;
         for cursor in &mut cursors {
-            cursor.fill(&criteria, &sort_order_value)?;
+            cursor.fill(criteria, sort_order, operation)?;
         }
 
         let mut best_index = None;
@@ -1677,7 +1918,7 @@ fn search_messages_multi(
                 .buffer
                 .front()
                 .expect("best cursor had a front item");
-            if compare_message_items(item, best_item, &sort_order_value).is_lt() {
+            if compare_message_items(item, best_item, sort_order).is_lt() {
                 best_index = Some(index);
             }
         }
@@ -1685,7 +1926,6 @@ fn search_messages_multi(
         let Some(best_index) = best_index else {
             break;
         };
-
         let cursor = &mut cursors[best_index];
         let mut item = cursor
             .buffer
@@ -1695,85 +1935,213 @@ fn search_messages_multi(
             skipped += 1;
             continue;
         }
-
         item.workspace_id = Some(cursor.active.id.clone());
         item.pst_display_name = Some(cursor.pst_display_name.clone());
         item.workspace_path = Some(cursor.active.path.display().to_string());
         items.push(item);
     }
 
-    Ok(MultiMessageListResult {
-        items,
+    let page = finish_bounded_page(items, page_limit as i64, page_offset as i64);
+    Ok(MultiMessagePageResult {
+        items: page.items,
+        requested_offset: page.requested_offset,
+        returned_count: page.returned_count,
+        has_more: page.has_more,
+        next_cursor: None,
+        pagination_mode: "offset",
+    })
+}
+
+fn count_multi_workspace_messages(
+    workspaces: Vec<ActiveWorkspace>,
+    criteria: &MessageSearchCriteria,
+    operation: &SearchOperationGuard,
+) -> AppResult<MultiMessageCountResult> {
+    let mut total_count = 0i64;
+    let mut per_workspace_counts = Vec::with_capacity(workspaces.len());
+    for active in workspaces {
+        operation.check_cancelled()?;
+        let conn = open_workspace_db_for_search(&active.path, operation)?;
+        let count = query_message_count(&conn, None, false, criteria, Some(operation))?;
+        total_count += count;
+        per_workspace_counts.push(WorkspaceSearchCount {
+            workspace_id: active.id.clone(),
+            pst_display_name: pst_display_name(&active),
+            count,
+        });
+        operation.check_cancelled()?;
+    }
+    Ok(MultiMessageCountResult {
         total_count,
         per_workspace_counts,
     })
 }
 
 #[tauri::command]
-fn list_conversations(
-    state: State<AppState>,
+async fn list_conversations(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
     scopes: Vec<ConversationWorkspaceScope>,
     query: Option<String>,
     search_filters: Option<SearchFilters>,
     conversation_sort: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> AppResult<ConversationListResult> {
-    let page_limit = limit
-        .unwrap_or(DEFAULT_CONVERSATION_PAGE_SIZE)
-        .clamp(1, MAX_CONVERSATION_PAGE_SIZE) as usize;
-    let page_offset = offset.unwrap_or(0).max(0) as usize;
-    let criteria = MessageSearchCriteria::from_inputs(query, search_filters);
+    search_generation: u64,
+    search_operation_id: String,
+) -> AppResult<ConversationPageResult> {
+    let operation = state.search_cancellations.begin_operation(
+        window.label(),
+        search_generation,
+        &search_operation_id,
+        SearchOperationCategory::ConversationPage,
+    )?;
+    let criteria = MessageSearchCriteria::from_inputs(query, search_filters)?;
     let sort = conversation_sort.unwrap_or_else(|| "newest".to_string());
+    validate_conversation_sort(&sort)?;
 
     let mut seen = HashSet::new();
-    let mut cursors = Vec::new();
-    let mut unindexed_workspaces = Vec::new();
+    let mut resolved_scopes = Vec::new();
     for scope in scopes {
+        operation.check_cancelled()?;
         if !seen.insert(scope.workspace_id.clone()) {
             continue;
         }
         let active = active_workspace_for_id(&state, &scope.workspace_id)?;
-        let conn = open_workspace_db(&active.path)?;
+        resolved_scopes.push((scope, active));
+    }
+
+    run_search_worker(operation, move |operation| {
+        query_conversation_page_for_scopes(
+            resolved_scopes,
+            &criteria,
+            &sort,
+            limit,
+            offset,
+            operation,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+async fn count_conversations(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    scopes: Vec<ConversationWorkspaceScope>,
+    query: Option<String>,
+    search_filters: Option<SearchFilters>,
+    search_generation: u64,
+    search_operation_id: String,
+) -> AppResult<ConversationCountResult> {
+    let operation = state.search_cancellations.begin_operation(
+        window.label(),
+        search_generation,
+        &search_operation_id,
+        SearchOperationCategory::ConversationCount,
+    )?;
+    let criteria = MessageSearchCriteria::from_inputs(query, search_filters)?;
+    let mut seen = HashSet::new();
+    let mut resolved_scopes = Vec::new();
+    for scope in scopes {
+        operation.check_cancelled()?;
+        if seen.insert(scope.workspace_id.clone()) {
+            let active = active_workspace_for_id(&state, &scope.workspace_id)?;
+            resolved_scopes.push((scope, active));
+        }
+    }
+    run_search_worker(operation, move |operation| {
+        count_conversations_for_scopes(resolved_scopes, &criteria, operation)
+    })
+    .await
+}
+
+struct ConversationCursor {
+    active: ActiveWorkspace,
+    conn: Connection,
+    folder_id: Option<i64>,
+    include_subfolders: bool,
+    next_offset: i64,
+    buffer: VecDeque<ConversationSummary>,
+    exhausted: bool,
+}
+
+impl ConversationCursor {
+    fn fill(
+        &mut self,
+        criteria: &MessageSearchCriteria,
+        sort: &str,
+        operation: &SearchOperationGuard,
+    ) -> AppResult<()> {
+        operation.check_cancelled()?;
+        if self.exhausted || !self.buffer.is_empty() {
+            return Ok(());
+        }
+        let page = query_conversation_summaries_page(
+            &self.conn,
+            &self.active,
+            self.folder_id,
+            self.include_subfolders,
+            criteria,
+            sort,
+            DEFAULT_CONVERSATION_PAGE_SIZE,
+            self.next_offset,
+            Some(operation),
+        )?;
+        self.next_offset += page.returned_count as i64;
+        self.exhausted = !page.has_more;
+        self.buffer = page.items.into();
+        Ok(())
+    }
+}
+
+fn conversation_workspace_issue(active: &ActiveWorkspace) -> ConversationWorkspaceIssue {
+    ConversationWorkspaceIssue {
+        workspace_id: active.id.clone(),
+        pst_display_name: pst_display_name(active),
+        workspace_path: active.path.display().to_string(),
+        can_reindex: active.path.join("extracted").is_dir(),
+    }
+}
+
+fn query_conversation_page_for_scopes(
+    resolved_scopes: Vec<(ConversationWorkspaceScope, ActiveWorkspace)>,
+    criteria: &MessageSearchCriteria,
+    sort: &str,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    operation: &SearchOperationGuard,
+) -> AppResult<ConversationPageResult> {
+    let page_limit = limit
+        .unwrap_or(DEFAULT_CONVERSATION_PAGE_SIZE)
+        .clamp(1, MAX_CONVERSATION_PAGE_SIZE) as usize;
+    let page_offset = offset.unwrap_or(0).max(0) as usize;
+    let mut cursors = Vec::new();
+    let mut unindexed_workspaces = Vec::new();
+    for (scope, active) in resolved_scopes {
+        operation.check_cancelled()?;
+        let conn = open_workspace_db_for_search(&active.path, operation)?;
         if !conversation_data_is_indexed(&conn)? {
-            unindexed_workspaces.push(ConversationWorkspaceIssue {
-                workspace_id: active.id.clone(),
-                pst_display_name: pst_display_name(&active),
-                workspace_path: active.path.display().to_string(),
-                can_reindex: active.path.join("extracted").is_dir(),
-            });
+            unindexed_workspaces.push(conversation_workspace_issue(&active));
             continue;
         }
-        let (total_count, matching_message_count) =
-            conversation_counts(&conn, scope.folder_id, scope.include_subfolders, &criteria)?;
         cursors.push(ConversationCursor {
             active,
             conn,
             folder_id: scope.folder_id,
             include_subfolders: scope.include_subfolders,
-            total_count,
-            matching_message_count,
             next_offset: 0,
             buffer: VecDeque::new(),
             exhausted: false,
         });
     }
-
-    for cursor in &mut cursors {
-        cursor.fill(&criteria, &sort)?;
-    }
-    let total_count = cursors.iter().map(|cursor| cursor.total_count).sum();
-    let matching_message_count = cursors
-        .iter()
-        .map(|cursor| cursor.matching_message_count)
-        .sum();
     let indexed_workspace_count = cursors.len();
-
     let mut skipped = 0usize;
-    let mut items = Vec::with_capacity(page_limit);
-    while items.len() < page_limit {
+    let mut items = Vec::with_capacity(page_limit + 1);
+    while items.len() < page_limit + 1 {
+        operation.check_cancelled()?;
         for cursor in &mut cursors {
-            cursor.fill(&criteria, &sort)?;
+            cursor.fill(criteria, sort, operation)?;
         }
         let mut best_index = None;
         for (index, cursor) in cursors.iter().enumerate() {
@@ -1788,7 +2156,7 @@ fn list_conversations(
                 .buffer
                 .front()
                 .expect("best conversation cursor had an item");
-            if compare_conversation_summaries(item, best_item, &sort).is_lt() {
+            if compare_conversation_summaries(item, best_item, sort).is_lt() {
                 best_index = Some(index);
             }
         }
@@ -1806,52 +2174,51 @@ fn list_conversations(
         items.push(item);
     }
 
-    Ok(ConversationListResult {
-        items,
-        total_count,
-        matching_message_count,
+    let page = finish_bounded_page(items, page_limit as i64, page_offset as i64);
+    Ok(ConversationPageResult {
+        items: page.items,
+        requested_offset: page.requested_offset,
+        returned_count: page.returned_count,
+        has_more: page.has_more,
         indexed_workspace_count,
         unindexed_workspaces,
     })
 }
 
-struct ConversationCursor {
-    active: ActiveWorkspace,
-    conn: Connection,
-    folder_id: Option<i64>,
-    include_subfolders: bool,
-    total_count: i64,
-    matching_message_count: i64,
-    next_offset: i64,
-    buffer: VecDeque<ConversationSummary>,
-    exhausted: bool,
-}
-
-impl ConversationCursor {
-    fn fill(&mut self, criteria: &MessageSearchCriteria, sort: &str) -> AppResult<()> {
-        if self.exhausted || !self.buffer.is_empty() {
-            return Ok(());
+fn count_conversations_for_scopes(
+    resolved_scopes: Vec<(ConversationWorkspaceScope, ActiveWorkspace)>,
+    criteria: &MessageSearchCriteria,
+    operation: &SearchOperationGuard,
+) -> AppResult<ConversationCountResult> {
+    let mut total_count = 0i64;
+    let mut matching_message_count = 0i64;
+    for (scope, active) in resolved_scopes {
+        operation.check_cancelled()?;
+        let conn = open_workspace_db_for_search(&active.path, operation)?;
+        if !conversation_data_is_indexed(&conn)? {
+            continue;
         }
-        let items = query_conversation_summaries(
-            &self.conn,
-            &self.active,
-            self.folder_id,
-            self.include_subfolders,
+        let (workspace_conversations, workspace_messages) = conversation_counts(
+            &conn,
+            scope.folder_id,
+            scope.include_subfolders,
             criteria,
-            sort,
-            DEFAULT_CONVERSATION_PAGE_SIZE,
-            self.next_offset,
+            Some(operation),
         )?;
-        self.next_offset += items.len() as i64;
-        self.exhausted = items.is_empty() || self.next_offset >= self.total_count;
-        self.buffer = items.into();
-        Ok(())
+        total_count += workspace_conversations;
+        matching_message_count += workspace_messages;
+        operation.check_cancelled()?;
     }
+    Ok(ConversationCountResult {
+        total_count,
+        matching_message_count,
+    })
 }
 
 #[tauri::command]
-fn get_conversation_messages(
-    state: State<AppState>,
+async fn get_conversation_messages(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
     workspace_id: String,
     conversation_id: String,
     folder_id: Option<i64>,
@@ -1861,52 +2228,79 @@ fn get_conversation_messages(
     show_entire_conversation: bool,
     limit: Option<i64>,
     offset: Option<i64>,
+    search_generation: u64,
+    search_operation_id: String,
 ) -> AppResult<ConversationMessagesResult> {
+    let operation = state.search_cancellations.begin_operation(
+        window.label(),
+        search_generation,
+        &search_operation_id,
+        SearchOperationCategory::ExpandedConversation,
+    )?;
+    let criteria = MessageSearchCriteria::from_inputs(query, search_filters)?;
     let active = active_workspace_for_id(&state, &workspace_id)?;
-    let conn = open_workspace_db(&active.path)?;
-    if !conversation_data_is_indexed(&conn)? {
-        return Err(AppError::new(
-            "Conversation data is not indexed for this workspace.",
-        ));
-    }
-    let criteria = MessageSearchCriteria::from_inputs(query, search_filters);
-    let source = build_message_query_source(&conn, folder_id, include_subfolders, &criteria)?;
-    let (matching_where, mut matching_params) =
-        query_source_with_condition(&source, "m.conversation_id = ?");
-    matching_params.push(Value::Text(conversation_id.clone()));
-    let matching_count_sql = format!("SELECT COUNT(*){}{}", source.from_sql, matching_where);
-    let matching_message_count = conn.query_row(
-        &matching_count_sql,
-        params_from_iter(matching_params.iter()),
-        |row| row.get(0),
-    )?;
-    let total_message_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
-        params![conversation_id],
-        |row| row.get(0),
-    )?;
+    run_search_worker(operation, move |operation| {
+        let conn = open_workspace_db_for_search(&active.path, operation)?;
+        if !conversation_data_is_indexed(&conn)? {
+            return Err(AppError::new(
+                "Conversation data is not indexed for this workspace.",
+            ));
+        }
+        let source = build_message_query_source(&conn, folder_id, include_subfolders, &criteria)?;
+        let (matching_where, mut matching_params) =
+            query_source_with_condition(&source, "m.conversation_id = ?");
+        matching_params.push(Value::Text(conversation_id.clone()));
+        let matching_count_sql = format!("SELECT COUNT(*){}{}", source.from_sql, matching_where);
+        let matching_message_count = conn.query_row(
+            &matching_count_sql,
+            params_from_iter(matching_params.iter()),
+            |row| row.get(0),
+        )?;
+        operation.check_cancelled()?;
+        let total_message_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+            params![conversation_id],
+            |row| row.get(0),
+        )?;
+        operation.check_cancelled()?;
 
-    let page_limit = limit
-        .unwrap_or(CONVERSATION_MESSAGE_PAGE_SIZE)
-        .clamp(1, MAX_MESSAGE_PAGE_SIZE);
-    let page_offset = offset.unwrap_or(0).max(0);
-    let mut items = if show_entire_conversation {
-        query_entire_conversation_page(&conn, &source, &conversation_id, page_limit, page_offset)?
-    } else {
-        query_matching_conversation_page(&conn, &source, &conversation_id, page_limit, page_offset)?
-    };
-    for item in &mut items {
-        item.message.workspace_id = Some(active.id.clone());
-        item.message.pst_display_name = Some(pst_display_name(&active));
-        item.message.workspace_path = Some(active.path.display().to_string());
-    }
+        let page_limit = limit
+            .unwrap_or(CONVERSATION_MESSAGE_PAGE_SIZE)
+            .clamp(1, MAX_MESSAGE_PAGE_SIZE);
+        let page_offset = offset.unwrap_or(0).max(0);
+        let mut items = if show_entire_conversation {
+            query_entire_conversation_page(
+                &conn,
+                &source,
+                &conversation_id,
+                page_limit,
+                page_offset,
+                Some(operation),
+            )?
+        } else {
+            query_matching_conversation_page(
+                &conn,
+                &source,
+                &conversation_id,
+                page_limit,
+                page_offset,
+                Some(operation),
+            )?
+        };
+        for item in &mut items {
+            item.message.workspace_id = Some(active.id.clone());
+            item.message.pst_display_name = Some(pst_display_name(&active));
+            item.message.workspace_path = Some(active.path.display().to_string());
+        }
 
-    Ok(ConversationMessagesResult {
-        items,
-        matching_message_count,
-        total_message_count,
-        showing_entire_conversation: show_entire_conversation,
+        Ok(ConversationMessagesResult {
+            items,
+            matching_message_count,
+            total_message_count,
+            showing_entire_conversation: show_entire_conversation,
+        })
     })
+    .await
 }
 
 #[tauri::command]
@@ -1916,7 +2310,7 @@ fn get_message(
     message_id: i64,
 ) -> AppResult<MessageDetail> {
     let workspace = resolve_workspace_for_id(&state, &workspace_id)?;
-    let conn = open_workspace_db(&workspace)?;
+    let conn = open_workspace_db_for_read(&workspace)?;
 
     let mut statement = conn.prepare(
         "SELECT id,
@@ -1976,7 +2370,7 @@ fn get_message_diagnostics(
     message_id: i64,
 ) -> AppResult<MessageDiagnostics> {
     let source = resolve_source_eml(&state, &workspace_id, message_id)?;
-    let conn = open_workspace_db(&source.workspace_root)?;
+    let conn = open_workspace_db_for_read(&source.workspace_root)?;
     let (
         subject,
         body_source,
@@ -2183,7 +2577,7 @@ fn render_message_html(
     allow_remote_images: bool,
 ) -> AppResult<HtmlRenderResult> {
     let active = active_workspace_for_id(&state, &workspace_id)?;
-    let conn = open_workspace_db(&active.path)?;
+    let conn = open_workspace_db_for_read(&active.path)?;
     let (body_html, eml_path): (Option<String>, String) = conn
         .query_row(
             "SELECT body_html, eml_path FROM messages WHERE id = ?1",
@@ -2225,7 +2619,7 @@ fn get_source_eml_view(
     allow_remote_resources: bool,
 ) -> AppResult<SourceEmlView> {
     let source = resolve_source_eml(&state, &workspace_id, message_id)?;
-    let conn = open_workspace_db(&source.workspace_root)?;
+    let conn = open_workspace_db_for_read(&source.workspace_root)?;
     let attachments = list_attachments(&conn, message_id)?;
     source_eml_view_from_path(
         &source.source_path,
@@ -2949,7 +3343,7 @@ fn empty_label(value: &str) -> String {
 #[tauri::command]
 fn reveal_eml(state: State<AppState>, workspace_id: String, message_id: i64) -> AppResult<()> {
     let workspace = resolve_workspace_for_id(&state, &workspace_id)?;
-    let conn = open_workspace_db(&workspace)?;
+    let conn = open_workspace_db_for_read(&workspace)?;
     let relative_path: String = conn
         .query_row(
             "SELECT eml_path FROM messages WHERE id = ?1",
@@ -3634,7 +4028,7 @@ fn resolve_source_eml(
         )));
     }
 
-    let conn = open_workspace_db(&workspace_root)?;
+    let conn = open_workspace_db_for_read(&workspace_root)?;
     let (relative_eml_path, subject, date): (String, String, String) = conn
         .query_row(
             "SELECT eml_path, COALESCE(subject, ''), COALESCE(date, '')
@@ -3842,7 +4236,7 @@ fn export_original_eml_inner(
         )));
     }
 
-    let conn = open_workspace_db(&workspace_root)?;
+    let conn = open_workspace_db_for_read(&workspace_root)?;
     let (relative_eml_path, subject, date): (String, String, String) = conn
         .query_row(
             "SELECT eml_path, COALESCE(subject, ''), COALESCE(date, '')
@@ -3938,7 +4332,7 @@ fn export_attachment_inner(
         )));
     }
 
-    let conn = open_workspace_db(&active.path)?;
+    let conn = open_workspace_db_for_read(&active.path)?;
     let attachment = load_attachment_for_export(&conn, message_id, attachment_id)?;
     let eml_path = active.path.join("extracted").join(&attachment.eml_path);
     if !eml_path.exists() {
@@ -5919,7 +6313,7 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-fn open_workspace_db(workspace: &Path) -> AppResult<Connection> {
+fn open_workspace_db_for_upgrade(workspace: &Path) -> AppResult<Connection> {
     let db_path = workspace.join("index.sqlite");
     if !db_path.exists() {
         return Err(AppError::new("This workspace does not have an index yet."));
@@ -5928,6 +6322,137 @@ fn open_workspace_db(workspace: &Path) -> AppResult<Connection> {
     let conn = Connection::open(db_path)?;
     initialize_schema(&conn)?;
     Ok(conn)
+}
+
+fn open_workspace_db_for_read(workspace: &Path) -> AppResult<Connection> {
+    let conn = open_workspace_db_read_only_connection(workspace)?;
+    configure_workspace_db_for_read(&conn)?;
+    Ok(conn)
+}
+
+fn open_workspace_db_for_search(
+    workspace: &Path,
+    operation: &SearchOperationGuard,
+) -> AppResult<Connection> {
+    operation.check_cancelled()?;
+    let conn = open_workspace_db_read_only_connection(workspace)?;
+    operation.register_connection(&conn)?;
+    configure_workspace_db_for_read(&conn)?;
+    operation.check_cancelled()?;
+    Ok(conn)
+}
+
+fn open_workspace_db_read_only_connection(workspace: &Path) -> AppResult<Connection> {
+    let db_path = workspace.join("index.sqlite");
+    if !db_path.is_file() {
+        return Err(AppError::new("This workspace does not have an index yet."));
+    }
+
+    // Do not use immutable=1: active WAL workspaces must remain visible to readers.
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    Ok(conn)
+}
+
+fn configure_workspace_db_for_read(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch("PRAGMA query_only = ON; PRAGMA foreign_keys = ON;")?;
+    verify_read_query_schema(&conn)?;
+    Ok(())
+}
+
+fn verify_read_query_schema(conn: &Connection) -> AppResult<()> {
+    let version = read_schema_version(conn)?;
+    if version > SQLITE_SCHEMA_VERSION_CURRENT {
+        return Err(AppError::new(format!(
+            "Workspace index schema version {version} is newer than this version of PST QuickView supports."
+        )));
+    }
+    if version < SQLITE_SCHEMA_VERSION_CURRENT {
+        return Err(AppError::new(format!(
+            "Workspace index schema version {version} requires upgrade before it can be searched. Reopen the workspace to run the normal upgrade."
+        )));
+    }
+
+    for (table, columns) in [
+        ("import_metadata", &["key", "value"] as &[&str]),
+        ("folders", &["id", "parent_id", "path", "name"]),
+        (
+            "messages",
+            &[
+                "id",
+                "folder_id",
+                "eml_path",
+                "subject",
+                "sender",
+                "recipients",
+                "date",
+                "body",
+                "body_source",
+                "body_html",
+                "snippet",
+                "attachment_names",
+                "has_attachments",
+                "message_id_header_raw",
+                "message_id_header",
+                "in_reply_to_raw",
+                "in_reply_to",
+                "references_header_raw",
+                "references_header",
+                "normalized_subject",
+                "conversation_id",
+                "conversation_parent_id",
+                "conversation_root_id",
+                "thread_assignment_method",
+                "thread_warning",
+            ],
+        ),
+        (
+            "attachments",
+            &[
+                "id",
+                "message_id",
+                "filename",
+                "sanitized_filename",
+                "content_type",
+                "size_bytes",
+                "attachment_index",
+                "content_disposition",
+                "mime_part_path",
+            ],
+        ),
+        (
+            "messages_fts",
+            &[
+                "subject",
+                "sender",
+                "recipients",
+                "body",
+                "attachment_names",
+            ],
+        ),
+    ] {
+        verify_required_columns(conn, table, columns).map_err(|error| {
+            AppError::new(format!(
+                "Workspace index schema is incompatible for read queries: {error}"
+            ))
+        })?;
+    }
+
+    let fts_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if !fts_sql
+        .as_deref()
+        .is_some_and(|sql| sql.to_ascii_lowercase().contains("using fts5"))
+    {
+        return Err(AppError::new(
+            "Workspace index schema is incompatible for read queries: messages_fts is missing or is not an FTS5 table.",
+        ));
+    }
+    Ok(())
 }
 
 fn metadata_value(conn: &Connection, key: &str) -> AppResult<Option<String>> {
@@ -10204,141 +10729,194 @@ fn make_snippet(body: &str) -> String {
     collapsed.chars().take(220).collect()
 }
 
-#[derive(Default)]
-struct MessageSearchCriteria {
-    fts_terms: Vec<SearchToken>,
-    from_terms: Vec<String>,
-    recipient_terms: Vec<String>,
-    subject_terms: Vec<String>,
-    body_terms: Vec<String>,
-    attachment_terms: Vec<String>,
-    has_attachments: Option<bool>,
-    date_from: Option<String>,
-    date_to: Option<String>,
+struct BoundedPage<T> {
+    items: Vec<T>,
+    requested_offset: i64,
+    returned_count: usize,
+    has_more: bool,
 }
 
-impl MessageSearchCriteria {
-    fn from_inputs(query: Option<String>, filters: Option<SearchFilters>) -> Self {
-        let mut criteria = Self::default();
-        if let Some(query) = query {
-            criteria.apply_query_syntax(&query);
-        }
-        if let Some(filters) = filters {
-            criteria.apply_filters(filters);
-        }
-        criteria
+fn finish_bounded_page<T>(
+    mut items: Vec<T>,
+    requested_limit: i64,
+    requested_offset: i64,
+) -> BoundedPage<T> {
+    let requested_limit = requested_limit.max(1) as usize;
+    let has_more = items.len() > requested_limit;
+    if has_more {
+        items.truncate(requested_limit);
     }
-
-    fn apply_filters(&mut self, filters: SearchFilters) {
-        push_filter_value(&mut self.from_terms, filters.from);
-        push_filter_value(&mut self.recipient_terms, filters.recipients);
-        push_filter_value(&mut self.subject_terms, filters.subject);
-        push_filter_value(&mut self.body_terms, filters.body);
-        push_filter_value(&mut self.attachment_terms, filters.attachment);
-
-        if let Some(value) = filters.has_attachments {
-            self.has_attachments = parse_has_attachments(&value).or(self.has_attachments);
-        }
-        if let Some(value) = clean_filter_value(filters.date_from) {
-            self.date_from = Some(normalize_date_bound(&value, false));
-        }
-        if let Some(value) = clean_filter_value(filters.date_to) {
-            self.date_to = Some(normalize_date_bound(&value, true));
-        }
-    }
-
-    fn apply_query_syntax(&mut self, query: &str) {
-        let tokens = tokenize_search_query(query);
-        let mut index = 0;
-        while index < tokens.len() {
-            let token = &tokens[index];
-            if !token.quoted {
-                if let Some(key) = token.value.strip_suffix(':') {
-                    if let Some(next) = tokens.get(index + 1) {
-                        self.apply_typed_token(key, &next.value);
-                        index += 2;
-                        continue;
-                    }
-                }
-
-                if let Some((key, value)) = split_typed_token(&token.value) {
-                    self.apply_typed_token(key, value);
-                    index += 1;
-                    continue;
-                }
-            }
-
-            if !token.value.trim().is_empty() {
-                self.fts_terms.push(token.clone());
-            }
-            index += 1;
-        }
-    }
-
-    fn apply_typed_token(&mut self, key: &str, value: &str) {
-        let value = value.trim();
-        if value.is_empty() {
-            return;
-        }
-
-        match key.to_ascii_lowercase().as_str() {
-            "from" => self.from_terms.push(value.to_string()),
-            "to" | "cc" | "bcc" | "recipient" | "recipients" => {
-                self.recipient_terms.push(value.to_string())
-            }
-            "subject" | "subj" => self.subject_terms.push(value.to_string()),
-            "body" | "text" => self.body_terms.push(value.to_string()),
-            "attachment" | "attach" | "filename" => self.attachment_terms.push(value.to_string()),
-            "has" => {
-                if let Some(has_attachments) = parse_has_attachments(value) {
-                    self.has_attachments = Some(has_attachments);
-                }
-            }
-            "before" => self.date_to = Some(normalize_date_bound(value, true)),
-            "after" => self.date_from = Some(normalize_date_bound(value, false)),
-            _ => self.fts_terms.push(SearchToken {
-                value: format!("{key}:{value}"),
-                quoted: false,
-            }),
-        }
+    BoundedPage {
+        returned_count: items.len(),
+        items,
+        requested_offset: requested_offset.max(0),
+        has_more,
     }
 }
 
-fn push_filter_value(values: &mut Vec<String>, value: Option<String>) {
-    if let Some(value) = clean_filter_value(value) {
-        values.push(value);
-    }
-}
+#[allow(clippy::too_many_arguments)]
+fn query_messages_cursor_page(
+    conn: &Connection,
+    workspace: &Path,
+    workspace_id: &str,
+    folder_id: Option<i64>,
+    include_subfolders: bool,
+    criteria: &MessageSearchCriteria,
+    sort_order: Option<&str>,
+    limit: Option<i64>,
+    cursor: Option<&str>,
+    search_generation: u64,
+    cursor_codec: &SearchCursorCodec,
+    operation: Option<&SearchOperationGuard>,
+) -> AppResult<MessagePageResult> {
+    check_search_operation(operation)?;
+    let page_limit = limit
+        .unwrap_or(DEFAULT_MESSAGE_PAGE_SIZE)
+        .clamp(1, MAX_MESSAGE_PAGE_SIZE);
+    let source = build_message_query_source(conn, folder_id, include_subfolders, criteria)?;
+    let sort = MessageSort::from_request(sort_order, source.has_text_match)?;
+    let cursor_context = MessageCursorContext {
+        workspace_hash: opaque_hash(workspace_id.as_bytes()),
+        criteria_hash: criteria.cursor_fingerprint(folder_id, include_subfolders),
+        index_generation: workspace_search_index_generation(workspace, conn)?,
+        sort,
+        search_generation,
+    };
+    check_search_operation(operation)?;
 
-fn clean_filter_value(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn parse_has_attachments(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "yes" | "true" | "1" | "attachment" | "attachments" => Some(true),
-        "no" | "false" | "0" | "none" | "noattachment" | "noattachments" | "no-attachment"
-        | "no-attachments" => Some(false),
-        _ => None,
-    }
-}
-
-fn normalize_date_bound(value: &str, end_of_day: bool) -> String {
-    let value = value.trim();
-    if value.len() == 10 && value.chars().nth(4) == Some('-') && value.chars().nth(7) == Some('-') {
-        if end_of_day {
-            format!("{value}T23:59:59.999999999Z")
-        } else {
-            format!("{value}T00:00:00Z")
-        }
+    let (where_sql, mut page_params) = if let Some(encoded_cursor) = cursor {
+        let position = cursor_codec.decode(encoded_cursor, &cursor_context)?;
+        let boundary = resolve_message_keyset_boundary(conn, &source, sort, position.message_id)?
+            .ok_or(SearchCursorError::Stale)?;
+        check_search_operation(operation)?;
+        let (condition, boundary_params) = message_keyset_condition(&boundary);
+        let (where_sql, mut params) = query_source_with_condition(&source, &condition);
+        params.extend(boundary_params);
+        (where_sql, params)
     } else {
-        value.to_string()
-    }
+        (source.where_sql.clone(), source.params.clone())
+    };
+
+    let sql = message_cursor_page_sql(&source, &where_sql, sort);
+
+    page_params.push(Value::Integer(page_limit + 1));
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(page_params.iter()), row_to_message_item)?;
+    let page = finish_bounded_page(collect_rows(rows)?, page_limit, 0);
+    check_search_operation(operation)?;
+    let next_cursor = if page.has_more {
+        page.items.last().map(|item| {
+            cursor_codec.encode(
+                &cursor_context,
+                MessageCursorPosition {
+                    message_id: item.id,
+                },
+            )
+        })
+    } else {
+        None
+    };
+
+    Ok(MessagePageResult {
+        items: page.items,
+        requested_offset: 0,
+        returned_count: page.returned_count,
+        has_more: page.has_more,
+        next_cursor,
+        pagination_mode: "cursor",
+    })
 }
 
-fn query_messages(
+fn message_cursor_page_sql(
+    source: &MessageQuerySource,
+    where_sql: &str,
+    sort: MessageSort,
+) -> String {
+    let mut sql = String::from(
+        "SELECT m.id,
+                m.folder_id,
+                f.path,
+                f.name,
+                m.subject,
+                m.sender,
+                m.recipients,
+                m.date,
+                m.snippet,
+                m.has_attachments,
+                (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count",
+    );
+    sql.push_str(search_match_select_sql(source.has_text_match));
+    sql.push_str(&source.from_sql);
+    sql.push_str(where_sql);
+    sql.push_str("ORDER BY ");
+    sql.push_str(sort.sql());
+    sql.push_str(" LIMIT ?");
+    sql
+}
+
+fn workspace_search_index_generation(workspace: &Path, conn: &Connection) -> AppResult<[u8; 16]> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pst-quickview-search-index-generation-v1");
+    for path in [
+        workspace.join("index.sqlite"),
+        workspace.join("index.sqlite-wal"),
+    ] {
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                hasher.update([1]);
+                hasher.update(metadata.dev().to_be_bytes());
+                hasher.update(metadata.ino().to_be_bytes());
+                hasher.update(metadata.len().to_be_bytes());
+                let modified_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                hasher.update(modified_ns.to_be_bytes());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => hasher.update([0]),
+            Err(_) => {
+                return Err(AppError::new(
+                    "Could not inspect the workspace index generation.",
+                ))
+            }
+        }
+    }
+
+    for pragma in ["user_version", "schema_version"] {
+        let value = conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))?;
+        hasher.update((pragma.len() as u64).to_be_bytes());
+        hasher.update(pragma.as_bytes());
+        hasher.update(value.to_be_bytes());
+    }
+    for key in [
+        "workspace_id",
+        "pst_content_fingerprint",
+        "pst_fingerprint",
+        "import_status",
+        "updated_at",
+        "last_reindex_at",
+        "message_count_indexed",
+        "conversation_schema_version",
+        "attachment_metadata_schema_version",
+        "body_html_schema_version",
+    ] {
+        hasher.update((key.len() as u64).to_be_bytes());
+        hasher.update(key.as_bytes());
+        if let Some(value) = metadata_value(conn, key)? {
+            hasher.update([1]);
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    Ok(opaque_hash(&hasher.finalize()))
+}
+
+fn query_messages_page(
     conn: &Connection,
     folder_id: Option<i64>,
     include_subfolders: bool,
@@ -10346,22 +10924,22 @@ fn query_messages(
     sort_order: Option<&str>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> AppResult<MessageListResult> {
+    operation: Option<&SearchOperationGuard>,
+) -> AppResult<MessagePageResult> {
+    check_search_operation(operation)?;
     let page_limit = limit
         .unwrap_or(DEFAULT_MESSAGE_PAGE_SIZE)
         .clamp(1, MAX_MESSAGE_PAGE_SIZE);
     let page_offset = offset.unwrap_or(0).max(0);
     let source = build_message_query_source(conn, folder_id, include_subfolders, criteria)?;
+    check_search_operation(operation)?;
     let MessageQuerySource {
         from_sql,
         where_sql,
         params: query_params,
+        has_text_match,
     } = source;
-
-    let count_sql = format!("SELECT COUNT(*){from_sql}{where_sql}");
-    let total_count = conn.query_row(&count_sql, params_from_iter(query_params.iter()), |row| {
-        row.get(0)
-    })?;
+    let sort_clause = message_sort_clause(sort_order, has_text_match)?;
 
     let mut sql = String::from(
         "SELECT m.id,
@@ -10376,120 +10954,53 @@ fn query_messages(
                 m.has_attachments,
                 (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count",
     );
+    sql.push_str(search_match_select_sql(has_text_match));
     sql.push_str(&from_sql);
     sql.push_str(&where_sql);
     sql.push_str("ORDER BY ");
-    sql.push_str(sort_clause(sort_order));
+    sql.push_str(sort_clause);
     sql.push_str(" LIMIT ? OFFSET ?");
 
     let mut page_params = query_params;
-    page_params.push(Value::Integer(page_limit));
+    page_params.push(Value::Integer(page_limit + 1));
     page_params.push(Value::Integer(page_offset));
-
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(page_params.iter()), row_to_message_item)?;
-    let items = collect_rows(rows)?;
-    Ok(MessageListResult { items, total_count })
+    let page = finish_bounded_page(collect_rows(rows)?, page_limit, page_offset);
+    check_search_operation(operation)?;
+    Ok(MessagePageResult {
+        items: page.items,
+        requested_offset: page.requested_offset,
+        returned_count: page.returned_count,
+        has_more: page.has_more,
+        next_cursor: None,
+        pagination_mode: "offset",
+    })
 }
 
-struct MessageQuerySource {
-    from_sql: String,
-    where_sql: String,
-    params: Vec<Value>,
-}
-
-fn build_message_query_source(
+fn query_message_count(
     conn: &Connection,
     folder_id: Option<i64>,
     include_subfolders: bool,
     criteria: &MessageSearchCriteria,
-) -> AppResult<MessageQuerySource> {
-    let fts_query = build_combined_fts_query(criteria);
-    let folder_scope = folder_scope(conn, folder_id, include_subfolders)?;
-    let mut from_sql = String::from(" FROM messages m LEFT JOIN folders f ON f.id = m.folder_id ");
-    let mut conditions = Vec::new();
-    let mut query_params = Vec::<Value>::new();
-
-    if fts_query.is_some() {
-        from_sql.push_str("JOIN messages_fts ON messages_fts.rowid = m.id ");
-    }
-
-    if matches!(folder_scope, FolderScope::WithDescendants { .. }) {
-        from_sql.push_str("JOIN folders folder_scope ON folder_scope.id = m.folder_id ");
-    }
-
-    if let Some(fts_query) = fts_query {
-        conditions.push("messages_fts MATCH ?".to_string());
-        query_params.push(Value::Text(fts_query));
-    }
-
-    match folder_scope {
-        FolderScope::All => {}
-        FolderScope::Exact(id) => {
-            conditions.push("m.folder_id = ?".to_string());
-            query_params.push(Value::Integer(id));
-        }
-        FolderScope::WithDescendants { id, prefix } => {
-            conditions
-                .push("(folder_scope.id = ? OR folder_scope.path LIKE ? ESCAPE '\\')".to_string());
-            query_params.push(Value::Integer(id));
-            query_params.push(Value::Text(prefix));
-        }
-    }
-
-    if let Some(has_attachments) = criteria.has_attachments {
-        if has_attachments {
-            conditions.push(
-                "(m.has_attachments != 0
-                  OR EXISTS (SELECT 1 FROM attachments attachment_presence WHERE attachment_presence.message_id = m.id))"
-                    .to_string(),
-            );
-        } else {
-            conditions.push(
-                "(m.has_attachments = 0
-                  AND NOT EXISTS (SELECT 1 FROM attachments attachment_presence WHERE attachment_presence.message_id = m.id))"
-                    .to_string(),
-            );
-        }
-    }
-
-    if criteria.date_from.is_some() || criteria.date_to.is_some() {
-        conditions.push("m.date IS NOT NULL AND m.date <> ''".to_string());
-    }
-    if let Some(date_from) = &criteria.date_from {
-        conditions.push("m.date >= ?".to_string());
-        query_params.push(Value::Text(date_from.clone()));
-    }
-    if let Some(date_to) = &criteria.date_to {
-        conditions.push("m.date <= ?".to_string());
-        query_params.push(Value::Text(date_to.clone()));
-    }
-
-    let where_sql = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {} ", conditions.join(" AND "))
-    };
-
-    Ok(MessageQuerySource {
-        from_sql,
-        where_sql,
-        params: query_params,
-    })
+    operation: Option<&SearchOperationGuard>,
+) -> AppResult<i64> {
+    check_search_operation(operation)?;
+    let source = build_message_query_source(conn, folder_id, include_subfolders, criteria)?;
+    check_search_operation(operation)?;
+    let sql = format!("SELECT COUNT(*){}{}", source.from_sql, source.where_sql);
+    let count = conn.query_row(&sql, params_from_iter(source.params.iter()), |row| {
+        row.get(0)
+    })?;
+    check_search_operation(operation)?;
+    Ok(count)
 }
 
-fn query_source_with_condition(
-    source: &MessageQuerySource,
-    condition: &str,
-) -> (String, Vec<Value>) {
-    let where_sql = if source.where_sql.trim().is_empty() {
-        format!(" WHERE {condition} ")
-    } else {
-        let trimmed = source.where_sql.trim();
-        let existing = trimmed.strip_prefix("WHERE").unwrap_or(trimmed).trim();
-        format!(" WHERE ({existing}) AND {condition} ")
-    };
-    (where_sql, source.params.clone())
+fn check_search_operation(operation: Option<&SearchOperationGuard>) -> AppResult<()> {
+    operation
+        .map(SearchOperationGuard::check_cancelled)
+        .transpose()?;
+    Ok(())
 }
 
 fn conversation_counts(
@@ -10497,7 +11008,9 @@ fn conversation_counts(
     folder_id: Option<i64>,
     include_subfolders: bool,
     criteria: &MessageSearchCriteria,
+    operation: Option<&SearchOperationGuard>,
 ) -> AppResult<(i64, i64)> {
+    check_search_operation(operation)?;
     let source = build_message_query_source(conn, folder_id, include_subfolders, criteria)?;
     let (where_sql, params) =
         query_source_with_condition(&source, "COALESCE(m.conversation_id, '') <> ''");
@@ -10505,10 +11018,11 @@ fn conversation_counts(
         "SELECT COUNT(DISTINCT m.conversation_id), COUNT(*){}{}",
         source.from_sql, where_sql
     );
-    conn.query_row(&sql, params_from_iter(params.iter()), |row| {
+    let counts = conn.query_row(&sql, params_from_iter(params.iter()), |row| {
         Ok((row.get(0)?, row.get(1)?))
-    })
-    .map_err(Into::into)
+    })?;
+    check_search_operation(operation)?;
+    Ok(counts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10521,7 +11035,9 @@ fn query_conversation_summaries(
     sort: &str,
     limit: i64,
     offset: i64,
+    operation: Option<&SearchOperationGuard>,
 ) -> AppResult<Vec<ConversationSummary>> {
+    check_search_operation(operation)?;
     let source = build_message_query_source(conn, folder_id, include_subfolders, criteria)?;
     let (where_sql, mut query_params) =
         query_source_with_condition(&source, "COALESCE(m.conversation_id, '') <> ''");
@@ -10592,7 +11108,9 @@ fn query_conversation_summaries(
     sql.push_str(" ORDER BY ");
     sql.push_str(conversation_sort_clause(sort));
     sql.push_str(" LIMIT ? OFFSET ?");
-    query_params.push(Value::Integer(limit.clamp(1, MAX_CONVERSATION_PAGE_SIZE)));
+    query_params.push(Value::Integer(
+        limit.clamp(1, MAX_CONVERSATION_PAGE_SIZE + 1),
+    ));
     query_params.push(Value::Integer(offset.max(0)));
 
     let workspace_id = active.id.clone();
@@ -10623,15 +11141,37 @@ fn query_conversation_summaries(
             workspace_path: workspace_path.clone(),
         })
     })?;
-    collect_rows(rows)
+    let items = collect_rows(rows)?;
+    check_search_operation(operation)?;
+    Ok(items)
 }
 
-fn conversation_sort_clause(sort: &str) -> &'static str {
-    match sort {
-        "oldest" => "matched.date ASC, matched.id ASC",
-        "subject" => "conversation_subject COLLATE NOCASE ASC, matched.date DESC, matched.id DESC",
-        _ => "matched.date DESC, matched.id DESC",
-    }
+#[allow(clippy::too_many_arguments)]
+fn query_conversation_summaries_page(
+    conn: &Connection,
+    active: &ActiveWorkspace,
+    folder_id: Option<i64>,
+    include_subfolders: bool,
+    criteria: &MessageSearchCriteria,
+    sort: &str,
+    limit: i64,
+    offset: i64,
+    operation: Option<&SearchOperationGuard>,
+) -> AppResult<BoundedPage<ConversationSummary>> {
+    let page_limit = limit.clamp(1, MAX_CONVERSATION_PAGE_SIZE);
+    let page_offset = offset.max(0);
+    let items = query_conversation_summaries(
+        conn,
+        active,
+        folder_id,
+        include_subfolders,
+        criteria,
+        sort,
+        page_limit + 1,
+        page_offset,
+        operation,
+    )?;
+    Ok(finish_bounded_page(items, page_limit, page_offset))
 }
 
 fn compare_conversation_summaries(
@@ -10660,8 +11200,9 @@ fn compare_conversation_summaries(
         .then_with(|| left.conversation_id.cmp(&right.conversation_id))
 }
 
-fn conversation_message_select_sql() -> &'static str {
-    "SELECT m.id,
+fn conversation_message_select_sql(has_text_match: bool) -> String {
+    let mut sql = String::from(
+        "SELECT m.id,
             m.folder_id,
             f.path,
             f.name,
@@ -10671,7 +11212,10 @@ fn conversation_message_select_sql() -> &'static str {
             m.date,
             m.snippet,
             m.has_attachments,
-            (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count"
+            (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count",
+    );
+    sql.push_str(search_match_select_sql(has_text_match));
+    sql
 }
 
 fn query_matching_conversation_page(
@@ -10680,12 +11224,14 @@ fn query_matching_conversation_page(
     conversation_id: &str,
     limit: i64,
     offset: i64,
+    operation: Option<&SearchOperationGuard>,
 ) -> AppResult<Vec<ConversationMessageItem>> {
+    check_search_operation(operation)?;
     let (where_sql, mut params) = query_source_with_condition(source, "m.conversation_id = ?");
     params.push(Value::Text(conversation_id.to_string()));
     let sql = format!(
         "{}{}{} ORDER BY m.date ASC, m.id ASC LIMIT ? OFFSET ?",
-        conversation_message_select_sql(),
+        conversation_message_select_sql(source.has_text_match),
         source.from_sql,
         where_sql
     );
@@ -10698,7 +11244,9 @@ fn query_matching_conversation_page(
             matches_scope: true,
         })
     })?;
-    collect_rows(rows)
+    let items = collect_rows(rows)?;
+    check_search_operation(operation)?;
+    Ok(items)
 }
 
 fn query_entire_conversation_page(
@@ -10707,7 +11255,9 @@ fn query_entire_conversation_page(
     conversation_id: &str,
     limit: i64,
     offset: i64,
+    operation: Option<&SearchOperationGuard>,
 ) -> AppResult<Vec<ConversationMessageItem>> {
+    check_search_operation(operation)?;
     let (matching_where, mut params) = query_source_with_condition(source, "m.conversation_id = ?");
     params.push(Value::Text(conversation_id.to_string()));
     let sql = format!(
@@ -10724,7 +11274,7 @@ fn query_entire_conversation_page(
           LIMIT ? OFFSET ?",
         source.from_sql,
         matching_where,
-        conversation_message_select_sql()
+        conversation_message_select_sql(false)
     );
     params.push(Value::Text(conversation_id.to_string()));
     params.push(Value::Integer(limit));
@@ -10733,70 +11283,12 @@ fn query_entire_conversation_page(
     let rows = statement.query_map(params_from_iter(params.iter()), |row| {
         Ok(ConversationMessageItem {
             message: row_to_message_item(row)?,
-            matches_scope: row.get::<_, i64>(11)? != 0,
+            matches_scope: row.get::<_, i64>(17)? != 0,
         })
     })?;
-    collect_rows(rows)
-}
-
-fn build_combined_fts_query(criteria: &MessageSearchCriteria) -> Option<String> {
-    let mut terms = build_fts_terms(&criteria.fts_terms);
-    append_column_fts_terms(&mut terms, "sender", &criteria.from_terms);
-    append_column_fts_terms(&mut terms, "recipients", &criteria.recipient_terms);
-    append_column_fts_terms(&mut terms, "subject", &criteria.subject_terms);
-    append_column_fts_terms(&mut terms, "body", &criteria.body_terms);
-    append_column_fts_terms(&mut terms, "attachment_names", &criteria.attachment_terms);
-
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" AND "))
-    }
-}
-
-fn append_column_fts_terms(terms: &mut Vec<String>, column: &str, values: &[String]) {
-    for value in values {
-        let tokens = tokenize_search_query(value);
-        terms.extend(
-            build_fts_terms(&tokens)
-                .into_iter()
-                .map(|term| format!("{column}:{term}")),
-        );
-    }
-}
-
-fn build_fts_terms(tokens: &[SearchToken]) -> Vec<String> {
-    let mut terms = Vec::new();
-    for token in tokens {
-        let words = token
-            .value
-            .split(|character: char| !character.is_alphanumeric())
-            .map(str::trim)
-            .filter(|term| !term.is_empty())
-            .map(|term| term.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-
-        if words.is_empty() {
-            continue;
-        }
-
-        if token.quoted && words.len() > 1 {
-            terms.push(format!("\"{}\"", words.join(" ")));
-        } else {
-            terms.extend(words.into_iter().map(|term| format!("{term}*")));
-        }
-    }
-
-    terms
-}
-
-fn sort_clause(sort_order: Option<&str>) -> &'static str {
-    match sort_order.unwrap_or("newest") {
-        "oldest" => "m.date ASC, m.id ASC",
-        "sender_az" => "m.sender COLLATE NOCASE ASC, m.date DESC, m.id DESC",
-        "subject_az" => "m.subject COLLATE NOCASE ASC, m.date DESC, m.id DESC",
-        _ => "m.date DESC, m.id DESC",
-    }
+    let items = collect_rows(rows)?;
+    check_search_operation(operation)?;
+    Ok(items)
 }
 
 fn row_to_message_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageListItem> {
@@ -10813,6 +11305,7 @@ fn row_to_message_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageListI
         snippet: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
         has_attachments: row.get::<_, i64>(9)? != 0 || attachment_count > 0,
         attachment_count,
+        search_match_context: search_match_context_from_row(row, 11)?,
         workspace_id: None,
         pst_display_name: None,
         workspace_path: None,
@@ -10860,53 +11353,6 @@ fn compare_message_items(
     ordering
         .then_with(|| left.pst_display_name.cmp(&right.pst_display_name))
         .then_with(|| left.workspace_id.cmp(&right.workspace_id))
-}
-
-enum FolderScope {
-    All,
-    Exact(i64),
-    WithDescendants { id: i64, prefix: String },
-}
-
-fn folder_scope(
-    conn: &Connection,
-    folder_id: Option<i64>,
-    include_subfolders: bool,
-) -> AppResult<FolderScope> {
-    let Some(id) = folder_id else {
-        return Ok(FolderScope::All);
-    };
-
-    if !include_subfolders {
-        return Ok(FolderScope::Exact(id));
-    }
-
-    let path = folder_path(conn, id)?;
-    if path.is_empty() {
-        return Ok(FolderScope::All);
-    }
-
-    Ok(FolderScope::WithDescendants {
-        id,
-        prefix: format!("{}/%", escape_like(&path)),
-    })
-}
-
-fn folder_path(conn: &Connection, folder_id: i64) -> AppResult<String> {
-    conn.query_row(
-        "SELECT path FROM folders WHERE id = ?1",
-        params![folder_id],
-        |row| row.get(0),
-    )
-    .optional()?
-    .ok_or_else(|| AppError::new("Folder was not found in this workspace."))
-}
-
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 fn list_attachments(conn: &Connection, message_id: i64) -> AppResult<Vec<Attachment>> {
@@ -10957,81 +11403,6 @@ fn collect_rows<T>(
         items.push(item?);
     }
     Ok(items)
-}
-
-#[derive(Clone)]
-struct SearchToken {
-    value: String,
-    quoted: bool,
-}
-
-fn tokenize_search_query(query: &str) -> Vec<SearchToken> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    let mut current_quoted = false;
-
-    for character in query.chars() {
-        match character {
-            '"' => {
-                if in_quote {
-                    let value = current.trim();
-                    if !value.is_empty() {
-                        tokens.push(SearchToken {
-                            value: value.to_string(),
-                            quoted: true,
-                        });
-                    }
-                    current.clear();
-                    in_quote = false;
-                    current_quoted = false;
-                } else {
-                    if !current.trim().is_empty() {
-                        tokens.push(SearchToken {
-                            value: current.trim().to_string(),
-                            quoted: current_quoted,
-                        });
-                    }
-                    current.clear();
-                    in_quote = true;
-                    current_quoted = true;
-                }
-            }
-            character if character.is_whitespace() && !in_quote => {
-                let value = current.trim();
-                if !value.is_empty() {
-                    tokens.push(SearchToken {
-                        value: value.to_string(),
-                        quoted: current_quoted,
-                    });
-                }
-                current.clear();
-                current_quoted = false;
-            }
-            character => current.push(character),
-        }
-    }
-
-    let value = current.trim();
-    if !value.is_empty() {
-        tokens.push(SearchToken {
-            value: value.to_string(),
-            quoted: current_quoted,
-        });
-    }
-
-    tokens
-}
-
-fn split_typed_token(token: &str) -> Option<(&str, &str)> {
-    let (key, value) = token.split_once(':')?;
-    if key.is_empty()
-        || value.is_empty()
-        || !key.chars().all(|character| character.is_ascii_alphabetic())
-    {
-        return None;
-    }
-    Some((key, value))
 }
 
 fn relative_path_string(root: &Path, path: &Path) -> AppResult<String> {
@@ -11404,6 +11775,152 @@ mod tests {
         conn
     }
 
+    fn create_current_search_workspace(name: &str) -> (PathBuf, PathBuf) {
+        let workspace = temporary_test_directory(name);
+        let database_path = workspace.join("index.sqlite");
+        let conn = Connection::open(&database_path).expect("search database should open");
+        initialize_schema(&conn).expect("current schema should initialize");
+        conn.execute(
+            "INSERT INTO folders (id, parent_id, path, name) VALUES (1, NULL, 'Inbox', 'Inbox')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (
+                 id, folder_id, eml_path, subject, sender, recipients, date, body,
+                 body_source, snippet, attachment_names, has_attachments
+             ) VALUES (
+                 1, 1, 'Inbox/message.eml', 'Searchable subject', 'sender@example.com',
+                 'recipient@example.com', '2026-03-01T00:00:00+00:00', 'Searchable body',
+                 'text_plain', 'Searchable body', '', 0
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages_fts (
+                 rowid, subject, sender, recipients, body, attachment_names
+             ) SELECT id, subject, sender, recipients, body, attachment_names
+                 FROM messages WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        (workspace, database_path)
+    }
+
+    fn create_search_workspace_with_messages(
+        name: &str,
+        workspace_id: &str,
+        message_count: i64,
+    ) -> ActiveWorkspace {
+        let workspace = temporary_test_directory(name);
+        let database_path = workspace.join("index.sqlite");
+        let conn = Connection::open(&database_path).expect("search database should open");
+        initialize_schema(&conn).expect("current schema should initialize");
+        conn.execute(
+            "INSERT INTO folders (id, parent_id, path, name) VALUES (1, NULL, 'Inbox', 'Inbox')",
+            [],
+        )
+        .unwrap();
+        set_metadata_value(
+            &conn,
+            "conversation_schema_version",
+            CONVERSATION_SCHEMA_VERSION,
+        )
+        .unwrap();
+        for id in 1..=message_count {
+            let conversation_number = (id - 1) / 2 + 1;
+            let conversation_root = (conversation_number - 1) * 2 + 1;
+            let attachment_name = if id == 1 { "report.pdf" } else { "" };
+            conn.execute(
+                "INSERT INTO messages (
+                     id, folder_id, eml_path, subject, sender, recipients, date, body,
+                     body_source, snippet, attachment_names, has_attachments,
+                     normalized_subject, conversation_id, conversation_root_id,
+                     thread_assignment_method
+                 ) VALUES (
+                     ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, 'text_plain', ?7, ?8, ?9,
+                     ?10, ?11, ?12, 'header'
+                 )",
+                params![
+                    id,
+                    format!("Inbox/message-{id}.eml"),
+                    format!("Shared subject {conversation_number}"),
+                    format!("sender-{id}@example.test"),
+                    "recipient@example.test",
+                    format!("2026-01-01T00:{id:02}:00+00:00"),
+                    format!("Shared body text for synthetic message {id}"),
+                    attachment_name,
+                    i64::from(id == 1),
+                    format!("Shared subject {conversation_number}"),
+                    format!("conversation-{conversation_number}"),
+                    conversation_root,
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages_fts (
+                     rowid, subject, sender, recipients, body, attachment_names
+                 ) SELECT id, subject, sender, recipients, body, attachment_names
+                     FROM messages WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        ActiveWorkspace {
+            id: workspace_id.to_string(),
+            pst_path: workspace.join(format!("{workspace_id}.pst")),
+            path: workspace,
+            fingerprint: format!("fingerprint-{workspace_id}"),
+            location_mode: WorkspaceLocationMode::AppSupport,
+        }
+    }
+
+    fn collect_cursor_message_ids(
+        active: &ActiveWorkspace,
+        conn: &Connection,
+        criteria: &MessageSearchCriteria,
+        sort: &str,
+        limit: i64,
+        codec: &SearchCursorCodec,
+    ) -> Vec<i64> {
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        for _ in 0..100 {
+            let page = query_messages_cursor_page(
+                conn,
+                &active.path,
+                &active.id,
+                None,
+                false,
+                criteria,
+                Some(sort),
+                Some(limit),
+                cursor.as_deref(),
+                11,
+                codec,
+                None,
+            )
+            .expect("cursor page should load");
+            ids.extend(page.items.iter().map(|item| item.id));
+            if !page.has_more {
+                assert!(page.next_cursor.is_none());
+                return ids;
+            }
+            cursor = Some(page.next_cursor.expect("continuing page needs a cursor"));
+        }
+        panic!("cursor pagination did not terminate");
+    }
+
+    fn expect_app_error<T>(result: AppResult<T>) -> AppError {
+        match result {
+            Ok(_) => panic!("operation should fail"),
+            Err(error) => error,
+        }
+    }
+
     fn sqlite_index_exists(conn: &Connection, name: &str) -> bool {
         conn.query_row(
             "SELECT EXISTS(
@@ -11684,9 +12201,10 @@ mod tests {
             .unwrap();
         }
 
-        let criteria = MessageSearchCriteria::from_inputs(Some("calendar".to_string()), None);
+        let criteria = MessageSearchCriteria::from_inputs(Some("calendar".to_string()), None)
+            .expect("conversation search should be valid");
         let (conversation_count, matching_count) =
-            conversation_counts(&conn, None, false, &criteria).unwrap();
+            conversation_counts(&conn, None, false, &criteria, None).unwrap();
         assert_eq!((conversation_count, matching_count), (1, 1));
 
         let active = ActiveWorkspace {
@@ -11696,9 +12214,10 @@ mod tests {
             fingerprint: "fingerprint-a".to_string(),
             location_mode: WorkspaceLocationMode::AppSupport,
         };
-        let summaries =
-            query_conversation_summaries(&conn, &active, None, false, &criteria, "newest", 100, 0)
-                .unwrap();
+        let summaries = query_conversation_summaries(
+            &conn, &active, None, false, &criteria, "newest", 100, 0, None,
+        )
+        .unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].matching_message_count, 1);
         assert_eq!(summaries[0].total_message_count, 2);
@@ -11709,16 +12228,831 @@ mod tests {
 
         let source = build_message_query_source(&conn, None, false, &criteria).unwrap();
         let matching =
-            query_matching_conversation_page(&conn, &source, "conversation-one", 100, 0).unwrap();
+            query_matching_conversation_page(&conn, &source, "conversation-one", 100, 0, None)
+                .unwrap();
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].message.id, 2);
         assert!(matching[0].matches_scope);
+        assert_eq!(
+            matching[0]
+                .message
+                .search_match_context
+                .as_ref()
+                .map(|context| context.matched_fields.as_slice()),
+            Some(&[search::SearchMatchedField::Body][..])
+        );
 
         let entire =
-            query_entire_conversation_page(&conn, &source, "conversation-one", 100, 0).unwrap();
+            query_entire_conversation_page(&conn, &source, "conversation-one", 100, 0, None)
+                .unwrap();
         assert_eq!(entire.len(), 2);
         assert!(!entire[0].matches_scope);
         assert!(entire[1].matches_scope);
+        assert!(entire
+            .iter()
+            .all(|item| item.message.search_match_context.is_none()));
+    }
+
+    #[test]
+    fn message_pages_use_limit_plus_one_without_exposing_the_extra_row() {
+        let active = create_search_workspace_with_messages("message-page", "workspace-page", 5);
+        let conn = open_workspace_db_for_read(&active.path).unwrap();
+        let criteria = MessageSearchCriteria::from_inputs(None, None).unwrap();
+
+        let first = query_messages_page(
+            &conn,
+            None,
+            false,
+            &criteria,
+            Some("newest"),
+            Some(3),
+            Some(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.requested_offset, 0);
+        assert_eq!(first.returned_count, 3);
+        assert_eq!(first.items.len(), 3, "the lookahead row must not leak");
+        assert!(first.has_more);
+        assert_eq!(
+            first.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![5, 4, 3]
+        );
+
+        let second = query_messages_page(
+            &conn,
+            None,
+            false,
+            &criteria,
+            Some("newest"),
+            Some(3),
+            Some(3),
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.requested_offset, 3);
+        assert_eq!(second.returned_count, 2);
+        assert!(!second.has_more);
+        assert_eq!(
+            second.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            query_message_count(&conn, None, false, &criteria, None).unwrap(),
+            5
+        );
+        let attachment_filter: SearchFilters = serde_json::from_value(serde_json::json!({
+            "hasAttachments": "yes"
+        }))
+        .unwrap();
+        let filtered = MessageSearchCriteria::from_inputs(None, Some(attachment_filter)).unwrap();
+        assert_eq!(
+            query_message_count(&conn, None, false, &filtered, None).unwrap(),
+            1,
+            "blank text plus structured filters must count independently"
+        );
+        let body_filter: SearchFilters = serde_json::from_value(serde_json::json!({
+            "body": "synthetic"
+        }))
+        .unwrap();
+        let text_and_filter =
+            MessageSearchCriteria::from_inputs(Some("shared".to_string()), Some(body_filter))
+                .unwrap();
+        assert_eq!(
+            query_message_count(&conn, None, false, &text_and_filter, None).unwrap(),
+            5,
+            "text and structured filters must share the page criteria"
+        );
+
+        drop(conn);
+        fs::remove_dir_all(active.path).unwrap();
+    }
+
+    #[test]
+    fn exact_limit_message_page_reports_no_more_and_preserves_context() {
+        let active = create_search_workspace_with_messages("message-exact", "workspace-exact", 3);
+        let conn = open_workspace_db_for_read(&active.path).unwrap();
+        let criteria =
+            MessageSearchCriteria::from_inputs(Some("shared".to_string()), None).unwrap();
+        let page = query_messages_page(
+            &conn,
+            None,
+            false,
+            &criteria,
+            Some("relevance"),
+            Some(3),
+            Some(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(page.returned_count, 3);
+        assert!(!page.has_more);
+        assert!(page
+            .items
+            .iter()
+            .all(|item| item.search_match_context.is_some()));
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            page.items.len(),
+            "stable relevance pagination must not duplicate rows"
+        );
+
+        drop(conn);
+        fs::remove_dir_all(active.path).unwrap();
+    }
+
+    #[test]
+    fn single_workspace_cursor_pages_match_full_order_for_every_message_sort() {
+        let active =
+            create_search_workspace_with_messages("message-cursor-order", "workspace-cursor", 9);
+        let writer = Connection::open(active.path.join("index.sqlite")).unwrap();
+        writer
+            .execute_batch(
+                "UPDATE messages
+                    SET date = CASE id
+                        WHEN 1 THEN NULL
+                        WHEN 2 THEN '2026-01-01T00:00:00+00:00'
+                        WHEN 3 THEN '2026-01-01T00:00:00+00:00'
+                        ELSE date
+                    END,
+                        sender = CASE id
+                            WHEN 1 THEN NULL
+                            WHEN 2 THEN 'Alpha'
+                            WHEN 3 THEN 'alpha'
+                            WHEN 4 THEN 'Ångström'
+                            WHEN 5 THEN '東京'
+                            ELSE 'Zulu'
+                        END,
+                        subject = CASE id
+                            WHEN 1 THEN NULL
+                            WHEN 2 THEN 'Shared Alpha'
+                            WHEN 3 THEN 'shared alpha'
+                            WHEN 4 THEN 'Shared Ångström'
+                            WHEN 5 THEN 'Shared 東京'
+                            ELSE 'Shared Zulu'
+                        END;
+                 INSERT INTO messages_fts(messages_fts) VALUES('rebuild');",
+            )
+            .unwrap();
+        drop(writer);
+
+        let conn = open_workspace_db_for_read(&active.path).unwrap();
+        let codec = SearchCursorCodec::default();
+        for (sort, criteria) in [
+            (
+                "newest",
+                MessageSearchCriteria::from_inputs(None, None).unwrap(),
+            ),
+            (
+                "oldest",
+                MessageSearchCriteria::from_inputs(None, None).unwrap(),
+            ),
+            (
+                "sender_az",
+                MessageSearchCriteria::from_inputs(None, None).unwrap(),
+            ),
+            (
+                "subject_az",
+                MessageSearchCriteria::from_inputs(None, None).unwrap(),
+            ),
+            (
+                "relevance",
+                MessageSearchCriteria::from_inputs(Some("shared".to_string()), None).unwrap(),
+            ),
+        ] {
+            let expected = query_messages_page(
+                &conn,
+                None,
+                false,
+                &criteria,
+                Some(sort),
+                Some(100),
+                Some(0),
+                None,
+            )
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+            let actual = collect_cursor_message_ids(&active, &conn, &criteria, sort, 2, &codec);
+            assert_eq!(actual, expected, "{sort} cursor order must match ORDER BY");
+            assert_eq!(
+                actual.iter().copied().collect::<HashSet<_>>().len(),
+                actual.len(),
+                "{sort} cursor pages must not duplicate rows"
+            );
+        }
+
+        drop(conn);
+        fs::remove_dir_all(active.path).unwrap();
+    }
+
+    #[test]
+    fn cursor_page_uses_limit_plus_one_context_and_no_offset_sql() {
+        let active = create_search_workspace_with_messages(
+            "message-cursor-page",
+            "workspace-cursor-page",
+            5,
+        );
+        let conn = open_workspace_db_for_read(&active.path).unwrap();
+        let criteria =
+            MessageSearchCriteria::from_inputs(Some("shared".to_string()), None).unwrap();
+        let source = build_message_query_source(&conn, None, false, &criteria).unwrap();
+        let sql = message_cursor_page_sql(
+            &source,
+            &source.where_sql,
+            MessageSort::from_request(Some("relevance"), source.has_text_match).unwrap(),
+        );
+        assert!(!sql.to_ascii_uppercase().contains(" OFFSET"));
+
+        let codec = SearchCursorCodec::default();
+        let first = query_messages_cursor_page(
+            &conn,
+            &active.path,
+            &active.id,
+            None,
+            false,
+            &criteria,
+            Some("relevance"),
+            Some(3),
+            None,
+            11,
+            &codec,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.pagination_mode, "cursor");
+        assert_eq!(first.requested_offset, 0);
+        assert_eq!(first.items.len(), 3);
+        assert!(first.has_more);
+        assert!(first.next_cursor.is_some());
+        assert!(first
+            .items
+            .iter()
+            .all(|item| item.search_match_context.is_some()));
+
+        let second = query_messages_cursor_page(
+            &conn,
+            &active.path,
+            &active.id,
+            None,
+            false,
+            &criteria,
+            Some("relevance"),
+            Some(3),
+            first.next_cursor.as_deref(),
+            11,
+            &codec,
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.items.len(), 2);
+        assert!(!second.has_more);
+        assert!(second.next_cursor.is_none());
+        assert!(first
+            .items
+            .iter()
+            .all(|first_item| second.items.iter().all(|item| item.id != first_item.id)));
+
+        drop(conn);
+        fs::remove_dir_all(active.path).unwrap();
+    }
+
+    #[test]
+    fn invalid_wrong_context_and_stale_message_cursors_return_typed_errors() {
+        let active =
+            create_search_workspace_with_messages("message-cursor-errors", "workspace-errors", 4);
+        let conn = open_workspace_db_for_read(&active.path).unwrap();
+        let criteria = MessageSearchCriteria::from_inputs(None, None).unwrap();
+        let codec = SearchCursorCodec::default();
+        let first = query_messages_cursor_page(
+            &conn,
+            &active.path,
+            &active.id,
+            None,
+            false,
+            &criteria,
+            Some("newest"),
+            Some(2),
+            None,
+            11,
+            &codec,
+            None,
+        )
+        .unwrap();
+        let cursor = first.next_cursor.as_deref().unwrap();
+        let oversized_cursor = "x".repeat(300);
+
+        let cases = [
+            (
+                "malformed",
+                "not-a-cursor",
+                active.id.as_str(),
+                "newest",
+                11,
+            ),
+            (
+                "oversized",
+                oversized_cursor.as_str(),
+                active.id.as_str(),
+                "newest",
+                11,
+            ),
+            (
+                "unsupported",
+                "pqv-msg-v2.deadbeef",
+                active.id.as_str(),
+                "newest",
+                11,
+            ),
+            ("workspace", cursor, "another-workspace", "newest", 11),
+            ("sort", cursor, active.id.as_str(), "oldest", 11),
+            ("generation", cursor, active.id.as_str(), "newest", 12),
+        ];
+        for (name, value, workspace_id, sort, generation) in cases {
+            let error = expect_app_error(query_messages_cursor_page(
+                &conn,
+                &active.path,
+                workspace_id,
+                None,
+                false,
+                &criteria,
+                Some(sort),
+                Some(2),
+                Some(value),
+                generation,
+                &codec,
+                None,
+            ));
+            let expected_code = if name == "unsupported" {
+                search_pagination::UNSUPPORTED_SEARCH_CURSOR_CODE
+            } else {
+                search_pagination::INVALID_SEARCH_CURSOR_CODE
+            };
+            assert_eq!(error.code, Some(expected_code), "{name}");
+        }
+
+        let changed_criteria =
+            MessageSearchCriteria::from_inputs(Some("shared".to_string()), None).unwrap();
+        let error = expect_app_error(query_messages_cursor_page(
+            &conn,
+            &active.path,
+            &active.id,
+            None,
+            false,
+            &changed_criteria,
+            Some("newest"),
+            Some(2),
+            Some(cursor),
+            11,
+            &codec,
+            None,
+        ));
+        assert_eq!(
+            error.code,
+            Some(search_pagination::INVALID_SEARCH_CURSOR_CODE)
+        );
+
+        let writer = Connection::open(active.path.join("index.sqlite")).unwrap();
+        set_metadata_value(&writer, "last_reindex_at", "2099-01-01T00:00:00Z").unwrap();
+        drop(writer);
+        let error = expect_app_error(query_messages_cursor_page(
+            &conn,
+            &active.path,
+            &active.id,
+            None,
+            false,
+            &criteria,
+            Some("newest"),
+            Some(2),
+            Some(cursor),
+            11,
+            &codec,
+            None,
+        ));
+        assert_eq!(
+            error.code,
+            Some(search_pagination::STALE_SEARCH_CURSOR_CODE)
+        );
+
+        drop(conn);
+        fs::remove_dir_all(active.path).unwrap();
+    }
+
+    #[test]
+    fn cursor_cancellation_is_safe_and_multi_workspace_remains_offset_only() {
+        let active =
+            create_search_workspace_with_messages("message-cursor-cancel", "workspace-cancel", 4);
+        let conn = open_workspace_db_for_read(&active.path).unwrap();
+        let criteria = MessageSearchCriteria::from_inputs(None, None).unwrap();
+        let codec = SearchCursorCodec::default();
+        let registry = Arc::new(SearchCancellationRegistry::default());
+        let operation = registry
+            .begin_operation(
+                "cursor-window",
+                11,
+                "message-page-1",
+                SearchOperationCategory::MessagePage,
+            )
+            .unwrap();
+        registry
+            .cancel_operation("cursor-window", 11, "message-page-1")
+            .unwrap();
+        let error = expect_app_error(query_messages_cursor_page(
+            &conn,
+            &active.path,
+            &active.id,
+            None,
+            false,
+            &criteria,
+            Some("newest"),
+            Some(2),
+            None,
+            11,
+            &codec,
+            Some(&operation),
+        ));
+        assert_eq!(error.code, Some(SEARCH_CANCELLED_CODE));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+
+        assert!(ensure_multi_workspace_cursor_absent(None).is_ok());
+        let unsupported = ensure_multi_workspace_cursor_absent(Some("opaque")).unwrap_err();
+        assert_eq!(
+            unsupported.code,
+            Some(search_pagination::UNSUPPORTED_SEARCH_CURSOR_CODE)
+        );
+        let multi_page = query_multi_workspace_message_page(
+            vec![active.clone()],
+            &criteria,
+            "newest",
+            Some(2),
+            Some(0),
+            &registry
+                .begin_operation(
+                    "cursor-window",
+                    12,
+                    "message-page-2",
+                    SearchOperationCategory::MessagePage,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(multi_page.pagination_mode, "offset");
+        assert!(multi_page.next_cursor.is_none());
+
+        drop(operation);
+        drop(conn);
+        fs::remove_dir_all(active.path).unwrap();
+    }
+
+    #[test]
+    fn multi_workspace_page_and_count_are_independent_and_keep_identity() {
+        let first = create_search_workspace_with_messages("multi-page-a", "workspace-a", 4);
+        let second = create_search_workspace_with_messages("multi-page-b", "workspace-b", 3);
+        let first_path = first.path.clone();
+        let second_path = second.path.clone();
+        let criteria = MessageSearchCriteria::from_inputs(None, None).unwrap();
+        let registry = Arc::new(SearchCancellationRegistry::default());
+        let page_operation = registry
+            .begin_operation(
+                "test-window",
+                3,
+                "message-page-1",
+                SearchOperationCategory::MessagePage,
+            )
+            .unwrap();
+        let count_operation = registry
+            .begin_operation(
+                "test-window",
+                3,
+                "message-count-1",
+                SearchOperationCategory::MessageCount,
+            )
+            .unwrap();
+
+        let page = query_multi_workspace_message_page(
+            vec![first.clone(), second.clone()],
+            &criteria,
+            "newest",
+            Some(4),
+            Some(0),
+            &page_operation,
+        )
+        .unwrap();
+        assert_eq!(page.returned_count, 4);
+        assert!(page.has_more);
+        assert!(page.items.iter().all(|item| {
+            matches!(
+                item.workspace_id.as_deref(),
+                Some("workspace-a" | "workspace-b")
+            ) && item.pst_display_name.is_some()
+        }));
+
+        let load_more_operation = registry
+            .begin_operation(
+                "test-window",
+                3,
+                "message-load-more-1",
+                SearchOperationCategory::MessagePage,
+            )
+            .unwrap();
+        let next_page = query_multi_workspace_message_page(
+            vec![first.clone(), second.clone()],
+            &criteria,
+            "newest",
+            Some(4),
+            Some(4),
+            &load_more_operation,
+        )
+        .unwrap();
+        assert_eq!(next_page.returned_count, 3);
+        assert!(!next_page.has_more);
+        let first_page_keys = page
+            .items
+            .iter()
+            .map(|item| (item.workspace_id.clone(), item.id))
+            .collect::<HashSet<_>>();
+        assert!(next_page
+            .items
+            .iter()
+            .all(|item| !first_page_keys.contains(&(item.workspace_id.clone(), item.id))));
+
+        let counts =
+            count_multi_workspace_messages(vec![first, second], &criteria, &count_operation)
+                .unwrap();
+        assert_eq!(counts.total_count, 7);
+        assert_eq!(
+            counts
+                .per_workspace_counts
+                .iter()
+                .map(|count| count.count)
+                .collect::<Vec<_>>(),
+            vec![4, 3]
+        );
+        assert!(page_operation.check_cancelled().is_ok());
+
+        drop(count_operation);
+        drop(load_more_operation);
+        drop(page_operation);
+        fs::remove_dir_all(first_path).unwrap();
+        fs::remove_dir_all(second_path).unwrap();
+    }
+
+    #[test]
+    fn conversation_pages_arrive_independently_of_exact_counts() {
+        let active =
+            create_search_workspace_with_messages("conversation-page", "workspace-conversation", 6);
+        let workspace_path = active.path.clone();
+        let scope = ConversationWorkspaceScope {
+            workspace_id: active.id.clone(),
+            folder_id: None,
+            include_subfolders: false,
+        };
+        let criteria = MessageSearchCriteria::from_inputs(None, None).unwrap();
+        let registry = Arc::new(SearchCancellationRegistry::default());
+        let page_operation = registry
+            .begin_operation(
+                "test-window",
+                5,
+                "conversation-page-1",
+                SearchOperationCategory::ConversationPage,
+            )
+            .unwrap();
+        let count_operation = registry
+            .begin_operation(
+                "test-window",
+                5,
+                "conversation-count-1",
+                SearchOperationCategory::ConversationCount,
+            )
+            .unwrap();
+        let page = query_conversation_page_for_scopes(
+            vec![(scope.clone(), active.clone())],
+            &criteria,
+            "newest",
+            Some(2),
+            Some(0),
+            &page_operation,
+        )
+        .unwrap();
+        assert_eq!(page.returned_count, 2);
+        assert_eq!(page.items.len(), 2);
+        assert!(page.has_more);
+        assert_eq!(page.indexed_workspace_count, 1);
+        assert!(page.unindexed_workspaces.is_empty());
+
+        let counts =
+            count_conversations_for_scopes(vec![(scope, active)], &criteria, &count_operation)
+                .unwrap();
+        assert_eq!(counts.total_count, 3);
+        assert_eq!(counts.matching_message_count, 6);
+
+        drop(count_operation);
+        drop(page_operation);
+        fs::remove_dir_all(workspace_path).unwrap();
+    }
+
+    #[test]
+    fn valid_schema_v3_search_uses_read_only_connection_without_changing_version() {
+        let (workspace, database_path) = create_current_search_workspace("read-search-current");
+        let conn = open_workspace_db_for_read(&workspace).expect("current workspace should open");
+        assert_eq!(
+            read_schema_version(&conn).unwrap(),
+            SQLITE_SCHEMA_VERSION_CURRENT
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        let criteria = MessageSearchCriteria::from_inputs(Some("searchable".into()), None).unwrap();
+        let result =
+            query_messages_page(&conn, None, false, &criteria, None, Some(10), Some(0), None)
+                .expect("read search should succeed");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.returned_count, 1);
+        assert!(!result.has_more);
+        assert_eq!(
+            query_message_count(&conn, None, false, &criteria, None).unwrap(),
+            1
+        );
+        let context = result.items[0]
+            .search_match_context
+            .as_ref()
+            .expect("FTS search should include additive context");
+        assert_eq!(
+            context.matched_fields,
+            vec![
+                search::SearchMatchedField::Subject,
+                search::SearchMatchedField::Body,
+            ]
+        );
+        assert!(context.snippet_text.contains("Searchable"));
+        assert!(context
+            .highlight_ranges
+            .iter()
+            .all(|range| range.start < range.end));
+        let relevance_result = query_messages_page(
+            &conn,
+            None,
+            false,
+            &criteria,
+            Some("relevance"),
+            Some(10),
+            Some(0),
+            None,
+        )
+        .expect("single-workspace FTS search should support relevance");
+        assert_eq!(relevance_result.items.len(), 1);
+        assert!(relevance_result.items[0].search_match_context.is_some());
+        assert!(
+            conn.execute_batch("PRAGMA user_version = 2").is_err(),
+            "read connection must reject schema writes"
+        );
+
+        let writer = Connection::open(&database_path).expect("writer should open beside reader");
+        writer
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .expect("read query connection must not hold a migration transaction");
+        assert_eq!(
+            read_schema_version(&writer).unwrap(),
+            SQLITE_SCHEMA_VERSION_CURRENT
+        );
+        drop(writer);
+        drop(conn);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn cancelled_count_does_not_cancel_a_valid_page_in_the_same_generation() {
+        let registry = Arc::new(SearchCancellationRegistry::default());
+        let page = registry
+            .begin_operation(
+                "test-window",
+                1,
+                "message-page-1",
+                SearchOperationCategory::MessagePage,
+            )
+            .unwrap();
+        let count = registry
+            .begin_operation(
+                "test-window",
+                1,
+                "message-count-1",
+                SearchOperationCategory::MessageCount,
+            )
+            .unwrap();
+        registry
+            .cancel_operation("test-window", 1, "message-count-1")
+            .unwrap();
+        assert!(count.check_cancelled().is_err());
+        assert!(page.check_cancelled().is_ok());
+    }
+
+    #[test]
+    fn cancellation_between_workspace_iterations_prevents_later_work() {
+        let registry = Arc::new(SearchCancellationRegistry::default());
+        let operation = registry
+            .begin_operation(
+                "test-window",
+                7,
+                "message-count-1",
+                SearchOperationCategory::MessageCount,
+            )
+            .unwrap();
+        let mut visited = Vec::new();
+        let result: AppResult<()> = (|| {
+            for workspace in 0..3 {
+                operation.check_cancelled()?;
+                visited.push(workspace);
+                if workspace == 0 {
+                    registry.cancel_generation("test-window", 7)?;
+                }
+            }
+            Ok(())
+        })();
+        let error = result.expect_err("later synthetic workspaces must be skipped");
+        assert_eq!(error.code, Some(SEARCH_CANCELLED_CODE));
+        assert_eq!(visited, vec![0]);
+    }
+
+    #[test]
+    fn read_connection_rejects_old_schema_without_starting_migration() {
+        let (workspace, database_path) = create_current_search_workspace("read-search-old");
+        let writer = Connection::open(&database_path).unwrap();
+        writer.execute_batch("PRAGMA user_version = 2").unwrap();
+        drop(writer);
+
+        let error = open_workspace_db_for_read(&workspace)
+            .expect_err("old schema must be upgraded through workspace activation");
+        assert!(error.to_string().contains("version 2 requires upgrade"));
+        assert_ne!(error.code, Some(SEARCH_CANCELLED_CODE));
+
+        let writer = Connection::open(&database_path).unwrap();
+        assert_eq!(read_schema_version(&writer).unwrap(), 2);
+        assert!(column_exists(&writer, "messages", "conversation_id").unwrap());
+        drop(writer);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn read_connection_rejects_future_schema_without_modification() {
+        let (workspace, database_path) = create_current_search_workspace("read-search-future");
+        let future_version = SQLITE_SCHEMA_VERSION_CURRENT + 1;
+        let writer = Connection::open(&database_path).unwrap();
+        writer
+            .execute_batch(&format!("PRAGMA user_version = {future_version}"))
+            .unwrap();
+        drop(writer);
+
+        let error = open_workspace_db_for_read(&workspace)
+            .expect_err("future schema must not be downgraded");
+        assert!(error.to_string().contains("newer than this version"));
+        assert_ne!(error.code, Some(SEARCH_CANCELLED_CODE));
+
+        let writer = Connection::open(&database_path).unwrap();
+        assert_eq!(read_schema_version(&writer).unwrap(), future_version);
+        drop(writer);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn read_connection_rejects_missing_required_search_table_clearly() {
+        let (workspace, database_path) = create_current_search_workspace("read-search-missing");
+        let writer = Connection::open(&database_path).unwrap();
+        writer.execute_batch("DROP TABLE messages_fts").unwrap();
+        drop(writer);
+
+        let error = open_workspace_db_for_read(&workspace)
+            .expect_err("missing search table must be rejected");
+        assert!(error.to_string().contains("messages_fts"));
+        assert_ne!(error.code, Some(SEARCH_CANCELLED_CODE));
+
+        let writer = Connection::open(&database_path).unwrap();
+        assert_eq!(
+            read_schema_version(&writer).unwrap(),
+            SQLITE_SCHEMA_VERSION_CURRENT
+        );
+        drop(writer);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn arbitrary_source_path_is_not_accepted_as_a_workspace_id() {
+        let error = workspace_path_for_id("/tmp/source.pst")
+            .expect_err("search commands accept validated workspace ids, not source paths");
+        assert_eq!(error.to_string(), "Invalid workspace id.");
     }
 
     #[test]
