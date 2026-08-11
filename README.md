@@ -6,7 +6,7 @@
 
 <p align="center">
   A local-only macOS viewer and search tool for PST, EML, and MSG files.<br>
-  <strong>Public beta v0.2.0-beta.2</strong>
+  <strong>Current source: v0.2.0-beta.3 release candidate</strong>
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/empathyrecoveryblitz/pst-quickview/releases/tag/v0.2.0-beta.2"><strong>Download latest beta</strong></a>
+  <a href="https://github.com/empathyrecoveryblitz/pst-quickview/releases"><strong>Download latest published beta</strong></a>
   ·
   <a href="https://github.com/empathyrecoveryblitz/pst-quickview/releases">View releases</a>
   ·
@@ -32,7 +32,7 @@
 
 PST QuickView provides a focused desktop interface for browsing and searching Outlook PST archives and standalone EML or MSG messages without sending mail data to a cloud service. Original source files remain read-only. PST archives are converted locally into persistent workspaces by the bundled ReadPST / LibPST 0.6.76 tooling, then indexed with SQLite and FTS5 for navigation and search.
 
-The current release is a beta. It is unsigned and unnotarized, and it does not claim complete Outlook rendering or calendar compatibility.
+This source version is a beta release candidate. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
 
 ## Screenshots
 
@@ -56,8 +56,14 @@ See the [public screenshot requirements](assets/screenshots/README.md) before ad
 
 ### Search and navigate
 
-- Search subject, body text, sender, recipients, and attachment names.
-- Search the current PST or all open PSTs with a persistent **Scope** preference.
+- Search subject, body text, sender, recipients, and attachment names with ordinary terms, quoted phrases, typed fields, and inclusive date filters.
+- Search the current PST or all open PSTs with a persistent **Scope** preference, folder/subtree filtering, removable filter chips, and **Clear All**.
+- See match-centered snippets, backend-derived highlighting, and badges identifying matched fields.
+- Sort single-PST text searches by FTS5 Relevance; Relevance is not compared across separate PST databases.
+- Receive the first result page independently of the exact count, while superseded SQLite page and count work is physically cancelled.
+- Use stable cursor pagination for single-PST Messages searches. True multi-PST Messages searches and Conversations retain deterministic offset pagination.
+- Keep large loaded result sets usable through variable-height DOM virtualization for Messages, Conversations, and expanded conversation messages.
+- Navigate virtualized results with a roving Tab stop plus Arrow, Home, End, Page Up, and Page Down keys; Conversations also support Left/Right expand, collapse, child, and parent movement.
 - Move between folder, message, and conversation views without leaving the desktop app.
 
 ### Privacy and safety behavior
@@ -84,7 +90,7 @@ Attachments are exported to a separate local file before Open is requested. Expo
 
 ## Installation
 
-1. Download the DMG from the [v0.2.0-beta.2 release page](https://github.com/empathyrecoveryblitz/pst-quickview/releases/tag/v0.2.0-beta.2).
+1. Download the current published DMG from the project [Releases](https://github.com/empathyrecoveryblitz/pst-quickview/releases) page.
 2. Open the DMG and drag **PST QuickView** into **Applications**.
 3. In Finder, open **Applications**, right-click **PST QuickView**, and choose **Open**.
 4. Confirm the per-app macOS prompt.
@@ -96,7 +102,7 @@ The beta is unsigned and unnotarized, so a normal double-click may be blocked on
 - **PST:** locally converted by the bundled ReadPST / LibPST 0.6.76 component and stored in a searchable workspace.
 - **EML:** opened and parsed as a standalone email message.
 - **MSG:** opened as a standalone Outlook message, with best-effort support for Outlook-specific content.
-- **macOS:** distributed as a Universal application for Intel (`x86_64`) and Apple silicon (`arm64`) Macs.
+- **macOS:** distributed as a Universal application for Intel (`x86_64`) and Apple silicon (`arm64`) Macs. The Intel slice targets macOS 10.13 and the Apple silicon slice targets macOS 11.0; these deployment targets do not replace clean-machine testing.
 
 The packaged beta includes ReadPST; Homebrew is not required to open PST files with the released application.
 
@@ -107,6 +113,11 @@ The packaged beta includes ReadPST; Homebrew is not required to open PST files w
 - Message rendering prioritizes readable plain text and sanitized HTML. Outlook HTML, Word/RTF layouts, calendar data, and uncommon MAPI properties may be simplified or incomplete.
 - Calendar and meeting MSG previews are best effort. Recurrence or time-zone details may be incomplete, and real exported calendar or meeting messages have not yet been manually validated.
 - Encrypted, damaged, unusual, or newer PST/MSG content may be unsupported.
+- Relevance is available only for text searches that resolve to exactly one PST. True multi-PST searches do not compare BM25 scores, and Conversations do not use Relevance.
+- Single-PST Messages use cursor pagination. Multi-PST Messages and Conversations remain offset-based.
+- Virtualization bounds mounted DOM rows, but loaded result objects remain in memory until the search resets; page-data eviction is not implemented.
+- Keyboard navigation has source and local testing but is not presented as VoiceOver certification.
+- Broader clean-machine and user testing remain important for this beta candidate.
 - PST conversion requires temporary local processing space and leaves a persistent local workspace for extracted EML files and the SQLite index until it is explicitly deleted. Large archives can require significant disk space and initial processing time.
 - Exported attachments remain untrusted files and should be handled with the same care as attachments from any other source.
 - Attachment export is one item at a time, and conversation quality depends on available Message-ID, References, In-Reply-To, participant, and subject data.

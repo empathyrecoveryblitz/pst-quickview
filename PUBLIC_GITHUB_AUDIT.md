@@ -1,6 +1,6 @@
 # Public GitHub readiness audit
 
-Audit date: 2026-07-17. Scope: tracked files and all commits reachable from local branches and tags. The audit used targeted string searches, email/credential patterns, tracked-extension checks, and per-commit Git searches. Sensitive content is intentionally not reproduced here.
+Audit refreshed: 2026-08-10. Scope: tracked files and all commits reachable from local branches and tags. The audit used targeted string searches, email/credential patterns, tracked-extension checks, and per-commit Git searches. Sensitive content is intentionally not reproduced here.
 
 ## Decision
 
@@ -42,7 +42,7 @@ verifier are now recorded. The accidental macOS 15.0 sidecar minimum was
 corrected through a verified source rebuild. Technical Corresponding Source
 companion preparation is complete. Public delivery is still
 incomplete until the regenerated companion archive and checksum are uploaded
-beside the DMG at the intended `0.2.0-beta.2` release location. Preparation and
+beside the DMG at the intended `0.2.0-beta.3` release location. Preparation and
 release verification now reject a stale companion URL. An upstream URL alone remains
 insufficient; see
 `docs/READPST_CORRESPONDING_SOURCE.md`.

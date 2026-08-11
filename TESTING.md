@@ -1,6 +1,6 @@
 # PST QuickView Internal Beta Test Plan
 
-Version under test: `0.2.0-beta.2`
+Version under test: `0.2.0-beta.3`
 
 Record the Mac model, macOS version, CPU architecture, app path, DMG filename, and whether
 Homebrew is installed before testing. Use disposable copies of test files where possible and
@@ -13,7 +13,7 @@ record SHA-256 hashes for source-integrity checks.
 - Never disable Gatekeeper globally.
 - If the approved internal workflow requires removing quarantine, remove it only from
   `/Applications/PST QuickView.app`.
-- Confirm About shows `0.2.0-beta.2`.
+- Confirm About shows `0.2.0-beta.3`.
 - Expand About > Diagnostics and record macOS, CPU, executable architecture, and readpst source.
 
 ## PST
@@ -68,6 +68,25 @@ record SHA-256 hashes for source-integrity checks.
 - Save Source EML As and compare the source and copy hashes.
 - Save Source MSG As and compare the source and copy hashes.
 - Confirm Message Diagnostics remain read-only.
+
+## Search 2.0
+
+- Search with ordinary terms, quoted phrases, typed fields, advanced text filters, attachment
+  presence, inclusive date bounds, folder scope, and subtree scope.
+- Confirm removable filter chips, the Advanced Search filter count, and Clear All preserve the
+  global Current PST or All Open PSTs Scope preference.
+- Confirm contextual snippets, matched-field badges, and highlighted ranges identify the actual
+  match without raw marker characters or rendered HTML.
+- Confirm Relevance is available only for a text search resolving to one PST and falls back to
+  Newest when the query, mode, or effective workspace selection becomes ineligible.
+- Confirm first-page rows appear without waiting for the exact count and that superseded searches
+  do not restore stale rows, counts, errors, or loading state.
+- Exercise explicit Load More for single-PST cursor pagination and true multi-PST offset
+  pagination; confirm no duplicates, missing rows, or unexpected scroll reset.
+- In Messages and Conversations, exercise Arrow keys, Home, End, Page Up, Page Down, and the
+  documented conversation Left/Right behavior across virtualized boundaries.
+- Confirm mounted result rows remain bounded after repeated Load More while selected message
+  preview and loaded result data remain available.
 
 ## Conversations
 

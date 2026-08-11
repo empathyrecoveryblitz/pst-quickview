@@ -10,7 +10,7 @@
   public download location.
 - [ ] The verified ReadPST Corresponding Source archive and checksum are uploaded and available
   next to the DMG at the recorded public location:
-  `https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.2/readpst-corresponding-source-0.6.76.tar.gz`.
+  `https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.3/readpst-corresponding-source-0.6.76.tar.gz`.
 - [ ] Distribution obligations and notices for the statically linked `GPL-2.0-or-later` LibPST
   component receive final release review.
 - [x] Original application icon ownership is documented; copied assets still require their normal

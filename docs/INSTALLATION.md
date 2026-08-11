@@ -1,19 +1,19 @@
 # Installing PST QuickView on macOS
 
-PST QuickView v0.2.0-beta.2 is an unsigned and unnotarized public beta. Install it only from the project's [official GitHub release page](https://github.com/empathyrecoveryblitz/pst-quickview/releases/tag/v0.2.0-beta.2).
+PST QuickView v0.2.0-beta.3 is an unsigned and unnotarized beta build. Install published builds only from the project's [official GitHub Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases).
 
 ## System requirements
 
 - A Mac with an Intel (`x86_64`) or Apple silicon (`arm64`) processor.
-- macOS. The beta is distributed as a Universal application; the project does not yet claim a fully qualified minimum OS version across all workflows.
+- macOS. The Universal build contains Intel and Apple silicon slices. The Intel slice targets macOS 10.13 and the Apple silicon slice targets macOS 11.0; broader clean-machine testing remains important.
 - Enough free disk space for the application and any local PST workspaces. PST import creates extracted message copies and a SQLite index, and the app presents a storage estimate before conversion.
 
 The released application includes ReadPST / LibPST 0.6.76. Homebrew is not required for PST conversion.
 
 ## Install from the DMG
 
-1. Open the [v0.2.0-beta.2 release page](https://github.com/empathyrecoveryblitz/pst-quickview/releases/tag/v0.2.0-beta.2).
-2. Download the DMG from the release assets.
+1. Open the project [Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases) and select v0.2.0-beta.3 when that release is available.
+2. Download the Universal DMG and `SHA256SUMS.txt` from that release's assets, then verify the DMG checksum before opening it.
 3. Open the downloaded DMG.
 4. Drag **PST QuickView** into the **Applications** folder.
 5. Eject the DMG after the copy finishes.

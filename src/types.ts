@@ -45,6 +45,24 @@ export type Folder = {
   directMessageCount: number;
 };
 
+export type SearchHighlightRange = {
+  start: number;
+  end: number;
+};
+
+export type SearchMatchedField =
+  | "subject"
+  | "sender"
+  | "recipients"
+  | "body"
+  | "attachment";
+
+export type SearchMatchContext = {
+  snippetText: string;
+  highlightRanges: SearchHighlightRange[];
+  matchedFields: SearchMatchedField[];
+};
+
 export type MessageListItem = {
   id: number;
   folderId: number;
@@ -57,13 +75,22 @@ export type MessageListItem = {
   snippet: string;
   hasAttachments: boolean;
   attachmentCount: number;
+  searchMatchContext?: SearchMatchContext;
   workspaceId?: string;
   pstDisplayName?: string;
   workspacePath?: string;
 };
 
-export type MessageListResult = {
+export type MessagePageResult = {
   items: MessageListItem[];
+  requestedOffset: number;
+  returnedCount: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+  paginationMode: "cursor" | "offset";
+};
+
+export type MessageCountResult = {
   totalCount: number;
 };
 
@@ -73,7 +100,9 @@ export type WorkspaceSearchCount = {
   count: number;
 };
 
-export type MultiMessageListResult = MessageListResult & {
+export type MultiMessagePageResult = MessagePageResult;
+
+export type MultiMessageCountResult = MessageCountResult & {
   perWorkspaceCounts: WorkspaceSearchCount[];
 };
 
@@ -108,12 +137,18 @@ export type ConversationWorkspaceIssue = {
   canReindex: boolean;
 };
 
-export type ConversationListResult = {
+export type ConversationPageResult = {
   items: ConversationSummary[];
-  totalCount: number;
-  matchingMessageCount: number;
+  requestedOffset: number;
+  returnedCount: number;
+  hasMore: boolean;
   indexedWorkspaceCount: number;
   unindexedWorkspaces: ConversationWorkspaceIssue[];
+};
+
+export type ConversationCountResult = {
+  totalCount: number;
+  matchingMessageCount: number;
 };
 
 export type ConversationMessageItem = MessageListItem & {
@@ -413,4 +448,5 @@ export type DeleteResult = {
 export type BackendError = {
   message: string;
   setupCommand?: string | null;
+  code?: string | null;
 };

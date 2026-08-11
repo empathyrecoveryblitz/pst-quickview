@@ -10,8 +10,8 @@ if [[ ! -r "${DYLIB_VALIDATION_SCRIPT}" ]]; then
 fi
 # shellcheck source=macos-dylib-validation.sh
 source "${DYLIB_VALIDATION_SCRIPT}"
-EXPECTED_VERSION="${PST_QUICKVIEW_EXPECTED_VERSION:-0.2.0-beta.2}"
-EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.0.2}"
+EXPECTED_VERSION="${PST_QUICKVIEW_EXPECTED_VERSION:-0.2.0-beta.3}"
+EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.0.3}"
 EXPECTED_PROJECT_LICENSE="GPL-3.0-or-later"
 EXPECTED_REPOSITORY="https://github.com/empathyrecoveryblitz/pst-quickview"
 EXPECTED_GPL3_SHA256="3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
@@ -267,8 +267,8 @@ for name, version in pins.items():
         raise SystemExit(f"dependency pin missing: {name} = {version!r}")
 
 macos = tauri.get("bundle", {}).get("macOS", {})
-if macos.get("bundleVersion") != "0.2.0.2":
-    raise SystemExit("macOS bundleVersion must be 0.2.0.2")
+if macos.get("bundleVersion") != "0.2.0.3":
+    raise SystemExit("macOS bundleVersion must be 0.2.0.3")
 if macos.get("hardenedRuntime") is not True:
     raise SystemExit("macOS hardenedRuntime must be true")
 build = tauri.get("build", {})

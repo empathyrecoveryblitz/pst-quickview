@@ -1,6 +1,6 @@
 [package]
 name = "pst-quickview"
-version = "0.2.0-beta.2"
+version = "0.2.0-beta.3"
 description = "Local-only read-only PST viewer"
 authors = ["PST QuickView"]
 license = "GPL-3.0-or-later"

@@ -14,7 +14,7 @@ COMPANION_NAME="readpst-corresponding-source-${VERSION}"
 PATCH_FILENAME="0001-disable-msg-output.patch"
 X86_64_DEPLOYMENT_TARGET="10.13"
 ARM64_DEPLOYMENT_TARGET="11.0"
-EXPECTED_PUBLIC_DOWNLOAD_LOCATION="https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.2/${COMPANION_NAME}.tar.gz"
+EXPECTED_PUBLIC_DOWNLOAD_LOCATION="https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.3/${COMPANION_NAME}.tar.gz"
 
 usage() {
   cat >&2 <<EOF
@@ -80,7 +80,7 @@ if [[ "${PUBLIC_DOWNLOAD_LOCATION}" =~ example\.(com|org|net|invalid)|localhost|
   exit 1
 fi
 if [[ "${PUBLIC_DOWNLOAD_LOCATION}" != "${EXPECTED_PUBLIC_DOWNLOAD_LOCATION}" ]]; then
-  echo "Public download location does not match the intended beta.2 release asset:" >&2
+  echo "Public download location does not match the intended beta.3 release asset:" >&2
   echo "  supplied: ${PUBLIC_DOWNLOAD_LOCATION}" >&2
   echo "  expected: ${EXPECTED_PUBLIC_DOWNLOAD_LOCATION}" >&2
   exit 1

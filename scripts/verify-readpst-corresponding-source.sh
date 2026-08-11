@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPANION_DIR="${1:-}"
 REFERENCE_ROOT="${2:-${ROOT_DIR}}"
-EXPECTED_PUBLIC_DOWNLOAD_LOCATION="${READPST_EXPECTED_PUBLIC_DOWNLOAD_LOCATION:-https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.2/readpst-corresponding-source-0.6.76.tar.gz}"
+EXPECTED_PUBLIC_DOWNLOAD_LOCATION="${READPST_EXPECTED_PUBLIC_DOWNLOAD_LOCATION:-https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.3/readpst-corresponding-source-0.6.76.tar.gz}"
 
 if [[ -z "${COMPANION_DIR}" || ! -d "${COMPANION_DIR}" ]]; then
   echo "Usage: $0 /absolute/path/to/readpst-corresponding-source-0.6.76 [repository-root]" >&2
@@ -172,7 +172,7 @@ if re.search(r"example\.(com|org|net|invalid)|localhost|placeholder|insert", pub
     fail("public download location contains a placeholder or non-public host")
 if public_location not in (companion / "README.md").read_text():
     fail("README.md does not record PUBLIC_DOWNLOAD_LOCATION.txt")
-passed("public download location matches the intended beta.2 HTTPS companion URL")
+passed("public download location matches the intended beta.3 HTTPS companion URL")
 
 placeholder_pattern = re.compile(r"\b(TODO|TBD|PLACEHOLDER)\b|INSERT[ _-]+URL", re.I)
 private_path_pattern = re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+/", re.I)
