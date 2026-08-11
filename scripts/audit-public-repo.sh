@@ -128,17 +128,24 @@ else
   fail "project license metadata verification failed"
 fi
 
-if [[ -s "${ROOT_DIR}/docs/READPST_CORRESPONDING_SOURCE.md" ]] &&
-  grep -q '^\*\*Technical preparation: COMPLETE\*\*$' \
-    "${ROOT_DIR}/docs/READPST_CORRESPONDING_SOURCE.md" &&
-  grep -q '^\*\*Public delivery beside the DMG: PENDING AND RELEASE-BLOCKING\*\*$' \
-    "${ROOT_DIR}/docs/READPST_CORRESPONDING_SOURCE.md" &&
+READPST_DELIVERY_DOC="${ROOT_DIR}/docs/READPST_CORRESPONDING_SOURCE.md"
+
+if [[ -s "${READPST_DELIVERY_DOC}" ]] &&
+  grep -q '^\*\*Technical preparation: COMPLETE\*\*$' "${READPST_DELIVERY_DOC}" &&
   [[ -x "${ROOT_DIR}/scripts/prepare-readpst-corresponding-source.sh" ]] &&
   [[ -x "${ROOT_DIR}/scripts/verify-readpst-corresponding-source.sh" ]] &&
   grep -q 'PUBLIC_RELEASE=1' "${ROOT_DIR}/scripts/verify-macos-release.sh"; then
-  warn "ReadPST Corresponding Source is technically prepared; public delivery beside the DMG remains blocking"
+  pass "ReadPST Corresponding Source technical preparation and public-release verification are present"
 else
-  fail "ReadPST Corresponding Source public-release gate is missing or not visible"
+  fail "ReadPST Corresponding Source technical preparation or public-release verification is missing"
+fi
+
+if "${ROOT_DIR}/scripts/verify-public-release-delivery-docs.sh" --root "${ROOT_DIR}" \
+  >"${TMP_DIR}/delivery-status" 2>&1; then
+  pass "ReadPST Corresponding Source public delivery is recorded as complete"
+else
+  fail "ReadPST Corresponding Source COMPLETE delivery contract is missing or invalid"
+  sed 's/^/  /' "${TMP_DIR}/delivery-status" >&2
 fi
 
 GIT_TOP_LEVEL="$(git -C "${ROOT_DIR}" rev-parse --show-toplevel 2>/dev/null || true)"

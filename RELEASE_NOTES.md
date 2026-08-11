@@ -2,7 +2,7 @@
 
 ## 0.2.0-beta.3
 
-Unsigned and unnotarized macOS public-beta candidate.
+Published unsigned and unnotarized macOS public beta.
 
 ### Search Correctness And Safety
 

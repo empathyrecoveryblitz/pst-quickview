@@ -71,6 +71,10 @@ check_public_audit() {
   (cd "${ROOT_DIR}" && scripts/audit-public-repo.sh)
 }
 
+check_public_audit_regressions() {
+  (cd "${ROOT_DIR}" && scripts/test-audit-public-release-delivery.sh)
+}
+
 check_shell_syntax() {
   while IFS= read -r -d '' script; do bash -n "${script}"; done < <(find "${ROOT_DIR}/scripts" -type f -name '*.sh' -print0)
 }
@@ -112,6 +116,7 @@ printf 'Repository: %s\n' "${ROOT_DIR}"
 
 run_check "git diff --check" check_git_diff
 run_check "shell script syntax" check_shell_syntax
+run_check "public release delivery audit regressions" check_public_audit_regressions
 run_check "public repository audit" check_public_audit
 run_check "npm run test:frontend" check_frontend_test
 run_check "cargo fmt --check" check_cargo_fmt
