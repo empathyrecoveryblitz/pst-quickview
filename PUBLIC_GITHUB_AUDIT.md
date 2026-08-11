@@ -1,6 +1,6 @@
 # Public GitHub readiness audit
 
-Audit refreshed: 2026-08-10. Scope: tracked files and all commits reachable from local branches and tags. The audit used targeted string searches, email/credential patterns, tracked-extension checks, and per-commit Git searches. Sensitive content is intentionally not reproduced here.
+Audit refreshed: 2026-08-11. Scope: tracked files and all commits reachable from local branches and tags. The audit used targeted string searches, email/credential patterns, tracked-extension checks, and per-commit Git searches. Sensitive content is intentionally not reproduced here.
 
 ## Decision
 
@@ -47,15 +47,24 @@ release verification now reject a stale companion URL. An upstream URL alone rem
 insufficient; see
 `docs/READPST_CORRESPONDING_SOURCE.md`.
 
+## Security and conduct reporting status
+
+Resolved:
+
+- GitHub Private Vulnerability Reporting is enabled for the public repository, and the issue
+  template links to the repository's private advisory form.
+- `SECURITY.md` makes Private Vulnerability Reporting the primary route and records
+  `noreply@busk.ai` as the fallback contact.
+- `CODE_OF_CONDUCT.md` records the private conduct-reporting contact, a reasonable-effort
+  acknowledgment target, an enforcement procedure, non-retaliation, and conflict handling for a
+  report involving the sole maintainer.
+
 ## Remaining publication work
 
 - Upload the approved DMG and matching ReadPST Corresponding Source archive/checksum together.
 - Verify the recorded public download URLs after upload.
 - Complete a clean Intel Mac test without Homebrew or system ReadPST.
 - Complete a clean Apple Silicon Mac test without Homebrew or system ReadPST.
-- Enable and verify public-repository private vulnerability reporting.
-- Add a private code-of-conduct reporting contact and enforcement procedure before community
-  contributions open.
 - Review and approve synthetic screenshots.
 - Make an explicit signing/notarization decision; this candidate remains unsigned and unnotarized.
 - Obtain explicit final publication approval before any push, release, or upload.
