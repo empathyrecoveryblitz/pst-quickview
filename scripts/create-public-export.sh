@@ -46,6 +46,7 @@ REQUIRED_EXPORT_PATHS=(
   "docs/READPST_CORRESPONDING_SOURCE.md"
 )
 EXCLUDED_INTERNAL_PATHS=(
+  "AGENTS.md"
   "LOOP_TASK.md"
   "docs/AGENT_LOOP.md"
   "scripts/codex-loop.sh"

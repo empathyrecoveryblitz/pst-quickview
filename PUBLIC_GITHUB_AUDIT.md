@@ -4,7 +4,7 @@ Audit refreshed: 2026-08-11. Scope: tracked files and all commits reachable from
 
 ## Decision
 
-The sanitized beta.3 tree was exported into fresh public history and published as a prerelease. **The private development history is not safe to publish.** Reachable private commits contain external-drive paths, fixture names/identifiers, and message-derived names or text. Examples include commits `c3ba791225831b90f32c3d0e156a540c81aea94a`, `d94cbc192f6265f1ec99d6de4fe8533e4f64e0b3`, `885ff75104d08f66e4cdfa0cf60cfbbcaa985181`, and `72239a9fce46cab7a6cd3cd2b86c79622139dc04`, affecting historical versions of `README.md`, `AGENTS.md`, tests, scripts, and `src-tauri/src/lib.rs`.
+The sanitized beta.3 tree was exported into fresh public history and published as a prerelease. **The private development history is not safe to publish.** Reachable private commits contain external-drive paths, fixture names/identifiers, and message-derived names or text. Examples include commits `c3ba791225831b90f32c3d0e156a540c81aea94a`, `d94cbc192f6265f1ec99d6de4fe8533e4f64e0b3`, `885ff75104d08f66e4cdfa0cf60cfbbcaa985181`, and `72239a9fce46cab7a6cd3cd2b86c79622139dc04`, affecting historical documentation, tests, scripts, and backend files.
 
 Use a fresh repository created from a reviewed, sanitized export. Keep this repository private as the development archive. Do not publish or rewrite this history without separate backup, review, and explicit approval.
 
@@ -57,10 +57,9 @@ Resolved:
 
 - GitHub Private Vulnerability Reporting is enabled for the public repository, and the issue
   template links to the repository's private advisory form.
-- `SECURITY.md` makes Private Vulnerability Reporting the primary route and records
-  `noreply@busk.ai` as the fallback contact.
-- `CODE_OF_CONDUCT.md` records the private conduct-reporting contact, a reasonable-effort
-  acknowledgment target, an enforcement procedure, non-retaliation, and conflict handling for a
+- `SECURITY.md` uses Private Vulnerability Reporting without publishing a contact email.
+- `CODE_OF_CONDUCT.md` directs sensitive conduct concerns to GitHub's platform-level reporting
+  controls and records an enforcement procedure, non-retaliation, and conflict handling for a
   report involving the sole maintainer.
 
 ## Remaining post-publication validation

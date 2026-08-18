@@ -5,7 +5,7 @@ The master application icon is:
 pst-quickview-icon-source.png
 
 The artwork was created specifically for PST QuickView in July 2026 under
-the direction of the project owner using OpenAI image-generation tooling.
+the direction of the project owner.
 It does not intentionally incorporate any third-party logo or brand mark.
 
 Copyright (C) 2026 Kev P

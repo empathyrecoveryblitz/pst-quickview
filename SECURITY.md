@@ -4,7 +4,7 @@ PST QuickView is beta software. Security fixes are prioritized for the latest be
 
 ## Report a vulnerability
 
-Do not report vulnerabilities through a public issue. Use [GitHub Private Vulnerability Reporting](https://github.com/empathyrecoveryblitz/pst-quickview/security/advisories/new) as the primary route. If the GitHub form cannot be used, email `noreply@busk.ai`.
+Do not report vulnerabilities through a public issue. Use [GitHub Private Vulnerability Reporting](https://github.com/empathyrecoveryblitz/pst-quickview/security/advisories/new). If the form is inaccessible, contact [GitHub Support](https://support.github.com/contact) for access help before sharing sensitive details.
 
 Include the affected PST QuickView version, macOS version, reproduction steps, impact, and any relevant non-sensitive diagnostics. Do not attach real PST, OST, EML, or MSG files, mailbox contents, message bodies, credentials, private logs, workspace databases, or other private data without prior authorization.
 
