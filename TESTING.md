@@ -1,6 +1,6 @@
 # PST QuickView Internal Beta Test Plan
 
-Version under test: `0.2.0-beta.5`
+Version under test: `0.2.0-beta.4-hotfix.1`
 
 Record the Mac model, macOS version, CPU architecture, app path, DMG filename, and whether
 Homebrew is installed before testing. Use disposable copies of test files where possible and
@@ -13,7 +13,7 @@ record SHA-256 hashes for source-integrity checks.
 - Never disable Gatekeeper globally.
 - If the approved internal workflow requires removing quarantine, remove it only from
   `/Applications/PST QuickView.app`.
-- Confirm About shows `0.2.0-beta.5`.
+- Confirm About shows `0.2.0-beta.4-hotfix.1`.
 - Expand About > Diagnostics and record macOS, CPU, executable architecture, and readpst source.
 
 ## PST
@@ -29,7 +29,7 @@ record SHA-256 hashes for source-integrity checks.
 - Test an older ANSI PST when a safe fixture is available.
 - Confirm invalid or truncated PST files show a readable error with technical Details.
 
-## Beta.5 Large EML Recovery
+## Beta.4 Hotfix 1 Large EML Recovery
 
 This matrix is a test plan, not a claim of completed client or packaged-app testing. Use an
 isolated synthetic corpus and retain before/after source hashes. Never remove an important

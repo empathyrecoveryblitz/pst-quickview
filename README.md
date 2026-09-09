@@ -6,7 +6,7 @@
 
 <p align="center">
   A local-only macOS viewer and search tool for PST, EML, and MSG files.<br>
-  <strong>Testing candidate: v0.2.0-beta.5</strong>
+  <strong>Testing candidate: v0.2.0-beta.4-hotfix.1</strong>
 </p>
 
 <p align="center">
@@ -32,9 +32,9 @@
 
 PST QuickView provides a focused desktop interface for browsing and searching Outlook PST archives and standalone EML or MSG messages without sending mail data to a cloud service. Original source files remain read-only. PST archives are converted locally into persistent workspaces by the bundled ReadPST / LibPST 0.6.76 tooling, then indexed with SQLite and FTS5 for navigation and search.
 
-This source version prepares the `v0.2.0-beta.5` testing prerelease. Check [GitHub Releases](https://github.com/empathyrecoveryblitz/pst-quickview/releases) for published downloads. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
+This source version prepares the `v0.2.0-beta.4-hotfix.1` testing prerelease. Check [GitHub Releases](https://github.com/empathyrecoveryblitz/pst-quickview/releases) for published downloads. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
 
-Beta.5 streams extracted-message discovery and verification so a message above 256 MiB can be retained without loading the complete file into memory. Available headers remain searchable; body text and individual attachments in these messages are not parsed or indexed. **Save Source As** exports the complete original EML, including its attachments. Malformed or over-budget headers can still have a limited placeholder. This is limited preview support, not unlimited message rendering.
+Beta.4 Hotfix 1 streams extracted-message discovery and verification so a message above 256 MiB can be retained without loading the complete file into memory. Available headers remain searchable; body text and individual attachments in these messages are not parsed or indexed. **Save Source As** exports the complete original EML, including its attachments. Malformed or over-budget headers can still have a limited placeholder. This is limited preview support, not unlimited message rendering.
 
 Beta.4 introduced idempotent Resume, import verification, Repair Index, possible-duplicate diagnostics, clearer import progress, conservative folder presentation, and reversible Local Trash. These remain available. The cause of historical duplicate imports remains unproven; suspected duplicates are never deleted automatically.
 
@@ -94,7 +94,7 @@ See the [public screenshot requirements](assets/screenshots/README.md) before ad
 
 PST QuickView performs parsing, indexing, search, and preview on the Mac. It has no telemetry, analytics, cloud parser, cloud storage, account system, or automatic upload path. Source PST, EML, and MSG files are opened for reading and are not modified.
 
-PST processing creates a local workspace containing extracted message copies and a searchable SQLite index. These workspaces may contain sensitive mail data and persist after the app is closed. HTML is sanitized before display, and remote message resources are blocked. Remote-image approval remains unavailable in beta.5.
+PST processing creates a local workspace containing extracted message copies and a searchable SQLite index. These workspaces may contain sensitive mail data and persist after the app is closed. HTML is sanitized before display, and remote message resources are blocked. Remote-image approval remains unavailable in beta.4 Hotfix 1.
 
 Attachments are exported to a separate local file before Open is requested. Exporting does not scan or establish trust in an attachment. See [Privacy and local data](docs/PRIVACY.md) for storage locations, retention, and removal guidance.
 
@@ -173,7 +173,7 @@ PST QuickView's original source code and application artwork are licensed under 
 See the [copyright notice](COPYRIGHT.md), [third-party notices](THIRD_PARTY_NOTICES.md), included [license texts](LICENSES/), and [ReadPST Corresponding Source documentation](docs/READPST_CORRESPONDING_SOURCE.md) for details.
 
 Every distributed DMG must provide equivalent access to the exact Corresponding Source used for its bundled ReadPST binary; an upstream URL alone is not sufficient.
-The `v0.2.0-beta.5` testing prerelease must deliver its DMG, matching verified ReadPST Corresponding Source archive, and `SHA256SUMS.txt` together. The published `v0.2.0-beta.4` and `v0.2.0-beta.3` releases and their assets remain unchanged.
+The `v0.2.0-beta.4-hotfix.1` testing prerelease must deliver its DMG, matching verified ReadPST Corresponding Source archive, and `SHA256SUMS.txt` together. The published `v0.2.0-beta.4` and `v0.2.0-beta.3` releases and their assets remain unchanged.
 
 ---
 

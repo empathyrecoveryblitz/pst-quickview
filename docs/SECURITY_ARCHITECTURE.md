@@ -402,7 +402,7 @@ version must address:
 - Authenticode signing and SmartScreen reputation; and
 - process invocation with separate arguments and no shell command construction.
 
-## Beta.5 streaming and limited-preview bounds
+## Beta.4 Hotfix 1 streaming and limited-preview bounds
 
 Extracted-message discovery, identity hashing, and backend Full Verify hash complete EMLs in
 bounded read chunks. EMLs above 256 MiB retain bounded transport headers for indexing and an

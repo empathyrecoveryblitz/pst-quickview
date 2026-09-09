@@ -4,7 +4,7 @@
 
 **Public delivery beside the DMG: COMPLETE**
 
-Those status lines describe the published beta.3 record below. The `0.2.0-beta.5` testing
+Those status lines describe the published beta.3 record below. The `0.2.0-beta.4-hotfix.1` testing
 prerelease requires a fresh exact companion archive and checksums before publication. Public
 delivery must be verified separately after the assets are uploaded.
 
@@ -22,7 +22,7 @@ ReadPST Corresponding Source archive, and `SHA256SUMS.txt` together. Recorded as
 
 The beta.4 archive remains at:
 `https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.4/readpst-corresponding-source-0.6.76.tar.gz`.
-This historical delivery record does not establish beta.5 public availability.
+This historical delivery record does not establish beta.4 Hotfix 1 public availability.
 
 ## Published beta.3 delivery
 
@@ -85,10 +85,10 @@ HTTPS asset location explicitly:
 scripts/prepare-readpst-corresponding-source.sh \
   /absolute/path/to/libpst-0.6.76.tar.gz \
   /absolute/output/readpst-corresponding-source-0.6.76 \
-  https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.5/readpst-corresponding-source-0.6.76.tar.gz
+  https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.4-hotfix.1/readpst-corresponding-source-0.6.76.tar.gz
 ```
 
-This is the intended `0.2.0-beta.5` testing-prerelease asset URL. Recording it is metadata,
+This is the intended `0.2.0-beta.4-hotfix.1` testing-prerelease asset URL. Recording it is metadata,
 not proof of public availability. The published beta.3 URL and verified delivery record above
 remain unchanged. The script refuses existing output, verifies
 the exact intended URL plus the source and patch inputs, copies exact
@@ -147,10 +147,10 @@ deterministic archive contents, archive SHA-256, and concrete HTTPS publication
 location. For this beta, the location must be:
 
 ```text
-https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.5/readpst-corresponding-source-0.6.76.tar.gz
+https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.4-hotfix.1/readpst-corresponding-source-0.6.76.tar.gz
 ```
 
-For beta.5, `PUBLIC_RELEASE=1` is a strict local completeness mode. It does not by itself prove
+For beta.4 Hotfix 1, `PUBLIC_RELEASE=1` is a strict local completeness mode. It does not by itself prove
 public asset delivery, signing, or notarization. Verify public downloads of all three assets after
 publication and preserve the published beta.2, beta.3, and beta.4 releases.
 

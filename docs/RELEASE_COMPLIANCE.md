@@ -1,10 +1,10 @@
 # Release compliance checklist
 
-## Beta.5 testing-prerelease gate
+## Beta.4 Hotfix 1 testing-prerelease gate
 
-PST QuickView `0.2.0-beta.5` is an unsigned and unnotarized testing prerelease prepared for
+PST QuickView `0.2.0-beta.4-hotfix.1` is an unsigned and unnotarized testing prerelease prepared for
 publication. Generate and verify a fresh Corresponding Source companion using the intended URL:
-`https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.5/readpst-corresponding-source-0.6.76.tar.gz`.
+`https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.4-hotfix.1/readpst-corresponding-source-0.6.76.tar.gz`.
 The DMG, exact companion archive, and `SHA256SUMS.txt` must be delivered together and public
 download hashes verified after publication. Local checks alone do not prove public availability,
 client import success, duplicate resolution, or complete GUI and clean-machine coverage.
@@ -23,7 +23,7 @@ The unsigned and unnotarized `v0.2.0-beta.4` testing prerelease was published wi
 
 The companion remains at
 `https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.4/readpst-corresponding-source-0.6.76.tar.gz`.
-Beta.4 and earlier releases are historical records and must remain unchanged when beta.5 is published.
+Beta.4 and earlier releases are historical records and must remain unchanged when beta.4 Hotfix 1 is published.
 
 ## Published beta.3 record
 

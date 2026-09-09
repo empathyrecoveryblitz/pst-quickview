@@ -2827,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "pst-quickview"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.4-hotfix.1"
 dependencies = [
  "ammonia",
  "base64 0.22.1",

@@ -964,7 +964,7 @@ body, Message-ID, attachment content, or digest similarity is not sufficient
 evidence for deletion. Unknown extractor provenance stays visible and
 fail-open.
 
-## Beta.5 large extracted messages
+## Beta.4 Hotfix 1 large extracted messages
 
 Discovery, indexing identity checks, and backend Full Verify stream complete EML files for
 freshness hashes. Discovery and verification retain no complete message buffer. Indexing retains

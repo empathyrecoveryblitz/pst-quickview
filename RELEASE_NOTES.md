@@ -1,6 +1,6 @@
 # PST QuickView Release Notes
 
-## 0.2.0-beta.5
+## 0.2.0-beta.4-hotfix.1
 
 Unsigned and unnotarized macOS testing prerelease prepared for publication. Client import
 success and duplicate resolution are not yet confirmed. Check GitHub Releases for availability.
