@@ -1,6 +1,6 @@
 # Installing PST QuickView on macOS
 
-PST QuickView v0.2.0-beta.3 is an unsigned and unnotarized beta build. Install published builds only from the project's [official GitHub Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases).
+PST QuickView v0.2.0-beta.4 is prepared as an unsigned and unnotarized testing prerelease. Install published builds only from the project's [official GitHub Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases).
 
 ## System requirements
 
@@ -12,7 +12,7 @@ The released application includes ReadPST / LibPST 0.6.76. Homebrew is not requi
 
 ## Install from the DMG
 
-1. Open the project [Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases) and select v0.2.0-beta.3 when that release is available.
+1. Open the project [Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases) and select v0.2.0-beta.4 when that testing prerelease is available.
 2. Download the Universal DMG and `SHA256SUMS.txt` from that release's assets, then verify the DMG checksum before opening it.
 3. Open the downloaded DMG.
 4. Drag **PST QuickView** into the **Applications** folder.

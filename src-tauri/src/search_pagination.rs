@@ -284,6 +284,22 @@ mod tests {
     }
 
     #[test]
+    fn malformed_cursor_storm_remains_bounded_and_nonpanicking() {
+        let codec = SearchCursorCodec::with_secret([9; 32]);
+        for index in 0..10_000_u64 {
+            let value = match index % 4 {
+                0 => format!("pqv-msg-v1.{index:016x}"),
+                1 => format!("pqv-msg-v{}.deadbeef", index % 99 + 2),
+                2 => "f".repeat((index as usize % (MAX_CURSOR_SCALARS + 32)) + 1),
+                _ => format!("東京-{index}-مرحبا-😀"),
+            };
+            let outcome = std::panic::catch_unwind(|| codec.decode(&value, &context()));
+            assert!(outcome.is_ok(), "cursor storm input must not panic");
+            assert!(outcome.unwrap().is_err(), "hostile cursor must be rejected");
+        }
+    }
+
+    #[test]
     fn unsupported_version_is_distinct() {
         let codec = SearchCursorCodec::with_secret([9; 32]);
         assert_eq!(

@@ -62,6 +62,7 @@ function snapshot(overrides = {}) {
     messageSort: "newest",
     conversationSort: "newest",
     sessionGeneration: 1,
+    visibility: "active",
     ...overrides,
   };
 }
@@ -268,4 +269,12 @@ test("search, sort, scope, and workspace changes invalidate affected navigation"
     ),
     true,
   );
+});
+
+test("active and Local Trash visibility never share result navigation", () => {
+  const active = snapshot({ visibility: "active" });
+  const trashed = snapshot({ visibility: "trashed" });
+  assert.equal(didResultNavigationContextChange(active, trashed, "messages"), true);
+  assert.equal(didResultNavigationContextChange(active, trashed, "conversations"), true);
+  assert.equal(didResultNavigationContextChange(trashed, active, "messages"), true);
 });

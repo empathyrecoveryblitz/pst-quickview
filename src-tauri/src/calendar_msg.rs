@@ -1,3 +1,4 @@
+use crate::message_security::open_bounded_message_file;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::{
@@ -428,15 +429,16 @@ fn build_calendar_details(item_type: &str, input: CalendarBuildInput) -> Calenda
 
 fn read_calendar_properties(source_path: &Path) -> CalendarPropertyRead {
     let mut result = CalendarPropertyRead::default();
-    let mut compound = match cfb::open(source_path) {
-        Ok(compound) => compound,
-        Err(error) => {
-            result.warnings.push(format!(
-                "Calendar property storage could not be opened: {error}"
-            ));
-            return result;
-        }
-    };
+    let mut compound =
+        match open_bounded_message_file(source_path).and_then(cfb::CompoundFile::open) {
+            Ok(compound) => compound,
+            Err(error) => {
+                result.warnings.push(format!(
+                    "Calendar property storage could not be opened: {error}"
+                ));
+                return result;
+            }
+        };
 
     let guid_stream =
         read_optional_stream(&mut compound, "/__nameid_version1.0/__substg1.0_00020102");
@@ -610,12 +612,11 @@ fn calendar_property_name(guid: &[u8; 16], dispid: u32) -> Option<&'static str> 
 
 fn parse_substitution_stream_name(name: &str) -> Option<(u16, u16)> {
     let suffix = name.strip_prefix("__substg1.0_")?;
-    if suffix.len() < 8 {
-        return None;
-    }
+    let property_id = suffix.get(..4)?;
+    let property_type = suffix.get(4..8)?;
     Some((
-        u16::from_str_radix(&suffix[0..4], 16).ok()?,
-        u16::from_str_radix(&suffix[4..8], 16).ok()?,
+        u16::from_str_radix(property_id, 16).ok()?,
+        u16::from_str_radix(property_type, 16).ok()?,
     ))
 }
 
@@ -1183,5 +1184,22 @@ mod tests {
             .get(&0x8007)
             .expect("meeting property should resolve");
         assert_eq!(definition.name, "RequiredAttendees");
+    }
+
+    #[test]
+    fn hostile_unicode_substitution_names_fail_without_panicking() {
+        for name in [
+            "__substg1.0_😀😀",
+            "__substg1.0_東京東京",
+            "__substg1.0_مرحبا1234",
+            "__substg1.0_e\u{301}e\u{301}1234",
+        ] {
+            let parsed = std::panic::catch_unwind(|| parse_substitution_stream_name(name));
+            assert_eq!(parsed.expect("hostile CFB name must not panic"), None);
+        }
+        assert_eq!(
+            parse_substitution_stream_name("__substg1.0_0037001F"),
+            Some((0x0037, 0x001F))
+        );
     }
 }

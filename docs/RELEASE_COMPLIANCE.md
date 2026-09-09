@@ -1,5 +1,17 @@
 # Release compliance checklist
 
+## Beta.4 testing-prerelease gate
+
+PST QuickView `0.2.0-beta.4` is an unsigned and unnotarized testing prerelease prepared for
+publication. Its local release gate uses the intended companion URL
+`https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.4/readpst-corresponding-source-0.6.76.tar.gz`
+to bind reproducible Corresponding Source metadata. The DMG, exact companion archive, and
+`SHA256SUMS.txt` must be delivered together and their public downloads verified. Passing the local
+gate alone does not prove public availability, client duplicate resolution, or complete GUI and
+clean-machine coverage. The beta.3 public-delivery record below remains unchanged.
+
+## Published beta.3 record
+
 - [x] Owner selected `GPL-3.0-or-later`; root license and package metadata updated.
 - [x] Official GPL version 3 and GPL version 2 texts included without project commentary.
 - [x] Project copyright notice and contribution licensing terms documented.

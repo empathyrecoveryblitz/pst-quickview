@@ -6,7 +6,7 @@
 
 <p align="center">
   A local-only macOS viewer and search tool for PST, EML, and MSG files.<br>
-  <strong>Current release: v0.2.0-beta.3</strong>
+  <strong>Testing candidate: v0.2.0-beta.4</strong>
 </p>
 
 <p align="center">
@@ -32,7 +32,9 @@
 
 PST QuickView provides a focused desktop interface for browsing and searching Outlook PST archives and standalone EML or MSG messages without sending mail data to a cloud service. Original source files remain read-only. PST archives are converted locally into persistent workspaces by the bundled ReadPST / LibPST 0.6.76 tooling, then indexed with SQLite and FTS5 for navigation and search.
 
-This source version accompanies the published `v0.2.0-beta.3` prerelease. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
+This source version prepares the `v0.2.0-beta.4` testing prerelease. Check [GitHub Releases](https://github.com/empathyrecoveryblitz/pst-quickview/releases) for published downloads. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
+
+Beta.4 adds idempotent Resume, import verification, Repair Index, possible-duplicate diagnostics, clearer import progress, conservative folder presentation, and reversible Local Trash. The cause of historical duplicate imports remains unproven; suspected duplicates are never deleted automatically.
 
 ## Screenshots
 
@@ -53,6 +55,8 @@ See the [public screenshot requirements](assets/screenshots/README.md) before ad
 - Read individual messages in a focused preview.
 - Group related messages in Conversation view when threading data is available.
 - Optionally restore the previous PST session and its selected folders.
+- Switch between simplified and original folder hierarchies without moving folders.
+- Move messages to reversible Local Trash, undo, and restore without changing the source.
 
 ### Search and navigate
 
@@ -79,12 +83,14 @@ See the [public screenshot requirements](assets/screenshots/README.md) before ad
 - Store extracted EML files, a SQLite/FTS5 index, and workspace logs on the Mac.
 - Place a PST workspace beside its source archive or under macOS Application Support.
 - Keep workspaces available between sessions until they are explicitly deleted.
+- Resume interrupted indexing with stable message identities.
+- Verify imports and run Repair Index; possible duplicates are reported conservatively and never removed automatically.
 
 ## Privacy and data handling
 
 PST QuickView performs parsing, indexing, search, and preview on the Mac. It has no telemetry, analytics, cloud parser, cloud storage, account system, or automatic upload path. Source PST, EML, and MSG files are opened for reading and are not modified.
 
-PST processing creates a local workspace containing extracted message copies and a searchable SQLite index. These workspaces may contain sensitive mail data and persist after the app is closed. HTML is sanitized before display, and remote resources are blocked by default. If a user explicitly loads remote images for the current message, the remote host can receive a normal image request from the Mac; that permission is not enabled globally.
+PST processing creates a local workspace containing extracted message copies and a searchable SQLite index. These workspaces may contain sensitive mail data and persist after the app is closed. HTML is sanitized before display, and remote message resources are blocked. Beta.4 provides no remote-image approval action.
 
 Attachments are exported to a separate local file before Open is requested. Exporting does not scan or establish trust in an attachment. See [Privacy and local data](docs/PRIVACY.md) for storage locations, retention, and removal guidance.
 
@@ -110,6 +116,8 @@ The packaged beta includes ReadPST; Homebrew is not required to open PST files w
 
 - The current beta is unsigned and unnotarized. First launch may require explicit per-app approval from macOS.
 - This is beta-quality software and may contain defects or incomplete workflows.
+- The cause of historical duplicated imports remains unproven. Verify checks internal workspace consistency, not Outlook or Exchange parity; retain the original PST.
+- Finder drag-and-drop, packaged synthetic MSG smoke, and clean Intel/Apple Silicon testing remain incomplete.
 - Message rendering prioritizes readable plain text and sanitized HTML. Outlook HTML, Word/RTF layouts, calendar data, and uncommon MAPI properties may be simplified or incomplete.
 - Calendar and meeting MSG previews are best effort. Recurrence or time-zone details may be incomplete, and real exported calendar or meeting messages have not yet been manually validated.
 - Encrypted, damaged, unusual, or newer PST/MSG content may be unsupported.
@@ -130,7 +138,7 @@ See the [release notes](RELEASE_NOTES.md) for release-specific details.
 2. For PST files, bundled ReadPST converts messages into EML files inside a local workspace. Standalone EML and MSG files are parsed directly.
 3. PST workspace metadata and searchable content are indexed in local SQLite and FTS5 tables.
 4. The Tauri desktop interface queries the local index for folders, messages, conversations, and search results.
-5. HTML is sanitized before rendering, remote resources remain blocked unless approved for the current message, and attachment Open operates on an exported copy.
+5. HTML is sanitized before rendering, remote message resources remain blocked, and attachment Open operates on an exported copy.
 
 ## Building from source
 
@@ -159,7 +167,7 @@ PST QuickView's original source code and application artwork are licensed under 
 See the [copyright notice](COPYRIGHT.md), [third-party notices](THIRD_PARTY_NOTICES.md), included [license texts](LICENSES/), and [ReadPST Corresponding Source documentation](docs/READPST_CORRESPONDING_SOURCE.md) for details.
 
 Every distributed DMG must provide equivalent access to the exact Corresponding Source used for its bundled ReadPST binary; an upstream URL alone is not sufficient.
-The `v0.2.0-beta.3` release publishes the DMG, verified ReadPST Corresponding Source archive, and `SHA256SUMS.txt` together.
+The `v0.2.0-beta.4` testing prerelease is prepared with the DMG, verified ReadPST Corresponding Source archive, and `SHA256SUMS.txt` for delivery together. The published `v0.2.0-beta.3` release and its assets remain available unchanged.
 
 ---
 

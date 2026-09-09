@@ -614,6 +614,27 @@ mod tests {
     }
 
     #[test]
+    fn repeated_generation_cancellation_remains_idempotent_and_bounded() {
+        let registry = registry();
+        for generation in 1..=1_024 {
+            let operation = begin(
+                &registry,
+                generation,
+                "message-count-1",
+                SearchOperationCategory::MessageCount,
+            );
+            let first = registry.cancel_generation(WINDOW, generation).unwrap();
+            assert_eq!(first.operations, 1);
+            assert!(operation.is_cancelled());
+            assert_eq!(
+                registry.cancel_generation(WINDOW, generation).unwrap(),
+                SearchCancellationOutcome::default()
+            );
+            assert_eq!(registry.active_operation_count(WINDOW), 0);
+        }
+    }
+
+    #[test]
     fn operation_ids_are_opaque_and_strictly_bounded() {
         let registry = registry();
         for invalid in ["", "contains query", "message:1", "message/path"] {

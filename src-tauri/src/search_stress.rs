@@ -341,16 +341,16 @@ fn verify_cursor_and_context_correctness(workspace: &ActiveWorkspace, message_co
     let selective =
         MessageSearchCriteria::from_inputs(Some(SELECTIVE_SEARCH_TERM.to_string()), None)
             .expect("selective criteria");
-    let selective_page = query_messages_page(
-        &conn,
-        None,
-        false,
-        &selective,
-        Some("relevance"),
-        Some(20),
-        Some(0),
-        None,
-    )
+    let selective_page = query_messages_page(MessagePageQuery {
+        conn: &conn,
+        folder_id: None,
+        include_subfolders: false,
+        criteria: &selective,
+        sort_order: Some("relevance"),
+        limit: Some(20),
+        offset: Some(0),
+        operation: None,
+    })
     .expect("selective page should load");
     assert!(!selective_page.items.is_empty());
     assert!(selective_page.items.iter().all(|item| {
@@ -366,16 +366,16 @@ fn verify_cursor_and_context_correctness(workspace: &ActiveWorkspace, message_co
 
     let rank = MessageSearchCriteria::from_inputs(Some(RANK_SEARCH_TERM.to_string()), None)
         .expect("rank criteria");
-    let ranked = query_messages_page(
-        &conn,
-        None,
-        false,
-        &rank,
-        Some("relevance"),
-        Some(1_000),
-        Some(0),
-        None,
-    )
+    let ranked = query_messages_page(MessagePageQuery {
+        conn: &conn,
+        folder_id: None,
+        include_subfolders: false,
+        criteria: &rank,
+        sort_order: Some("relevance"),
+        limit: Some(1_000),
+        offset: Some(0),
+        operation: None,
+    })
     .expect("ranked page should load");
     assert_eq!(ranked.items.first().map(|item| item.id % 100), Some(0));
     let best_subject = ranked

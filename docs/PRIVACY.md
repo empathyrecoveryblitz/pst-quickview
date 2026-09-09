@@ -15,7 +15,7 @@ PST QuickView is built for local mail inspection. Parsing, PST conversion, index
 
 PST QuickView does not send messages to a cloud service and does not include a background telemetry or analytics client.
 
-Remote resources referenced by message HTML are blocked by default. The interface can explicitly load remote images for the current message. If that action is approved, the Mac requests the image URLs named in the message, which can disclose the Mac's public IP address and any message- or recipient-specific identifiers embedded in those URLs. Approval applies to that message and does not enable remote resources globally. HTML sanitization remains active.
+Remote resources referenced by message HTML are blocked. Beta.4 provides no action to approve remote-image loading. HTML sanitization remains active.
 
 ## Source file handling
 
@@ -31,6 +31,7 @@ A PST workspace is a persistent local cache, not a temporary file that disappear
 - `index.sqlite` and its SQLite support files;
 - FTS5 search data for subject, body text, sender, recipients, and attachment names;
 - folder, message, attachment, and conversation metadata;
+- import-verification reports and reversible Local Trash state;
 - import and export logs; and
 - message or attachment copies exported within that workspace.
 
@@ -46,7 +47,7 @@ Operational logs are also local. Application logs can remain under `~/Library/Ap
 
 ## HTML messages and remote content
 
-HTML messages are sanitized before display. Active and non-allowlisted markup is removed, and remote resources are blocked unless the user explicitly approves remote images for the current message. Plain-text rendering remains available when HTML fidelity is unnecessary or incomplete.
+HTML messages are sanitized before display. Active and non-allowlisted markup is removed, and remote message resources remain blocked. Plain-text rendering remains available when HTML fidelity is unnecessary or incomplete.
 
 Blocking remote resources avoids automatic contact with servers referenced by a message. It does not prove that the message itself or any exported file is trustworthy.
 

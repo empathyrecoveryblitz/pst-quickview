@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 
 import {
   appendUniqueByKey,
+  appliedSearchNavigationContextKey,
+  appliedSearchNonTextKey,
   appliedSearchSnapshotKey,
   applySearchSnapshotImmediately,
   backendSearchFilters,
@@ -15,8 +17,10 @@ import {
   commitQueuedSearchSnapshot,
   createAppliedSearchSnapshot,
   createSearchApplicationState,
+  didAppliedSearchNavigationContextChange,
   emptySearchDraft,
   getActiveFilterCount,
+  getRelevanceAvailability,
   invalidateSearchApplication,
   isAppliedSearchActive,
   isExpandedConversationResponseCurrent,
@@ -46,6 +50,7 @@ function context(overrides = {}) {
     messageSort: "newest",
     conversationSort: "newest",
     sessionGeneration: 1,
+    visibility: "active",
     ...overrides,
   };
 }
@@ -127,6 +132,7 @@ test("snapshot includes normalized text, filters, scope, folder identity, mode, 
   assert.equal(applied.listMode, "conversations");
   assert.equal(applied.messageSort, "sender_az");
   assert.equal(applied.conversationSort, "subject");
+  assert.equal(applied.visibility, "active");
   assert.equal(isAppliedSearchActive(applied), true);
   assert.deepEqual(
     buildAppliedFilterChips(applied, {
@@ -415,9 +421,94 @@ test("equivalent drafts share a key and each meaningful backend input changes it
     snapshot({ query: "calendar" }, { messageSort: "oldest" }),
     snapshot({ query: "calendar" }, { conversationSort: "subject" }),
     snapshot({ query: "calendar" }, { sessionGeneration: 2 }),
+    snapshot({ query: "calendar" }, { visibility: "trashed" }),
   ]) {
     assert.notEqual(appliedSearchSnapshotKey(base), appliedSearchSnapshotKey(changed));
   }
+});
+
+test("visibility is a non-text navigation criterion and legacy callers default active", () => {
+  const legacyContext = context();
+  delete legacyContext.visibility;
+  const active = createAppliedSearchSnapshot(draft({ query: "synthetic" }), legacyContext);
+  const trashed = snapshot({ query: "synthetic" }, { visibility: "trashed" });
+
+  assert.equal(active.visibility, "active");
+  assert.notEqual(appliedSearchNonTextKey(active), appliedSearchNonTextKey(trashed));
+  assert.notEqual(
+    appliedSearchNavigationContextKey(active, "messages"),
+    appliedSearchNavigationContextKey(trashed, "messages"),
+  );
+  assert.equal(
+    didAppliedSearchNavigationContextChange(active, trashed, "messages"),
+    true,
+  );
+
+  let state = createSearchApplicationState(active);
+  const generation = state.applied.generation;
+  state = applySearchSnapshotImmediately(state, trashed).state;
+  assert.equal(isSearchGenerationCurrent(generation, state.applied.generation), false);
+});
+
+test("Local Trash stays Messages-only while preserving one-PST relevance eligibility", () => {
+  const eligible = snapshot(
+    { query: "synthetic" },
+    { visibility: "trashed", listMode: "conversations", messageSort: "relevance" },
+  );
+  assert.equal(eligible.listMode, "messages");
+  assert.equal(eligible.messageSort, "relevance");
+  assert.deepEqual(getRelevanceAvailability(eligible), {
+    available: true,
+    reason: null,
+    explanation: "Relevance ranks text matches within this PST.",
+    effectiveWorkspaceCount: 1,
+  });
+
+  assert.equal(
+    getRelevanceAvailability(
+      snapshot(
+        { query: "synthetic" },
+        {
+          visibility: "trashed",
+          scope: "all_open",
+          workspaceIds: ["workspace-a", "workspace-b"],
+          useMultiWorkspace: true,
+          singleWorkspaceId: null,
+        },
+      ),
+    ).reason,
+    "multiple_workspaces",
+  );
+  assert.equal(
+    getRelevanceAvailability(snapshot({}, { visibility: "trashed" })).reason,
+    "requires_text",
+  );
+});
+
+test("clearing the final workspace returns visibility to active", () => {
+  const cleared = clearAppliedSearchSnapshot(
+    snapshot({ query: "synthetic" }, { visibility: "trashed" }),
+  );
+  assert.equal(cleared.visibility, "active");
+  assert.equal(cleared.activeWorkspaceId, null);
+  assert.deepEqual(cleared.workspaceIds, []);
+});
+
+test("Local Trash empty states remain message-specific", () => {
+  const empty = classifySearchEmptyState({
+    hasWorkspace: true,
+    isSearchActive: false,
+    isLoading: false,
+    resultCount: 0,
+    listMode: "conversations",
+    scope: "current",
+    activeFilterCount: 0,
+    errorGeneration: null,
+    currentGeneration: 1,
+    visibility: "trashed",
+  });
+  assert.equal(empty.title, "Local Trash is empty.");
+  assert.doesNotMatch(empty.title, /conversation/i);
 });
 
 test("rapid textual changes commit only the final debounced snapshot", () => {
@@ -611,8 +702,9 @@ test("App exposes Advanced Search and removable chips with keyboard semantics", 
   assert.match(app, /aria-controls=\{advancedSearchPanelId\}/);
   assert.match(app, /id=\{advancedSearchPanelId\}/);
   assert.match(app, /aria-labelledby=\{advancedSearchToggleId\}/);
-  assert.match(app, /onKeyDown=\{handleAdvancedSearchKeyDown\}/);
-  assert.match(app, /advancedSearchToggleRef\.current\?\.focus\(\)/);
+  assert.match(app, /createDismissiblePopoverController\(\{/);
+  assert.match(app, /trigger:\s*activePopoverTriggerRef\.current/);
+  assert.match(app, /panel:\s*popoverPanelFor\(attachedPopoverId\)/);
   assert.match(app, /className="filter-chip"/);
   assert.match(app, /aria-label=\{chip\.removeLabel\}/);
   assert.match(app, /aria-busy=\{isResultsBusy\}/);
