@@ -66,6 +66,12 @@ The separately developed enhanced RTF converter prototype is not included in bet
 
 ### Known Limitations
 
+- The source lockfile retains the development-only Browserslist 4.28.4 dependency affected by
+  [GHSA-73wf-gq98-2v4g](https://github.com/advisories/GHSA-73wf-gq98-2v4g) (fixed in 4.28.7).
+  Malicious custom statistics can crash build tools or alter a temporary object's prototype.
+  This remains unresolved for builds from source. No application import or custom statistics
+  file was found in the reviewed tree; exposure through message viewing in the prebuilt Mac
+  installer has not been demonstrated. The prepared installer and exact dependency locks are unchanged.
 - The exact cause of historical duplicated import in a live workspace remains unproven. Beta.4
   adds idempotent Resume, verification, possible-duplicate diagnostics, and Repair, but never
   deletes suspected duplicates automatically.
