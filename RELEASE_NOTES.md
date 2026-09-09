@@ -1,10 +1,53 @@
 # PST QuickView Release Notes
 
+## 0.2.0-beta.5
+
+Unsigned and unnotarized macOS testing prerelease prepared for publication. Client import
+success and duplicate resolution are not yet confirmed. Check GitHub Releases for availability.
+
+### Large Message Import Recovery
+
+- Discovery, identity hashing, and backend Full Verify stream complete extracted EML files
+  without retaining their complete contents in memory. Hashes still cover all source bytes.
+- EML files above the 256 MiB full-preview budget retain a canonical message row, available
+  searchable headers, and an explicit limited-preview notice. Their body text and individual
+  attachments are not parsed or indexed. Headers that are malformed or exceed the separate
+  header budget may be unavailable; the message remains represented by a limited placeholder.
+- **Save Source As** exports the complete original EML, including attachments. Original PST,
+  EML, and MSG files remain read-only. This does not provide unlimited rendering or expand
+  standalone MSG parsing limits.
+- ReadPST output validation no longer rejects an individual extracted file solely because it
+  exceeds 512 MiB. The source-scaled aggregate extraction budget and other process, file-type,
+  entry-count, and filesystem safety checks remain active.
+- Import completion and verification preserve notices for messages with limited previews;
+  internal consistency is not proof that every body or attachment was parsed.
+
+### Retrying An Existing Import
+
+Keep the existing workspace and extracted EML files. After upgrading, reopen the same PST and
+use **Resume Indexing** or **Repair Index** if offered. These paths reuse retained extraction
+output. Preserve the original PST, current index, and workspace sidecars; do not remove them to
+retry. This recovery does not require starting a fresh import or deleting a workspace.
+
+### Known Limitations
+
+- A successful retry of the reported large PST and historical duplicate resolution remain
+  client-testing items. No end-to-end client result is claimed by this release preparation.
+- A message over 256 MiB has limited header-based support, not full body search, full preview,
+  or individual attachment access. Export the complete original EML for access in another viewer.
+- Exact dependency resolutions are preserved. The development-only Browserslist 4.28.4
+  dependency remains affected by [GHSA-73wf-gq98-2v4g](https://github.com/advisories/GHSA-73wf-gq98-2v4g),
+  fixed in 4.28.7. That source-build advisory is unresolved; exposure through message viewing
+  in a prebuilt Mac installer has not been demonstrated.
+- The beta.4 limits below remain applicable, including incomplete clean-machine, Finder
+  drag-and-drop, and packaged synthetic MSG coverage. Verify checks internal workspace
+  consistency, not Outlook/Exchange parity. Suspected duplicates are never deleted automatically.
+
 ## 0.2.0-beta.4
 
-Unsigned and unnotarized macOS testing prerelease prepared for publication.
-See GitHub Releases for download availability. Historical duplicate-import resolution is not yet
-confirmed; client testing remains necessary.
+Published unsigned and unnotarized macOS testing prerelease. Its existing release and assets
+remain unchanged. Historical duplicate-import resolution is not confirmed; client testing
+remains necessary.
 
 ### Security And Privacy Hardening
 

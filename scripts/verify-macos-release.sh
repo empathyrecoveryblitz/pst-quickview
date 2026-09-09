@@ -10,8 +10,8 @@ if [[ ! -r "${DYLIB_VALIDATION_SCRIPT}" ]]; then
 fi
 # shellcheck source=macos-dylib-validation.sh
 source "${DYLIB_VALIDATION_SCRIPT}"
-EXPECTED_VERSION="${PST_QUICKVIEW_EXPECTED_VERSION:-0.2.0-beta.4}"
-EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.0.4}"
+EXPECTED_VERSION="${PST_QUICKVIEW_EXPECTED_VERSION:-0.2.0-beta.5}"
+EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.0.5}"
 EXPECTED_PRODUCT_NAME="${PST_QUICKVIEW_EXPECTED_PRODUCT_NAME:-PST QuickView}"
 EXPECTED_IDENTIFIER="${PST_QUICKVIEW_EXPECTED_IDENTIFIER:-com.local.pstquickview}"
 PRODUCTION_IDENTIFIER="com.local.pstquickview"
@@ -362,9 +362,9 @@ if [[ -s "${RELEASE_NOTES}" ]] &&
   grep -Fq -- "enhanced RTF converter prototype is not included" "${RELEASE_NOTES}" &&
   ! grep -Fq -- "RTF body recovery is not ""included" "${RELEASE_NOTES}"
 then
-  pass "beta.4 release notes accurately bound inherited RTF behavior and exclude the enhanced prototype"
+  pass "release notes accurately bound inherited RTF behavior and exclude the enhanced prototype"
 else
-  fail "beta.4 release notes do not accurately bound inherited RTF behavior and exclude the enhanced prototype"
+  fail "release notes do not accurately bound inherited RTF behavior and exclude the enhanced prototype"
 fi
 
 if [[ -n "${INHERITED_TAURI_CONFIG}" ]]; then
@@ -457,8 +457,8 @@ for name, version in pins.items():
         raise SystemExit(f"dependency pin missing: {name} = {version!r}")
 
 macos = tauri.get("bundle", {}).get("macOS", {})
-if macos.get("bundleVersion") != "0.2.0.4":
-    raise SystemExit("macOS bundleVersion must be 0.2.0.4")
+if macos.get("bundleVersion") != "0.2.0.5":
+    raise SystemExit("macOS bundleVersion must be 0.2.0.5")
 if macos.get("hardenedRuntime") is not True:
     raise SystemExit("macOS hardenedRuntime must be true")
 build = tauri.get("build", {})

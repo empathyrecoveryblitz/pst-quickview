@@ -1237,7 +1237,7 @@ fn validate_manifest(manifest: &ImportManifest, workspace_id: &str) -> AppResult
         .try_fold(0_u64, |total, candidate| {
             if !validate_relative_identity(&candidate.relative_path)
                 || !is_lower_hex_sha256(&candidate.sha256)
-                || candidate.size_bytes > MAX_READPST_EXTRACTED_FILE_BYTES
+                || candidate.size_bytes > readpst_output_byte_limit(manifest.source_size_before)
                 || !identities.insert(candidate.relative_path.as_str())
             {
                 return None;
@@ -2104,8 +2104,7 @@ where
         let relative = relative_path_string(extract_dir, entry.path())?;
         let metadata = require_regular_nonsymlink_file(entry.path(), "extracted source record")?;
         let (snapshot, observed_sha256) = if level == VerificationLevel::Full {
-            let (_, identity) =
-                read_eml_candidate_snapshot_with_progress(entry.path(), |_| on_progress())?;
+            let identity = snapshot_eml_candidate_with_progress(entry.path(), &mut on_progress)?;
             (
                 ExtractionEntrySnapshot {
                     device: identity.device,
@@ -2190,6 +2189,7 @@ fn finish_extraction_scan(
 #[derive(Default)]
 struct DatabaseChecks {
     canonical_messages: u64,
+    large_message_headers: u64,
     attachments: u64,
     folders: u64,
     fts_rows: u64,
@@ -2462,9 +2462,13 @@ where
         conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get::<_, u64>(0)
         })?;
-    let canonical_messages = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| {
-        row.get::<_, u64>(0)
-    })?;
+    let (canonical_messages, large_message_headers) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN body_source = 'large_message_headers' THEN 1 ELSE 0 END), 0)
+           FROM messages",
+        [],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+    )?;
     let attachments = conn.query_row("SELECT COUNT(*) FROM attachments", [], |row| {
         row.get::<_, u64>(0)
     })?;
@@ -2634,6 +2638,7 @@ where
         || manifest.fts_row_count != fts_rows;
     let checks = DatabaseChecks {
         canonical_messages,
+        large_message_headers,
         attachments,
         folders,
         fts_rows,
@@ -2871,7 +2876,28 @@ fn finish_report_timing(report: &mut VerificationReport, started: Instant) {
     report.elapsed_duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 }
 
-fn allowed_verification_warning(value: &str) -> bool {
+const LARGE_MESSAGE_HEADERS_WARNING_SUFFIX: &str = " large message(s) were retained with searchable headers and a limited preview. Their bodies and individual attachments were not indexed; export the original EML to access the complete message.";
+
+fn large_message_headers_warning(count: u64) -> String {
+    format!("{count}{LARGE_MESSAGE_HEADERS_WARNING_SUFFIX}")
+}
+
+fn large_message_headers_warning_count(value: &str) -> Option<u64> {
+    let prefix = value.strip_suffix(LARGE_MESSAGE_HEADERS_WARNING_SUFFIX)?;
+    if prefix.is_empty()
+        || prefix.starts_with('0')
+        || !prefix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let count = prefix.parse::<u64>().ok()?;
+    (count > 0 && count <= MAX_READPST_EXTRACTED_ENTRIES).then_some(count)
+}
+
+fn allowed_verification_warning(value: &str, canonical_messages: u64) -> bool {
+    if let Some(count) = large_message_headers_warning_count(value) {
+        return count <= canonical_messages;
+    }
     matches!(
         value,
         "Workspace state metadata is malformed or from an unsupported version."
@@ -2914,6 +2940,7 @@ fn validate_verification_report(
         None => true,
     };
     let mut warning_set = HashSet::with_capacity(report.warnings.len());
+    let mut large_message_warning_seen = false;
     let mut action_set = HashSet::with_capacity(report.recommended_actions.len());
     let mut opaque_ids = HashSet::with_capacity(report.possible_duplicate_group_details.len());
     let outcome_counts_invalid = match report
@@ -3011,7 +3038,10 @@ fn validate_verification_report(
         || duplicate_details_invalid
         || report.warnings.len() > 12
         || report.warnings.iter().any(|value| {
-            !allowed_verification_warning(value) || !warning_set.insert(value.as_str())
+            !allowed_verification_warning(value, report.canonical_messages)
+                || !warning_set.insert(value.as_str())
+                || (large_message_headers_warning_count(value).is_some()
+                    && std::mem::replace(&mut large_message_warning_seen, true))
         })
         || report.recommended_actions.len() > 8
         || report
@@ -3430,6 +3460,11 @@ where
         }
         (Ok((found, content_mismatch)), Ok(checks)) => {
             report.canonical_messages = checks.canonical_messages;
+            if checks.large_message_headers > 0 {
+                report
+                    .warnings
+                    .push(large_message_headers_warning(checks.large_message_headers));
+            }
             report.attachments = checks.attachments;
             report.folders = checks.folders;
             report.fts_rows = checks.fts_rows;

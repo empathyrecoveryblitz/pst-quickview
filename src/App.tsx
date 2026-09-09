@@ -1159,6 +1159,9 @@ function formatBodyForDisplay(body: string): string {
 }
 
 function bodyStatusMessage(message: MessageDetail, displayBody: string): string | null {
+  if (message.bodySource === "large_message_headers") {
+    return "Large message retained with searchable headers. Body and attachments were not parsed; use Save Source As to export the complete original EML.";
+  }
   if (message.bodySource === "parse_error") return "Body could not be parsed.";
   if (!displayBody.trim() || message.bodySource === "missing") return "No message body found.";
   if (message.bodySource === "html_converted") return "HTML-only message converted to plain text.";
@@ -1170,6 +1173,9 @@ function bodyStatusMessage(message: MessageDetail, displayBody: string): string 
 }
 
 function sourceBodyStatusMessage(view: SourceEmlView, displayBody: string): string | null {
+  if (view.bodySource === "large_message_headers") {
+    return "Large message retained with searchable headers. Body and attachments were not parsed; use Save Source As to export the complete original EML.";
+  }
   if (view.bodySource === "parse_error") return "Body could not be parsed.";
   if (!displayBody.trim() || view.bodySource === "missing") return "No message body found.";
   if (view.bodySource === "html_converted") return "HTML-only message converted to plain text.";
@@ -1545,7 +1551,19 @@ function sourceMessageFormatLabel(view: SourceEmlView | null): "EML" | "MSG" {
   return view?.sourceFormat === "msg" ? "MSG" : "EML";
 }
 
+function isLargeMessageRawSourceUnavailable(view: SourceEmlView | null): boolean {
+  return view?.sourceFormat === "eml"
+    && view.bodySource === "large_message_headers"
+    && view.rawSourceAvailable === false;
+}
+
+const largeMessageRawSourceNotice =
+  "Raw Source is unavailable in this limited preview of a large message. Use Save Source EML As... to export the complete original EML.";
+
 function rawSourcePrintNote(view: SourceEmlView): string {
+  if (isLargeMessageRawSourceUnavailable(view)) {
+    return "Printed a limited preview; complete original EML content was not included. No remote resources were loaded.";
+  }
   return view.sourceFormat === "msg"
     ? "Printed structured MSG properties and diagnostics. No remote resources were loaded."
     : "Printed raw EML source text. No remote resources were loaded.";
@@ -1652,8 +1670,11 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
     let note: string | null = null;
 
     if (sourceEmlMode === "raw_source") {
-      bodyHtml = plainTextPrintBody(sourceEmlView.rawSource);
-      bodyModeLabel = "Raw Source";
+      const rawSourceUnavailable = isLargeMessageRawSourceUnavailable(sourceEmlView);
+      bodyHtml = plainTextPrintBody(
+        rawSourceUnavailable ? largeMessageRawSourceNotice : sourceEmlView.rawSource,
+      );
+      bodyModeLabel = rawSourceUnavailable ? "Limited Preview" : "Raw Source";
       note = rawSourcePrintNote(sourceEmlView);
     } else if (sourceEmlMode === "plain_text") {
       bodyHtml = plainTextPrintBody(formatBodyForDisplay(sourceEmlView.bodyText));
@@ -1854,6 +1875,7 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
     ? sourceReconstructionWarnings(sourceEmlView)
     : [];
   const sourceEmlRawTerms = sourceEmlRawSearch.trim() ? [sourceEmlRawSearch.trim()] : [];
+  const sourceEmlRawUnavailable = isLargeMessageRawSourceUnavailable(sourceEmlView);
 
   return (
     <main className="preview-window-shell">
@@ -2120,23 +2142,29 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
                 </>
               ) : (
                 <div className="raw-source-panel">
-                  <p className="body-status">
-                    {sourceEmlView.sourceFormat === "msg"
-                      ? "Raw Source shows structured MSG properties and diagnostics. MSG files are binary and are not displayed as raw bytes."
-                      : sourceEmlView.sourceKind === "standalone"
-                        ? "Raw Source shows the original standalone .eml contents."
-                        : "Raw Source shows the original extracted .eml contents."}
-                  </p>
-                  <input
-                    type="search"
-                    value={sourceEmlRawSearch}
-                    onChange={(event) => setSourceEmlRawSearch(event.target.value)}
-                    placeholder={rawSourceSearchLabel(sourceEmlView)}
-                    aria-label={rawSourceSearchLabel(sourceEmlView)}
-                  />
-                  <pre className="raw-source-text">
-                    <HighlightedText text={sourceEmlView.rawSource} terms={sourceEmlRawTerms} />
-                  </pre>
+                  {sourceEmlRawUnavailable ? (
+                    <p className="body-status">{largeMessageRawSourceNotice}</p>
+                  ) : (
+                    <>
+                      <p className="body-status">
+                        {sourceEmlView.sourceFormat === "msg"
+                          ? "Raw Source shows structured MSG properties and diagnostics. MSG files are binary and are not displayed as raw bytes."
+                          : sourceEmlView.sourceKind === "standalone"
+                            ? "Raw Source shows the original standalone .eml contents."
+                            : "Raw Source shows the original extracted .eml contents."}
+                      </p>
+                      <input
+                        type="search"
+                        value={sourceEmlRawSearch}
+                        onChange={(event) => setSourceEmlRawSearch(event.target.value)}
+                        placeholder={rawSourceSearchLabel(sourceEmlView)}
+                        aria-label={rawSourceSearchLabel(sourceEmlView)}
+                      />
+                      <pre className="raw-source-text">
+                        <HighlightedText text={sourceEmlView.rawSource} terms={sourceEmlRawTerms} />
+                      </pre>
+                    </>
+                  )}
                 </div>
               )}
             </section>
@@ -6388,8 +6416,11 @@ function App() {
     let note: string | null = null;
 
     if (sourceEmlMode === "raw_source") {
-      bodyHtml = plainTextPrintBody(sourceEmlView.rawSource);
-      bodyModeLabel = "Raw Source";
+      const rawSourceUnavailable = isLargeMessageRawSourceUnavailable(sourceEmlView);
+      bodyHtml = plainTextPrintBody(
+        rawSourceUnavailable ? largeMessageRawSourceNotice : sourceEmlView.rawSource,
+      );
+      bodyModeLabel = rawSourceUnavailable ? "Limited Preview" : "Raw Source";
       note = rawSourcePrintNote(sourceEmlView);
     } else if (sourceEmlMode === "plain_text") {
       bodyHtml = plainTextPrintBody(formatBodyForDisplay(sourceEmlView.bodyText));
@@ -7439,6 +7470,7 @@ function App() {
     : [];
   const messageDiagnosticNotes = messageDiagnostics ? diagnosticNotes(messageDiagnostics) : [];
   const sourceEmlRawTerms = sourceEmlRawSearch.trim() ? [sourceEmlRawSearch.trim()] : [];
+  const sourceEmlRawUnavailable = isLargeMessageRawSourceUnavailable(sourceEmlView);
   const htmlMissingCanReindex =
     selectedMessage != null &&
     !selectedBodyIsRtfFallback &&
@@ -10983,22 +11015,28 @@ function App() {
               </>
             ) : (
               <div className="source-eml-raw">
-                  <p className="body-status">
-                  {sourceEmlView.sourceFormat === "msg"
-                    ? "Raw Source shows structured MSG properties and diagnostics. MSG files are binary and are not displayed as raw bytes."
-                    : sourceEmlView.sourceKind === "standalone"
-                      ? "Raw Source shows the original standalone .eml contents."
-                      : "Raw Source shows the original extracted .eml contents."}
-                </p>
-                <input
-                  type="search"
-                  placeholder="Find in raw source"
-                  value={sourceEmlRawSearch}
-                  onChange={(event) => setSourceEmlRawSearch(event.target.value)}
-                />
-                <pre className="raw-source-preview">
-                  <HighlightedText text={sourceEmlView.rawSource} terms={sourceEmlRawTerms} />
-                </pre>
+                {sourceEmlRawUnavailable ? (
+                  <p className="body-status">{largeMessageRawSourceNotice}</p>
+                ) : (
+                  <>
+                    <p className="body-status">
+                      {sourceEmlView.sourceFormat === "msg"
+                        ? "Raw Source shows structured MSG properties and diagnostics. MSG files are binary and are not displayed as raw bytes."
+                        : sourceEmlView.sourceKind === "standalone"
+                          ? "Raw Source shows the original standalone .eml contents."
+                          : "Raw Source shows the original extracted .eml contents."}
+                    </p>
+                    <input
+                      type="search"
+                      placeholder="Find in raw source"
+                      value={sourceEmlRawSearch}
+                      onChange={(event) => setSourceEmlRawSearch(event.target.value)}
+                    />
+                    <pre className="raw-source-preview">
+                      <HighlightedText text={sourceEmlView.rawSource} terms={sourceEmlRawTerms} />
+                    </pre>
+                  </>
+                )}
               </div>
             )}
           </section>

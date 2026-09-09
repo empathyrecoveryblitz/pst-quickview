@@ -1,14 +1,29 @@
 # Release compliance checklist
 
-## Beta.4 testing-prerelease gate
+## Beta.5 testing-prerelease gate
 
-PST QuickView `0.2.0-beta.4` is an unsigned and unnotarized testing prerelease prepared for
-publication. Its local release gate uses the intended companion URL
-`https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.4/readpst-corresponding-source-0.6.76.tar.gz`
-to bind reproducible Corresponding Source metadata. The DMG, exact companion archive, and
-`SHA256SUMS.txt` must be delivered together and their public downloads verified. Passing the local
-gate alone does not prove public availability, client duplicate resolution, or complete GUI and
-clean-machine coverage. The beta.3 public-delivery record below remains unchanged.
+PST QuickView `0.2.0-beta.5` is an unsigned and unnotarized testing prerelease prepared for
+publication. Generate and verify a fresh Corresponding Source companion using the intended URL:
+`https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.5/readpst-corresponding-source-0.6.76.tar.gz`.
+The DMG, exact companion archive, and `SHA256SUMS.txt` must be delivered together and public
+download hashes verified after publication. Local checks alone do not prove public availability,
+client import success, duplicate resolution, or complete GUI and clean-machine coverage.
+
+The existing development-only Browserslist advisory GHSA-73wf-gq98-2v4g remains unresolved;
+this release preserves dependency pins and resolutions. Large-message limited previews do not
+establish complete body or attachment parsing. Keep these limitations visible in release notes.
+
+## Published beta.4 record
+
+The unsigned and unnotarized `v0.2.0-beta.4` testing prerelease was published with all three assets:
+
+- Universal DMG SHA-256: `a6e2f3b2ba4161c19a30d771d07c094f5ffc15de104dd03a284cdd31117f17fa`.
+- ReadPST Corresponding Source SHA-256: `7bf0d27a240822a484398e4c17112f9e86c1c0b4bbfec92b3b8fa9a087f0d8ea`.
+- `SHA256SUMS.txt` records both hashes.
+
+The companion remains at
+`https://github.com/empathyrecoveryblitz/pst-quickview/releases/download/v0.2.0-beta.4/readpst-corresponding-source-0.6.76.tar.gz`.
+Beta.4 and earlier releases are historical records and must remain unchanged when beta.5 is published.
 
 ## Published beta.3 record
 

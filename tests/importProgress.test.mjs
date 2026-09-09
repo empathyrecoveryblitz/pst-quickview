@@ -1069,8 +1069,8 @@ test("completion, cancellation, incomplete, and failure have qualified terminal 
 
   const cases = [
     ["cancelled", "import_cancelled", /cancelled after/],
-    ["incomplete", "import_incomplete", /did not pass internal verification/],
-    ["failed", "import_failed", /did not pass internal verification/],
+    ["incomplete", "import_incomplete", /internal verification was not completed/],
+    ["failed", "import_failed", /internal verification was not completed/],
   ];
   for (const [status, statusCode, expected] of cases) {
     const terminal = terminalImportPresentation(
@@ -1093,6 +1093,32 @@ test("completion, cancellation, incomplete, and failure have qualified terminal 
   );
 });
 
+test("interruptions identify the recorded stage without claiming an earlier verification failure", () => {
+  for (const stage of IMPORT_STAGES.filter((stage) => stage !== "complete")) {
+    for (const [status, statusCode] of [
+      ["failed", "import_failed"],
+      ["incomplete", "import_incomplete"],
+    ]) {
+      const stopped = parsed(snapshot({
+        stage,
+        completedStages: IMPORT_STAGES.slice(0, IMPORT_STAGES.indexOf(stage)),
+        status,
+        statusCode,
+        processState: "not_applicable",
+      }));
+      const terminal = terminalImportPresentation(stopped);
+      const tracker = importStageTracker(stopped).find((item) => item.stage === stage);
+      assert.match(terminal.detail, new RegExp(`at the "${tracker.label}" stage`));
+      if (stage === "verifying") {
+        assert.match(terminal.detail, /did not pass internal verification/);
+      } else {
+        assert.match(terminal.detail, /internal verification was not completed/);
+        assert.doesNotMatch(terminal.detail, /did not pass internal verification/);
+      }
+    }
+  }
+});
+
 test("legacy timing terminal copy does not present partial import timing as full duration", () => {
   const warningCodes = ["prior_timing_unavailable"];
   const completed = parsed(
@@ -1111,8 +1137,8 @@ test("legacy timing terminal copy does not present partial import timing as full
 
   const interruptedCases = [
     ["cancelled", "import_cancelled", /completed stages and counts were preserved/],
-    ["incomplete", "import_incomplete", /did not pass internal verification/],
-    ["failed", "import_failed", /did not pass internal verification/],
+    ["incomplete", "import_incomplete", /internal verification was not completed/],
+    ["failed", "import_failed", /internal verification was not completed/],
   ];
   for (const [status, statusCode, expected] of interruptedCases) {
     const terminal = terminalImportPresentation(

@@ -449,7 +449,9 @@ test("ReadPST execution is bundled, isolated, bounded, and source preserving", (
   assert.match(rustSource, /\.arg\("--"\)\s*\.arg\(pst_path\)/);
   assert.match(rustSource, /MAX_READPST_STREAM_BYTES/);
   assert.match(rustSource, /MAX_READPST_EXTRACTED_ENTRIES/);
-  assert.match(rustSource, /MAX_READPST_EXTRACTED_FILE_BYTES/);
+  assert.match(rustSource, /snapshot\.total_bytes > max_total_bytes/);
+  assert.match(rustSource, /fn readpst_output_byte_limit\(source_bytes: u64\)/);
+  assert.doesNotMatch(rustSource, /MAX_READPST_EXTRACTED_FILE_BYTES/);
   assert.doesNotMatch(rustSource, /READPST_STALL_TIMEOUT/);
   assert.match(rustSource, /fn readpst_running_process_state/);
   assert.match(rustSource, /ProcessState::RunningNoRecentSignal/);

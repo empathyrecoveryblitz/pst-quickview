@@ -744,8 +744,8 @@ that requires a current source comparison.
 ### Full Verify
 
 Phase 2's backend also supports a bounded Full Verify. It performs every Quick
-Verify check and rereads each extracted candidate to recompute its size and
-SHA-256 freshness guard before comparing the complete canonical identity set.
+Verify check and streams each extracted candidate to recompute its size and
+complete-file SHA-256 freshness guard before comparing the complete canonical identity set.
 It does not mutate the active database or reparse message content. The restrained
 Workspace UI exposes Quick Verify by default; Full Verify remains available to
 future UI or diagnostic integration. It has the same proof boundary and does
@@ -963,3 +963,26 @@ materialized every record a server or Outlook installation ever held. Subject,
 body, Message-ID, attachment content, or digest similarity is not sufficient
 evidence for deletion. Unknown extractor provenance stays visible and
 fail-open.
+
+## Beta.5 large extracted messages
+
+Discovery, indexing identity checks, and backend Full Verify stream complete EML files for
+freshness hashes. Discovery and verification retain no complete message buffer. Indexing retains
+full content only within the 256 MiB source budget; above that threshold it retains bounded
+transport headers. Available header fields remain searchable, while body text and individual
+attachments are not parsed or indexed. Malformed, unterminated, or over-budget headers retain a
+limited canonical placeholder rather than suppressing the message. These bounds do not expand
+MSG parsing or claim unlimited message rendering.
+
+The source-scaled aggregate ReadPST extraction budget remains enforced. The former independent
+512 MiB per-file ceiling no longer rejects a large extracted message within that aggregate
+budget. Other entry, file-type, link, process, and resource checks remain active.
+
+Large-message previews and verification/completion results disclose the limited representation.
+**Save Source As** copies the complete original EML, including its original attachments.
+Internal verification does not imply complete body/attachment parsing or Outlook/Exchange parity.
+
+For a retry after upgrading, preserve the current workspace, extracted tree, index, and SQLite
+sidecars. Reopen the same PST and choose **Resume Indexing** or **Repair Index** if offered. This
+recovery reuses extraction; it does not require deleting the workspace or starting a fresh import.
+Successful client import and historical duplicate resolution require separate runtime evidence.

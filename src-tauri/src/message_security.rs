@@ -1,5 +1,5 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, Metadata, OpenOptions},
     io::{self, Read},
     os::unix::{fs::MetadataExt, fs::OpenOptionsExt},
     path::Path,
@@ -19,23 +19,20 @@ fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-pub(crate) fn open_bounded_message_file(path: &Path) -> io::Result<File> {
+pub(crate) fn open_regular_message_file(path: &Path) -> io::Result<File> {
     let expected = std::fs::symlink_metadata(path)?;
     if expected.file_type().is_symlink() || !expected.is_file() || expected.nlink() != 1 {
         return Err(invalid_data(
             "message source must be one regular, nonlinked file",
         ));
     }
-    if expected.len() > MAX_MESSAGE_SOURCE_BYTES {
-        return Err(invalid_data("message source exceeds the safety limit"));
-    }
-
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)?;
     let opened = file.metadata()?;
-    if opened.dev() != expected.dev()
+    if !opened.is_file()
+        || opened.dev() != expected.dev()
         || opened.ino() != expected.ino()
         || opened.nlink() != 1
         || opened.len() != expected.len()
@@ -43,6 +40,69 @@ pub(crate) fn open_bounded_message_file(path: &Path) -> io::Result<File> {
         return Err(invalid_data("message source changed while it was opened"));
     }
     Ok(file)
+}
+
+pub(crate) fn open_bounded_message_file(path: &Path) -> io::Result<File> {
+    let file = open_regular_message_file(path)?;
+    if file.metadata()?.len() > MAX_MESSAGE_SOURCE_BYTES {
+        return Err(invalid_data("message source exceeds the safety limit"));
+    }
+    Ok(file)
+}
+
+fn validate_message_file_unchanged(file: &File, before: &Metadata) -> io::Result<()> {
+    let after = file.metadata()?;
+    if !after.is_file()
+        || after.dev() != before.dev()
+        || after.ino() != before.ino()
+        || after.nlink() != 1
+        || after.len() != before.len()
+        || after.mtime() != before.mtime()
+        || after.mtime_nsec() != before.mtime_nsec()
+        || after.ctime() != before.ctime()
+        || after.ctime_nsec() != before.ctime_nsec()
+    {
+        return Err(invalid_data("message source changed while it was read"));
+    }
+    Ok(())
+}
+
+/// Read only the top-level headers, including their terminating blank line.
+///
+/// Large message bodies stay on disk. Both the header allocation and each read
+/// are bounded, including when a malformed source has no newline at all.
+pub(crate) fn read_bounded_message_headers(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_regular_message_file(path)?;
+    let before = file.metadata()?;
+    let mut headers = Vec::with_capacity(8192);
+    let mut buffer = [0u8; 8192];
+    let mut line_start = 0usize;
+    while headers.len() < MAX_TRANSPORT_HEADERS_BYTES {
+        let remaining = MAX_TRANSPORT_HEADERS_BYTES - headers.len();
+        let read_limit = buffer.len().min(remaining);
+        let count = match file.read(&mut buffer[..read_limit]) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Err(invalid_data("message headers are not terminated"));
+        }
+        for byte in &buffer[..count] {
+            headers.push(*byte);
+            if *byte != b'\n' {
+                continue;
+            }
+            let line_end = headers.len() - 1;
+            let blank_line = line_end == line_start
+                || (line_end == line_start + 1 && headers[line_start] == b'\r');
+            if blank_line {
+                validate_message_file_unchanged(&file, &before)?;
+                return Ok(headers);
+            }
+            line_start = headers.len();
+        }
+    }
+    Err(invalid_data("message headers exceed the safety limit"))
 }
 
 pub(crate) fn read_bounded_message_source(path: &Path) -> io::Result<Vec<u8>> {
@@ -55,15 +115,7 @@ pub(crate) fn read_bounded_message_source(path: &Path) -> io::Result<Vec<u8>> {
     if bytes.len() as u64 > MAX_MESSAGE_SOURCE_BYTES {
         return Err(invalid_data("message source exceeds the safety limit"));
     }
-    let after = file.metadata()?;
-    if after.dev() != before.dev()
-        || after.ino() != before.ino()
-        || after.len() != before.len()
-        || after.mtime() != before.mtime()
-        || after.mtime_nsec() != before.mtime_nsec()
-    {
-        return Err(invalid_data("message source changed while it was read"));
-    }
+    validate_message_file_unchanged(&file, &before)?;
     Ok(bytes)
 }
 
@@ -205,7 +257,10 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, io::Cursor, io::Write};
+    use std::{
+        fs,
+        io::{Cursor, Seek, SeekFrom, Write},
+    };
 
     fn temporary_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -228,11 +283,133 @@ mod tests {
 
         let symlink = path.with_file_name("symlink.eml");
         std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        assert!(open_regular_message_file(&symlink).is_err());
         assert!(open_bounded_message_file(&symlink).is_err());
+        assert!(read_bounded_message_headers(&symlink).is_err());
         let hardlink = path.with_file_name("hardlink.eml");
         fs::hard_link(&path, &hardlink).unwrap();
+        assert!(open_regular_message_file(&path).is_err());
+        assert!(open_regular_message_file(&hardlink).is_err());
         assert!(open_bounded_message_file(&path).is_err());
         assert!(open_bounded_message_file(&hardlink).is_err());
+        assert!(read_bounded_message_headers(&path).is_err());
+        assert!(read_bounded_message_headers(&hardlink).is_err());
+        assert!(open_regular_message_file(path.parent().unwrap()).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn oversized_source_supports_bounded_headers_without_changing_source() {
+        let headers =
+            b"Subject: synthetic large message\r\nContent-Type: application/octet-stream\r\n\r\n";
+        let path = temporary_file("large-headers", headers);
+        let mut source = OpenOptions::new().write(true).open(&path).unwrap();
+        source.set_len(MAX_MESSAGE_SOURCE_BYTES + 17).unwrap();
+        source.seek(SeekFrom::End(-4)).unwrap();
+        source.write_all(b"tail").unwrap();
+        drop(source);
+        let before = fs::metadata(&path).unwrap();
+
+        assert_eq!(
+            open_regular_message_file(&path)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            before.len()
+        );
+        assert!(open_bounded_message_file(&path).is_err());
+        assert!(read_bounded_message_source(&path).is_err());
+        assert_eq!(read_bounded_message_headers(&path).unwrap(), headers);
+
+        let mut unchanged_source = File::open(&path).unwrap();
+        validate_message_file_unchanged(&unchanged_source, &before).unwrap();
+        let mut prefix = vec![0; headers.len()];
+        unchanged_source.read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix, headers);
+        unchanged_source.seek(SeekFrom::End(-4)).unwrap();
+        let mut suffix = [0; 4];
+        unchanged_source.read_exact(&mut suffix).unwrap();
+        assert_eq!(&suffix, b"tail");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn header_reader_stops_at_blank_line_across_read_boundaries() {
+        for (name, separator) in [
+            ("lf-headers", b"\n\n".as_slice()),
+            ("crlf-headers", b"\r\n\r\n".as_slice()),
+        ] {
+            let mut headers = b"X-Synthetic: ".to_vec();
+            headers.resize(8191, b'x');
+            headers.extend_from_slice(separator);
+            let mut source = headers.clone();
+            source.extend_from_slice(b"body must not be returned\n\n");
+            let path = temporary_file(name, &source);
+            assert_eq!(read_bounded_message_headers(&path).unwrap(), headers);
+            assert_eq!(fs::read(&path).unwrap(), source);
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn header_reader_accepts_exact_budget_and_rejects_excessive_unterminated_headers() {
+        let mut headers = b"X-Synthetic: ".to_vec();
+        headers.resize(MAX_TRANSPORT_HEADERS_BYTES - 4, b'x');
+        headers.extend_from_slice(b"\r\n\r\n");
+        let path = temporary_file("exact-header-budget", &headers);
+        assert_eq!(read_bounded_message_headers(&path).unwrap(), headers);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        let path = temporary_file("excessive-header-line", b"X-Synthetic: ");
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_TRANSPORT_HEADERS_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(
+            read_bounded_message_headers(&path).unwrap_err().to_string(),
+            "message headers exceed the safety limit"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        for (index, bytes) in [
+            b"".as_slice(),
+            b"Subject: synthetic",
+            b"Subject: synthetic\r\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = temporary_file(&format!("unterminated-headers-{index}"), bytes);
+            assert_eq!(
+                read_bounded_message_headers(&path).unwrap_err().to_string(),
+                "message headers are not terminated"
+            );
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn source_metadata_validation_rejects_length_and_link_changes() {
+        let path = temporary_file("source-length-change", b"Subject: synthetic\n\n");
+        let opened = open_regular_message_file(&path).unwrap();
+        let before = opened.metadata().unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(before.len() + 1)
+            .unwrap();
+        assert!(validate_message_file_unchanged(&opened, &before).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        let path = temporary_file("source-link-change", b"Subject: synthetic\n\n");
+        let opened = open_regular_message_file(&path).unwrap();
+        let before = opened.metadata().unwrap();
+        fs::hard_link(&path, path.with_file_name("new-link.eml")).unwrap();
+        assert!(validate_message_file_unchanged(&opened, &before).is_err());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

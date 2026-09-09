@@ -1,12 +1,42 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
+import { runInNewContext } from "node:vm";
 
 const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 const backend = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 const previewStart = app.indexOf("function MessagePreviewWindow");
 const previewEnd = app.indexOf("function App()");
 const previewWindow = app.slice(previewStart, previewEnd);
+
+const rawSourceHelpers = runInNewContext(
+  stripTypeScriptTypes(
+    app.slice(
+      app.indexOf("function isLargeMessageRawSourceUnavailable"),
+      app.indexOf("function rawSourceSearchLabel"),
+    ),
+  ) + "\n({ isLargeMessageRawSourceUnavailable, rawSourcePrintNote })",
+);
+
+test("only large EML without raw content uses the limited source preview", () => {
+  const largeEml = {
+    sourceFormat: "eml",
+    bodySource: "large_message_headers",
+    rawSourceAvailable: false,
+  };
+  const unavailable = rawSourceHelpers.isLargeMessageRawSourceUnavailable;
+  assert.equal(unavailable(largeEml), true);
+  assert.equal(unavailable(null), false);
+  assert.equal(unavailable({ ...largeEml, rawSourceAvailable: true }), false);
+  assert.equal(unavailable({ ...largeEml, bodySource: "text_plain" }), false);
+  assert.equal(unavailable({ ...largeEml, sourceFormat: "msg" }), false);
+  assert.match(rawSourceHelpers.rawSourcePrintNote(largeEml), /limited preview.*not included/);
+  assert.match(
+    rawSourceHelpers.rawSourcePrintNote({ ...largeEml, sourceFormat: "msg" }),
+    /structured MSG properties and diagnostics/,
+  );
+});
 
 test("standalone EML and MSG previews explain permanent remote-image blocking", () => {
   assert.match(app, /Remote images are blocked for privacy and security\./);

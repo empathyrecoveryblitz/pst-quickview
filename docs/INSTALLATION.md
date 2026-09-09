@@ -1,6 +1,6 @@
 # Installing PST QuickView on macOS
 
-PST QuickView v0.2.0-beta.4 is prepared as an unsigned and unnotarized testing prerelease. Install published builds only from the project's [official GitHub Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases).
+PST QuickView v0.2.0-beta.5 is prepared as an unsigned and unnotarized testing prerelease. Install published builds only from the project's [official GitHub Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases).
 
 ## System requirements
 
@@ -12,7 +12,7 @@ The released application includes ReadPST / LibPST 0.6.76. Homebrew is not requi
 
 ## Install from the DMG
 
-1. Open the project [Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases) and select v0.2.0-beta.4 when that testing prerelease is available.
+1. Open the project [Releases page](https://github.com/empathyrecoveryblitz/pst-quickview/releases) and select v0.2.0-beta.5 when that testing prerelease is available.
 2. Download the Universal DMG and `SHA256SUMS.txt` from that release's assets, then verify the DMG checksum before opening it.
 3. Open the downloaded DMG.
 4. Drag **PST QuickView** into the **Applications** folder.
@@ -49,6 +49,8 @@ Do not turn off Gatekeeper system-wide. If the per-app controls are unavailable 
 5. Launch the new copy. Because releases are currently unsigned, macOS may require per-app approval again.
 
 Replacing the app does not remove original PST, EML, or MSG files, and it does not automatically remove existing local workspaces.
+
+For an interrupted large-PST import, keep the existing workspace, extracted EML files, index, and sidecars. Reopen the same PST and use **Resume Indexing** or **Repair Index** if offered. Do not delete the workspace or begin a fresh import merely to retry. Messages above 256 MiB may retain searchable headers and a limited preview; use **Save Source As** to export their complete original EML.
 
 ## Uninstall
 

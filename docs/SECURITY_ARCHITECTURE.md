@@ -236,7 +236,7 @@ from a fixed bundled sidecar location. There is no ambient `PATH` fallback.
 Options and canonical source/output paths are separate arguments and `--`
 terminates option parsing. The child runs in its own process group with a
 cleared, minimal environment and private temporary directory. Cancellation,
-stall, absolute-time, stream-output, extracted-entry, per-file, and total-byte
+stall, absolute-time, stream-output, extracted-entry, and source-scaled total-byte
 limits terminate the complete process group. Stdout and stderr are drained into
 bounded in-memory tails and only byte counts are logged.
 
@@ -298,7 +298,7 @@ cancellation registry lifetime. At most 64 workspaces can be open or targeted
 by one request, and offset-based fallback requests reject offsets above
 5,000,000 rows. Combined counts use checked arithmetic.
 
-ReadPST has absolute-time, stall, stream, per-file, entry-count, and total-byte
+ReadPST has absolute-time, stall, stream, entry-count, and source-scaled total-byte
 limits. Search operations register SQLite interrupt handles. Deterministic
 tests cover parser boundaries, malformed cursor storms, repeated cancellation,
 workspace capacity, temporary-output failure, disk-space preflight, sidecar
@@ -401,3 +401,16 @@ version must address:
 - rollback-safe installer upgrades;
 - Authenticode signing and SmartScreen reputation; and
 - process invocation with separate arguments and no shell command construction.
+
+## Beta.5 streaming and limited-preview bounds
+
+Extracted-message discovery, identity hashing, and backend Full Verify hash complete EMLs in
+bounded read chunks. EMLs above 256 MiB retain bounded transport headers for indexing and an
+explicit limited-preview status; body and individual attachment parsing is skipped. Malformed or
+over-budget headers retain a canonical placeholder. Original bytes remain available through
+complete EML export. These changes preserve existing MSG, MIME, HTML, and attachment limits.
+
+ReadPST output no longer has a separate 512 MiB per-file ceiling. The aggregate extraction limit
+still scales with source PST size, and existing process, entry-count, file-type, and filesystem
+checks remain required. Streaming does not make an arbitrarily large or hostile message safe to
+fully parse, and limited previews must never be reported as complete content fidelity.

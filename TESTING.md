@@ -1,6 +1,6 @@
 # PST QuickView Internal Beta Test Plan
 
-Version under test: `0.2.0-beta.4`
+Version under test: `0.2.0-beta.5`
 
 Record the Mac model, macOS version, CPU architecture, app path, DMG filename, and whether
 Homebrew is installed before testing. Use disposable copies of test files where possible and
@@ -13,7 +13,7 @@ record SHA-256 hashes for source-integrity checks.
 - Never disable Gatekeeper globally.
 - If the approved internal workflow requires removing quarantine, remove it only from
   `/Applications/PST QuickView.app`.
-- Confirm About shows `0.2.0-beta.4`.
+- Confirm About shows `0.2.0-beta.5`.
 - Expand About > Diagnostics and record macOS, CPU, executable architecture, and readpst source.
 
 ## PST
@@ -28,6 +28,39 @@ record SHA-256 hashes for source-integrity checks.
 - Confirm Diagnostics reports a bundled readpst source.
 - Test an older ANSI PST when a safe fixture is available.
 - Confirm invalid or truncated PST files show a readable error with technical Details.
+
+## Beta.5 Large EML Recovery
+
+This matrix is a test plan, not a claim of completed client or packaged-app testing. Use an
+isolated synthetic corpus and retain before/after source hashes. Never remove an important
+workspace or source file merely to obtain a test result.
+
+- Include extracted EMLs below, at, and above 256 MiB, plus one above 512 MiB. Use synthetic
+  headers and content; confirm complete-file hashes and byte lengths remain unchanged.
+- Confirm discovery and backend Full Verify stream large files with bounded working memory,
+  activity updates, and responsive cancellation. Verify identity hashes cover complete files.
+- Resume an incomplete synthetic workspace containing a large EML. Confirm canonical rows are
+  retained and repeated Resume does not add rows for the same extracted message identities.
+- Repair an existing synthetic index from its retained extraction output. Confirm the original
+  extraction remains unchanged and the previous active index survives any failed replacement.
+- For EMLs above 256 MiB, confirm available Subject, From, To/Cc/Bcc, and Date fields appear and
+  header searches can find them. Confirm an explicit limited-preview notice remains visible;
+  body and attachment contents must not be presented as parsed or indexed.
+- Exercise malformed, unterminated, and excessive large-message headers. Confirm a retained
+  canonical placeholder and clear notice rather than silent message loss or an unbounded read.
+- Use **Save Source As** on a large-message preview and compare the exported EML SHA-256 and
+  length to its original. Confirm the exported file includes all original bytes and attachments.
+- Confirm standalone MSG parsing limits, HTML sanitization, remote-content blocking, and
+  export-first attachment handling remain unchanged.
+- Confirm ReadPST accepts an individual synthetic output above 512 MiB within the permitted
+  aggregate budget, while over-budget aggregate output and unsafe file types still fail closed.
+- Confirm verification/completion reports mention retained large messages and limited previews.
+  A completed index must not imply full body or attachment parsing or Outlook/Exchange parity.
+- Client retry: keep the existing workspace, index sidecars, and extracted files; reopen the same
+  PST and use **Resume Indexing** or **Repair Index** if offered. Record only aggregate result,
+  counts, warnings, and source-integrity evidence. Do not recommend starting over or deleting
+  the workspace as a prerequisite. Client success and duplicate resolution remain unconfirmed
+  until this run supplies evidence.
 
 ## Import Progress Phase 3
 

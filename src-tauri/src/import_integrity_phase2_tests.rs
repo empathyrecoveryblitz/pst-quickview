@@ -90,6 +90,13 @@ impl SyntheticWorkspace {
     }
 
     fn with_records(label: &str, records: &[(&str, &[u8])]) -> Self {
+        Self::with_prepared_records(label, records, |_| {})
+    }
+
+    fn with_prepared_records<F>(label: &str, records: &[(&str, &[u8])], prepare: F) -> Self
+    where
+        F: FnOnce(&Path),
+    {
         let root = TestDirectory::new(label);
         let source = root.path.join("fictional.pst");
         fs::write(&source, SYNTHETIC_PST_BYTES).expect("synthetic source should be written");
@@ -105,6 +112,7 @@ impl SyntheticWorkspace {
                 .expect("record parent should be created");
             fs::write(path, bytes).expect("synthetic EML should be written");
         }
+        prepare(&extracted);
 
         let marker = WorkspaceMarker {
             app: WORKSPACE_MARKER_APP_NAME.to_string(),
@@ -4120,6 +4128,189 @@ fn resume_preserves_preexisting_parse_failure_count() {
 }
 
 #[test]
+fn large_message_import_full_verify_and_resumed_repair_preserve_every_record() {
+    use std::os::unix::fs::FileExt;
+
+    const LARGE_PATH: &str = "Inbox/large.eml";
+    let large_size = MAX_MESSAGE_SOURCE_BYTES + 4096;
+    let fixture = SyntheticWorkspace::with_prepared_records(
+        "large-message-lifecycle",
+        &[(LARGE_PATH, NORMAL_EML), ("Inbox/normal.eml", SECOND_EML)],
+        |extracted| {
+            OpenOptions::new()
+                .write(true)
+                .open(extracted.join(LARGE_PATH))
+                .unwrap()
+                .set_len(large_size)
+                .unwrap();
+        },
+    );
+    assert_eq!(fixture.discovery.count, 2);
+    assert_eq!(fixture.stats.indexed, 2);
+    assert_eq!(fixture.stats.error_count, 0);
+    assert_eq!(fixture.manifest().parse_failure_count, 0);
+    let large_candidate = fixture
+        .discovery
+        .candidates
+        .iter()
+        .find(|candidate| candidate.relative_path == LARGE_PATH)
+        .unwrap();
+    assert_eq!(large_candidate.identity.size, large_size);
+    let assert_large_headers = |index_path: &Path| {
+        let conn = open_sqlite_read_only_connection(index_path).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT subject, sender, body_source, length(COALESCE(body_html, '')), message_id_header
+                   FROM messages WHERE eml_path = ?1",
+                params![LARGE_PATH],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "Fictional status");
+        assert!(row.1.contains("ada@example.test"));
+        assert_eq!(row.2, "large_message_headers");
+        assert_eq!(row.3, 0);
+        assert!(row.4.contains("phase-two-1@example.test"));
+    };
+    assert_large_headers(&fixture.index_path());
+    let (retained, retained_identity) =
+        read_eml_candidate_snapshot_with_progress(&large_candidate.path, |_| Ok(())).unwrap();
+    assert_eq!(retained_identity, large_candidate.identity);
+    assert!(retained.len() < 4096, "only headers are retained in memory");
+    assert_eq!(eml_header_end(&retained, 0), Some(retained.len()));
+    let preview = standalone_eml_message(&large_candidate.path).unwrap();
+    assert_eq!(preview.subject, "Fictional status");
+    assert_eq!(preview.body_source, BodySource::LargeMessageHeaders);
+    assert!(preview.raw_source.is_empty());
+    assert!(!preview.raw_source_available);
+    assert!(preview.attachments.is_empty());
+    assert!(preview.cid_images.is_empty());
+    assert!(preview.body_text.contains("Save Source As"));
+    assert!(preview
+        .parse_warnings
+        .iter()
+        .any(|warning| warning.contains("not parsed")));
+
+    let full = verify_for_test(
+        &fixture,
+        "large_message_full_verify",
+        phase2::VerificationLevel::Full,
+    );
+    assert_eq!(full.result, phase2::VerificationResult::Verified);
+    assert_eq!(full.discovered_candidates, 2);
+    assert_eq!(full.canonical_messages, 2);
+    assert_eq!(full.parse_failures, 0);
+    assert!(full.warnings.iter().any(|warning| {
+        warning.starts_with("1 large message(s)")
+            && warning.contains("bodies and individual attachments were not indexed")
+    }));
+    let cancelled = phase2::verify_active_workspace_cancellation_for_test(
+        &fixture.active,
+        "large_message_full_verify_cancel",
+    )
+    .expect_err("Full Verify should honor cancellation while hashing a large message");
+    assert_eq!(cancelled.code, Some(IMPORT_CANCELLED_CODE));
+
+    let active_hash = sha256_file(&fixture.index_path()).unwrap();
+    let active_ids = read_stable_message_ids(&fixture.index_path()).unwrap();
+    let repair_path = fixture.active.path.join("index.large-repair.sqlite");
+    let mut conn = open_sqlite_write_connection(&repair_path).unwrap();
+    initialize_schema(&conn).unwrap();
+    insert_import_metadata(
+        &mut conn,
+        &fixture.identity,
+        &fixture.active.id,
+        fixture.discovery.count,
+        &fixture.discovery.identity_manifest,
+        &fixture.active.path,
+        WorkspaceLocationMode::AppSupport,
+        "bundled-readpst",
+        "synthetic-readpst-0",
+    )
+    .unwrap();
+    for stage in [
+        phase2::WorkspaceState::Incomplete,
+        phase2::WorkspaceState::Indexing,
+    ] {
+        phase2::transition_state(
+            &fixture.active.path,
+            &fixture.active.id,
+            stage,
+            phase2::StateCounts {
+                discovered_candidates: Some(fixture.discovery.count),
+                canonical_indexed: Some(0),
+            },
+            Some("synthetic_large_message_repair"),
+        )
+        .unwrap();
+    }
+    let cancelled = stream_index_eml_files_with_preferred_ids(
+        &fixture.active.path,
+        &fixture.active.path.join("extracted"),
+        &mut conn,
+        &fixture.discovery,
+        1,
+        "Synthetic large-message repair cancellation.",
+        |stats| stats.processed >= 1,
+        |_| {},
+        Some(&active_ids),
+    )
+    .expect_err("repair should cancel after committing the large-message record");
+    assert_eq!(cancelled.code, Some(IMPORT_CANCELLED_CODE));
+    assert_large_headers(&repair_path);
+    let resumed = stream_index_eml_files_with_preferred_ids(
+        &fixture.active.path,
+        &fixture.active.path.join("extracted"),
+        &mut conn,
+        &fixture.discovery,
+        1,
+        "Synthetic large-message repair cancellation.",
+        |_| false,
+        |_| {},
+        Some(&active_ids),
+    )
+    .unwrap();
+    assert_eq!(resumed.indexed, 2);
+    assert_eq!(resumed.inserted, 1);
+    assert_eq!(resumed.skipped_existing, 1);
+    assert_eq!(resumed.error_count, 0);
+    assert_eq!(read_stable_message_ids(&repair_path).unwrap(), active_ids);
+    assert_large_headers(&repair_path);
+    assert_eq!(sha256_file(&fixture.index_path()).unwrap(), active_hash);
+    drop(conn);
+
+    // The sparse tail is beyond the parser budget. Full Verify must still hash it.
+    let large_file = OpenOptions::new()
+        .write(true)
+        .open(&large_candidate.path)
+        .unwrap();
+    large_file.write_all_at(b"X", large_size - 1).unwrap();
+    large_file.sync_all().unwrap();
+    let (found, mismatch) = phase2::scan_extraction_for_test(
+        &fixture.active.path.join("extracted"),
+        &fixture.manifest(),
+        phase2::VerificationLevel::Full,
+    )
+    .expect("Full Verify must scan large messages without applying the parser limit");
+    assert_eq!(found.len(), 2);
+    assert!(
+        mismatch,
+        "Full Verify must detect changes beyond the preview budget"
+    );
+    large_file.write_all_at(b"\0", large_size - 1).unwrap();
+    large_file.sync_all().unwrap();
+    fixture.source_and_extraction_unchanged();
+}
+
+#[test]
 fn repair_indexing_cancellation_leaves_active_index_and_can_resume() {
     let fixture = SyntheticWorkspace::valid("index-cancellation");
     let active_hash = sha256_file(&fixture.index_path()).unwrap();
@@ -4390,6 +4581,108 @@ fn verified_atomic_promotion_swaps_then_retires_previous_database() {
         phase2::verify_replacement_index(&fixture.active.path, &fixture.active.id, &index_path)
             .unwrap();
     }
+    fixture.source_and_extraction_unchanged();
+}
+
+#[test]
+fn large_message_verification_warning_accepts_only_bounded_canonical_counts() {
+    let fixture = SyntheticWorkspace::valid("large-message-warning-contract");
+    let conn = open_sqlite_write_connection(&fixture.index_path()).unwrap();
+    conn.execute(
+        "UPDATE messages SET body_source = 'large_message_headers'
+          WHERE id = (SELECT MIN(id) FROM messages)",
+        [],
+    )
+    .unwrap();
+    checked_truncate_checkpoint(&conn).unwrap();
+    drop(conn);
+
+    let report = verify_for_test(
+        &fixture,
+        "large_message_warning_contract",
+        phase2::VerificationLevel::Quick,
+    );
+    assert_eq!(report.result, phase2::VerificationResult::Verified);
+    let warning = report
+        .warnings
+        .iter()
+        .find(|warning| warning.starts_with("1 large message(s)"))
+        .expect("the verifier must generate a warning for the retained large record");
+    assert!(phase2::get_last_verification(&fixture.active.path, &fixture.active.id).is_ok());
+    let suffix = warning.strip_prefix('1').unwrap();
+    let path = fixture.active.path.join(phase2::LAST_VERIFICATION_FILE);
+    let valid = raw_json(&path);
+
+    for prefix in [
+        "",
+        "0",
+        "00",
+        "01",
+        "+1",
+        "-1",
+        " 1",
+        "1 ",
+        "1\n",
+        "1e0",
+        "1.0",
+        "１",
+        "18446744073709551616",
+        "private@example.test",
+        "1/private/source.pst",
+    ] {
+        let mut invalid = valid.clone();
+        invalid["warnings"] = serde_json::json!([format!("{prefix}{suffix}")]);
+        write_raw_json(&path, &invalid);
+        assert!(
+            phase2::get_last_verification(&fixture.active.path, &fixture.active.id).is_err(),
+            "warning prefixes must be bounded canonical decimal counts"
+        );
+    }
+    for changed_warning in [
+        format!("{}{suffix}", report.canonical_messages + 1),
+        format!("{warning}\nprivate@example.test"),
+        format!("{warning} "),
+        warning.replace("limited preview", "private@example.test"),
+    ] {
+        let mut invalid = valid.clone();
+        invalid["warnings"] = serde_json::json!([changed_warning]);
+        write_raw_json(&path, &invalid);
+        assert!(phase2::get_last_verification(&fixture.active.path, &fixture.active.id).is_err());
+    }
+
+    let mut duplicate = valid.clone();
+    duplicate["warnings"] = serde_json::json!([warning, format!("2{suffix}")]);
+    write_raw_json(&path, &duplicate);
+    assert!(phase2::get_last_verification(&fixture.active.path, &fixture.active.id).is_err());
+
+    for (count, accepted) in [
+        (1, true),
+        (MAX_READPST_EXTRACTED_ENTRIES, true),
+        (MAX_READPST_EXTRACTED_ENTRIES + 1, false),
+    ] {
+        let mut boundary = valid.clone();
+        for field in [
+            "canonicalMessages",
+            "discoveredCandidates",
+            "insertedMessages",
+            "ftsRows",
+        ] {
+            boundary[field] = Value::from(count);
+        }
+        boundary["warnings"] = serde_json::json!([format!("{count}{suffix}")]);
+        write_raw_json(&path, &boundary);
+        assert_eq!(
+            phase2::get_last_verification(&fixture.active.path, &fixture.active.id).is_ok(),
+            accepted
+        );
+    }
+    write_raw_json(&path, &valid);
+    assert_eq!(
+        phase2::get_last_verification(&fixture.active.path, &fixture.active.id)
+            .unwrap()
+            .unwrap(),
+        report
+    );
     fixture.source_and_extraction_unchanged();
 }
 

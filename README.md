@@ -6,7 +6,7 @@
 
 <p align="center">
   A local-only macOS viewer and search tool for PST, EML, and MSG files.<br>
-  <strong>Testing candidate: v0.2.0-beta.4</strong>
+  <strong>Testing candidate: v0.2.0-beta.5</strong>
 </p>
 
 <p align="center">
@@ -32,9 +32,13 @@
 
 PST QuickView provides a focused desktop interface for browsing and searching Outlook PST archives and standalone EML or MSG messages without sending mail data to a cloud service. Original source files remain read-only. PST archives are converted locally into persistent workspaces by the bundled ReadPST / LibPST 0.6.76 tooling, then indexed with SQLite and FTS5 for navigation and search.
 
-This source version prepares the `v0.2.0-beta.4` testing prerelease. Check [GitHub Releases](https://github.com/empathyrecoveryblitz/pst-quickview/releases) for published downloads. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
+This source version prepares the `v0.2.0-beta.5` testing prerelease. Check [GitHub Releases](https://github.com/empathyrecoveryblitz/pst-quickview/releases) for published downloads. It is unsigned and unnotarized, and it does not claim complete Outlook rendering, RTF, or calendar compatibility.
 
-Beta.4 adds idempotent Resume, import verification, Repair Index, possible-duplicate diagnostics, clearer import progress, conservative folder presentation, and reversible Local Trash. The cause of historical duplicate imports remains unproven; suspected duplicates are never deleted automatically.
+Beta.5 streams extracted-message discovery and verification so a message above 256 MiB can be retained without loading the complete file into memory. Available headers remain searchable; body text and individual attachments in these messages are not parsed or indexed. **Save Source As** exports the complete original EML, including its attachments. Malformed or over-budget headers can still have a limited placeholder. This is limited preview support, not unlimited message rendering.
+
+Beta.4 introduced idempotent Resume, import verification, Repair Index, possible-duplicate diagnostics, clearer import progress, conservative folder presentation, and reversible Local Trash. These remain available. The cause of historical duplicate imports remains unproven; suspected duplicates are never deleted automatically.
+
+To retry an interrupted import after upgrading, keep the existing workspace and extracted files, reopen the same PST, and use **Resume Indexing** or **Repair Index** if offered. Preserve the original PST and current workspace; starting over is not required by this recovery path. Client import success and duplicate resolution still require testing.
 
 ## Screenshots
 
@@ -90,7 +94,7 @@ See the [public screenshot requirements](assets/screenshots/README.md) before ad
 
 PST QuickView performs parsing, indexing, search, and preview on the Mac. It has no telemetry, analytics, cloud parser, cloud storage, account system, or automatic upload path. Source PST, EML, and MSG files are opened for reading and are not modified.
 
-PST processing creates a local workspace containing extracted message copies and a searchable SQLite index. These workspaces may contain sensitive mail data and persist after the app is closed. HTML is sanitized before display, and remote message resources are blocked. Beta.4 provides no remote-image approval action.
+PST processing creates a local workspace containing extracted message copies and a searchable SQLite index. These workspaces may contain sensitive mail data and persist after the app is closed. HTML is sanitized before display, and remote message resources are blocked. Remote-image approval remains unavailable in beta.5.
 
 Attachments are exported to a separate local file before Open is requested. Exporting does not scan or establish trust in an attachment. See [Privacy and local data](docs/PRIVACY.md) for storage locations, retention, and removal guidance.
 
@@ -116,6 +120,8 @@ The packaged beta includes ReadPST; Homebrew is not required to open PST files w
 
 - The current beta is unsigned and unnotarized. First launch may require explicit per-app approval from macOS.
 - This is beta-quality software and may contain defects or incomplete workflows.
+- EML files above 256 MiB retain a limited preview and available searchable headers. Their full bodies and individual attachments are not parsed or indexed; export the complete EML with Save Source As. MSG parsing limits are unchanged.
+- The existing development-only Browserslist advisory [GHSA-73wf-gq98-2v4g](https://github.com/advisories/GHSA-73wf-gq98-2v4g) remains unresolved in the source lockfile; dependency resolutions are unchanged.
 - The cause of historical duplicated imports remains unproven. Verify checks internal workspace consistency, not Outlook or Exchange parity; retain the original PST.
 - Finder drag-and-drop, packaged synthetic MSG smoke, and clean Intel/Apple Silicon testing remain incomplete.
 - Message rendering prioritizes readable plain text and sanitized HTML. Outlook HTML, Word/RTF layouts, calendar data, and uncommon MAPI properties may be simplified or incomplete.
@@ -167,7 +173,7 @@ PST QuickView's original source code and application artwork are licensed under 
 See the [copyright notice](COPYRIGHT.md), [third-party notices](THIRD_PARTY_NOTICES.md), included [license texts](LICENSES/), and [ReadPST Corresponding Source documentation](docs/READPST_CORRESPONDING_SOURCE.md) for details.
 
 Every distributed DMG must provide equivalent access to the exact Corresponding Source used for its bundled ReadPST binary; an upstream URL alone is not sufficient.
-The `v0.2.0-beta.4` testing prerelease is prepared with the DMG, verified ReadPST Corresponding Source archive, and `SHA256SUMS.txt` for delivery together. The published `v0.2.0-beta.3` release and its assets remain available unchanged.
+The `v0.2.0-beta.5` testing prerelease must deliver its DMG, matching verified ReadPST Corresponding Source archive, and `SHA256SUMS.txt` together. The published `v0.2.0-beta.4` and `v0.2.0-beta.3` releases and their assets remain unchanged.
 
 ---
 

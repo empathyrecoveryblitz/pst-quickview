@@ -3,8 +3,9 @@
 PST QuickView `0.2.0-beta.3` is a published, unsigned public beta. Do not claim it is signed or notarized
 until every verification step below succeeds.
 
-PST QuickView `0.2.0-beta.4` is an unsigned, unnotarized testing prerelease prepared for
-publication, and the same prohibition on signing claims applies.
+PST QuickView `0.2.0-beta.4` is a published unsigned and unnotarized testing prerelease.
+PST QuickView `0.2.0-beta.5` is prepared for publication with the same unsigned and unnotarized
+status. The same prohibition on signing claims applies.
 
 Apple references:
 
@@ -35,7 +36,7 @@ Example paths:
 
 ```sh
 APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app"
-DMG="src-tauri/target/universal-apple-darwin/release/bundle/dmg/PST QuickView_0.2.0-beta.4_universal.dmg"
+DMG="src-tauri/target/universal-apple-darwin/release/bundle/dmg/PST QuickView_0.2.0-beta.5_universal.dmg"
 IDENTITY="Developer ID Application: Example Company (TEAMID)"
 ```
 

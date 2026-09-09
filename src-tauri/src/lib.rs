@@ -58,9 +58,10 @@ mod threading;
 
 use calendar_msg::CalendarItemDetails;
 use message_security::{
-    open_bounded_message_file, read_bounded_message_source, validate_mime_preflight,
-    validate_outlook_message, validate_parsed_mail, validate_rendered_message_text,
-    MAX_MESSAGE_SOURCE_BYTES, MAX_MESSAGE_TEXT_BYTES,
+    open_bounded_message_file, open_regular_message_file, read_bounded_message_headers,
+    read_bounded_message_source, validate_mime_preflight, validate_outlook_message,
+    validate_parsed_mail, validate_rendered_message_text, MAX_MESSAGE_SOURCE_BYTES,
+    MAX_MESSAGE_TEXT_BYTES, MAX_TRANSPORT_HEADERS_BYTES,
 };
 use runtime_profile::{
     RuntimeProfile, RuntimeProfileIdentity, RuntimeProfilePaths, RuntimeProfileState,
@@ -158,7 +159,6 @@ const READPST_OUTPUT_SCAN_INTERVAL: Duration = Duration::from_secs(15);
 const READPST_ACTIVITY_EMIT_INTERVAL: Duration = Duration::from_secs(1);
 const READPST_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(48 * 60 * 60);
 const MAX_READPST_EXTRACTED_ENTRIES: u64 = 2_000_000;
-const MAX_READPST_EXTRACTED_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const READPST_OUTPUT_OVERHEAD_BYTES: u64 = 1024 * 1024 * 1024;
 const READPST_OUTPUT_SIZE_RATIO: u64 = 8;
 const READPST_X86_64_SHA256: &str =
@@ -1341,6 +1341,7 @@ enum BodySource {
     #[default]
     Missing,
     ParseError,
+    LargeMessageHeaders,
 }
 
 impl BodySource {
@@ -1352,6 +1353,7 @@ impl BodySource {
             Self::RtfHtmlConverted => "rtf_html_converted",
             Self::Missing => "missing",
             Self::ParseError => "parse_error",
+            Self::LargeMessageHeaders => "large_message_headers",
         }
     }
 }
@@ -4271,9 +4273,18 @@ fn get_message_diagnostics(
     let mut remote_images_detected = html_has_remote_images(&body_html);
     let mut cid_images_detected = html_has_cid_images(&body_html);
 
-    let bytes = read_bounded_message_source(&source.source_path)?;
-    match parse_mail_bytes(&bytes) {
-        Ok(parsed_mail) => match parse_eml(&source.source_path) {
+    let bytes = if open_regular_message_file(&source.source_path)?
+        .metadata()?
+        .len()
+        > MAX_MESSAGE_SOURCE_BYTES
+    {
+        None
+    } else {
+        Some(read_bounded_message_source(&source.source_path)?)
+    };
+    match bytes.as_deref().map(parse_mail_bytes) {
+        None => parse_warnings.push(LARGE_MESSAGE_PREVIEW_NOTE.to_string()),
+        Some(Ok(parsed_mail)) => match parse_eml(&source.source_path) {
             Ok(parsed_message) => {
                 if parsed_message.body_source.as_str() != body_source {
                     parse_warnings.push(format!(
@@ -4327,7 +4338,7 @@ fn get_message_diagnostics(
                     .map(describe_mime_part);
             }
         },
-        Err(error) => {
+        Some(Err(error)) => {
             parse_warnings.push(format!("Source EML MIME parse failed: {error}"));
         }
     }
@@ -4534,15 +4545,38 @@ fn standalone_message_from_path(source_path: &Path) -> AppResult<StandaloneMessa
 }
 
 fn standalone_eml_message(source_path: &Path) -> AppResult<StandaloneMessage> {
-    let bytes = read_bounded_message_source(source_path)?;
-    let raw_source = String::from_utf8_lossy(&bytes).to_string();
-    let parsed = parse_eml(source_path)?;
+    let limited_preview =
+        open_regular_message_file(source_path)?.metadata()?.len() > MAX_MESSAGE_SOURCE_BYTES;
+    let bytes = if limited_preview {
+        Vec::new()
+    } else {
+        read_bounded_message_source(source_path)?
+    };
+    let raw_source = if limited_preview {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+    let parsed = if limited_preview {
+        read_large_eml_preview(source_path)?
+    } else {
+        parse_eml_bytes(&bytes)?
+    };
     let attachments = parsed
         .attachments
         .iter()
         .map(attachment_from_draft)
         .collect();
-    let cid_images = load_cid_images_from_eml_path(source_path).unwrap_or_default();
+    let cid_images = if limited_preview {
+        HashMap::new()
+    } else {
+        load_cid_images_from_eml_path(source_path).unwrap_or_default()
+    };
+    let parse_warnings = if limited_preview {
+        vec![parsed.thread_warning.clone()]
+    } else {
+        Vec::new()
+    };
 
     Ok(StandaloneMessage {
         source_format: StandaloneSourceFormat::Eml,
@@ -4559,8 +4593,8 @@ fn standalone_eml_message(source_path: &Path) -> AppResult<StandaloneMessage> {
         attachments,
         cid_images,
         raw_source,
-        raw_source_available: true,
-        parse_warnings: Vec::new(),
+        raw_source_available: !limited_preview,
+        parse_warnings,
         inline_resources: Vec::new(),
         message_id_header: parsed.message_id_header_raw,
         in_reply_to: parsed.in_reply_to_raw,
@@ -11530,11 +11564,9 @@ where
             ));
         }
         snapshot.files = snapshot.files.saturating_add(1);
-        if metadata.len() > MAX_READPST_EXTRACTED_FILE_BYTES {
-            return Err(AppError::new(
-                "A ReadPST output file exceeded the per-file safety limit.",
-            ));
-        }
+        // Disk output is bounded by the source-size-scaled total below. A large
+        // individual record is streamed during discovery and kept with limited
+        // preview instead of rejecting an otherwise valid large archive.
         snapshot.total_bytes = snapshot.total_bytes.saturating_add(metadata.len());
         if snapshot.total_bytes > max_total_bytes {
             return Err(AppError::new(
@@ -13731,57 +13763,96 @@ fn snapshot_eml_candidate_with_progress<F>(
 where
     F: FnMut() -> AppResult<()>,
 {
-    let (_, identity) = read_eml_candidate_snapshot_with_progress(path, |_| on_progress())?;
+    let (_, identity) = stream_eml_candidate_snapshot(path, false, |_| on_progress())?;
     Ok(identity)
-}
-
-fn read_eml_candidate_snapshot(path: &Path) -> AppResult<(Vec<u8>, FileIdentity)> {
-    read_eml_candidate_snapshot_with_progress(path, |_| Ok(()))
 }
 
 fn read_eml_candidate_snapshot_with_progress<F>(
     path: &Path,
+    on_progress: F,
+) -> AppResult<(Vec<u8>, FileIdentity)>
+where
+    F: FnMut(u64) -> AppResult<()>,
+{
+    stream_eml_candidate_snapshot(path, true, on_progress)
+}
+
+// All identity hashes cover the complete file. Discovery/verification retain no
+// content; indexing retains a bounded full message or only its top-level headers.
+fn stream_eml_candidate_snapshot<F>(
+    path: &Path,
+    capture_content: bool,
     mut on_progress: F,
 ) -> AppResult<(Vec<u8>, FileIdentity)>
 where
     F: FnMut(u64) -> AppResult<()>,
 {
-    let mut file = open_bounded_message_file(path)?;
+    let mut file = open_regular_message_file(path)?;
     let before = file.metadata()?;
-    let mut bytes = Vec::with_capacity((before.len() as usize).min(1024 * 1024));
+    if before.len() >= DISCOVERY_HASH_PROGRESS_BYTES {
+        on_progress(0)?;
+    }
+    let full_content = before.len() <= MAX_MESSAGE_SOURCE_BYTES;
+    let capture_limit = if !capture_content {
+        0
+    } else if full_content {
+        MAX_MESSAGE_SOURCE_BYTES as usize
+    } else {
+        MAX_TRANSPORT_HEADERS_BYTES
+    };
+    let mut bytes = Vec::with_capacity(capture_limit.min(1024 * 1024));
+    let mut headers_complete = false;
+    let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
+    let mut total_read = 0_u64;
     let mut next_progress_bytes = DISCOVERY_HASH_PROGRESS_BYTES;
     loop {
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        let next_len = (bytes.len() as u64)
+        total_read = total_read
             .checked_add(bytes_read as u64)
-            .ok_or_else(|| AppError::new("An extracted EML candidate exceeds the safety limit."))?;
-        if next_len > MAX_MESSAGE_SOURCE_BYTES {
+            .ok_or_else(|| AppError::new("An extracted EML candidate changed during discovery."))?;
+        if total_read > before.len() {
             return Err(AppError::new(
-                "An extracted EML candidate exceeds the safety limit.",
+                "An extracted EML candidate changed during discovery; indexing was refused.",
             ));
         }
-        bytes.extend_from_slice(&buffer[..bytes_read]);
-        if next_len >= next_progress_bytes {
-            on_progress(next_len)?;
-            next_progress_bytes = next_progress_bytes.saturating_add(DISCOVERY_HASH_PROGRESS_BYTES);
+        hasher.update(&buffer[..bytes_read]);
+        if !headers_complete && bytes.len() < capture_limit {
+            let previous_len = bytes.len();
+            let retained = bytes_read.min(capture_limit - previous_len);
+            bytes.extend_from_slice(&buffer[..retained]);
+            if !full_content {
+                if let Some(end) = eml_header_end(&bytes, previous_len.saturating_sub(3)) {
+                    bytes.truncate(end);
+                    headers_complete = true;
+                }
+            }
+        }
+        if total_read >= next_progress_bytes {
+            on_progress(total_read)?;
+            next_progress_bytes = total_read.saturating_add(DISCOVERY_HASH_PROGRESS_BYTES);
         }
     }
     let after = file.metadata()?;
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.nlink() != 1
-        || after.nlink() != 1
-        || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
+    let current = fs::symlink_metadata(path)?;
+    if total_read != before.len()
+        || !same_eml_snapshot_metadata(&before, &after)
+        || !same_eml_snapshot_metadata(&after, &current)
     {
         return Err(AppError::new(
             "An extracted EML candidate changed during discovery; indexing was refused.",
         ));
+    }
+    if total_read >= DISCOVERY_HASH_PROGRESS_BYTES {
+        on_progress(total_read)?;
+    }
+    if capture_content && !full_content && !headers_complete {
+        // Keep the canonical row even when large-message headers are malformed
+        // or exceed the bounded header parser budget. No source is discarded.
+        bytes.clear();
     }
     let identity = FileIdentity {
         device: before.dev(),
@@ -13789,9 +13860,42 @@ where
         size: before.len(),
         modified_seconds: before.mtime(),
         modified_nanoseconds: before.mtime_nsec(),
-        sha256: hex::encode(Sha256::digest(&bytes)),
+        sha256: hex::encode(hasher.finalize()),
     };
     Ok((bytes, identity))
+}
+
+fn same_eml_snapshot_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.is_file()
+        && after.is_file()
+        && !after.file_type().is_symlink()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.nlink() == 1
+        && after.nlink() == 1
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+fn eml_header_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.starts_with(b"\n") {
+        return Some(1);
+    }
+    if bytes.starts_with(b"\r\n") {
+        return Some(2);
+    }
+    (start..bytes.len()).find_map(|index| {
+        if bytes[index..].starts_with(b"\n\r\n") {
+            Some(index + 3)
+        } else if bytes[index..].starts_with(b"\n\n") {
+            Some(index + 2)
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]
@@ -14158,8 +14262,19 @@ where
         if existing_message_id(&transaction, &relative_path)?.is_some() {
             stats.skipped_existing = stats.skipped_existing.saturating_add(1);
         } else {
-            let bytes = read_discovered_eml_candidate(candidate)?;
-            let parsed = match parse_eml_bytes(&bytes) {
+            let bytes = read_discovered_eml_candidate(candidate, || {
+                if is_cancelled(&stats) {
+                    return Err(import_cancelled_error(cancel_message));
+                }
+                on_progress(&stats);
+                Ok(())
+            })?;
+            let parsed_result = if candidate.identity.size > MAX_MESSAGE_SOURCE_BYTES {
+                Ok(parse_large_eml_headers(&bytes))
+            } else {
+                parse_eml_bytes(&bytes)
+            };
+            let parsed = match parsed_result {
                 Ok(parsed) => parsed,
                 Err(_) => {
                     stats.error_count = stats.error_count.saturating_add(1);
@@ -16128,18 +16243,101 @@ fn thread_timestamp(value: &str) -> Option<i64> {
 }
 
 fn parse_eml(path: &Path) -> AppResult<ParsedMessage> {
+    if open_regular_message_file(path)?.metadata()?.len() > MAX_MESSAGE_SOURCE_BYTES {
+        return read_large_eml_preview(path);
+    }
     let bytes = read_bounded_message_source(path)?;
     parse_eml_bytes(&bytes)
 }
 
-fn read_discovered_eml_candidate(candidate: &EmlCandidate) -> AppResult<Vec<u8>> {
-    let (bytes, identity) = read_eml_candidate_snapshot(&candidate.path)?;
+fn read_discovered_eml_candidate<F>(
+    candidate: &EmlCandidate,
+    mut on_progress: F,
+) -> AppResult<Vec<u8>>
+where
+    F: FnMut() -> AppResult<()>,
+{
+    let (bytes, identity) =
+        read_eml_candidate_snapshot_with_progress(&candidate.path, |_| on_progress())?;
     if identity != candidate.identity {
         return Err(AppError::new(
             "An extracted EML candidate changed while it was read; indexing was refused.",
         ));
     }
     Ok(bytes)
+}
+
+const LARGE_MESSAGE_PREVIEW_NOTE: &str = "Large message: only headers are indexed and shown. \
+Body text and individual attachments were not parsed because this message exceeds the \
+full-preview memory budget. Use Save Source As to export the complete original EML, \
+including all attachments. The message has not been deleted or suppressed.";
+
+fn read_large_eml_preview(path: &Path) -> AppResult<ParsedMessage> {
+    let expected = open_regular_message_file(path)?.metadata()?;
+    let headers = match read_bounded_message_headers(path) {
+        Ok(headers) => headers,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let current = fs::symlink_metadata(path)?;
+    if !same_eml_snapshot_metadata(&expected, &current) {
+        return Err(AppError::new(
+            "Message source changed while its headers were read.",
+        ));
+    }
+    Ok(parse_large_eml_headers(&headers))
+}
+
+fn parse_large_eml_headers(bytes: &[u8]) -> ParsedMessage {
+    let headers = if !bytes.is_empty() && validate_mime_preflight(bytes).is_ok() {
+        mailparse::parse_headers(bytes)
+            .ok()
+            .map(|(headers, _)| headers)
+    } else {
+        None
+    };
+    let mut warning = LARGE_MESSAGE_PREVIEW_NOTE.to_string();
+    if headers.is_none() {
+        warning.push_str(" Headers could not be read within the header parsing budget.");
+    }
+    let value = |name: &str| {
+        headers
+            .as_ref()
+            .and_then(|headers| headers.get_first_value(name))
+            .unwrap_or_default()
+    };
+    let subject = value("Subject");
+    let message_id_header_raw = value("Message-ID");
+    let in_reply_to_raw = value("In-Reply-To");
+    let references_header_raw = value("References");
+    ParsedMessage {
+        normalized_subject: normalize_thread_subject(&subject),
+        subject,
+        sender: value("From"),
+        recipients: ["To", "Cc", "Bcc"]
+            .iter()
+            .map(|name| value(name))
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("; "),
+        date: normalized_date(&value("Date")),
+        body: warning.clone(),
+        body_source: BodySource::LargeMessageHeaders,
+        message_id_header: extract_message_ids(&message_id_header_raw)
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+        in_reply_to: extract_message_ids(&in_reply_to_raw)
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+        references_header: extract_message_ids(&references_header_raw).join("\n"),
+        message_id_header_raw,
+        in_reply_to_raw,
+        references_header_raw,
+        thread_warning: warning,
+        ..ParsedMessage::default()
+    }
 }
 
 fn parse_eml_bytes(bytes: &[u8]) -> AppResult<ParsedMessage> {
@@ -24437,6 +24635,36 @@ mod tests {
     }
 
     #[test]
+    fn large_message_header_capture_matches_line_ending_variants() {
+        for header in [
+            "Subject: synthetic\r\n\r\n",
+            "Subject: synthetic\n\n",
+            "Subject: synthetic\n\r\n",
+            "Subject: synthetic\r\n\n",
+            "\r\n",
+            "\n",
+        ] {
+            let source = format!("{header}body must not be retained");
+            assert_eq!(eml_header_end(source.as_bytes(), 0), Some(header.len()));
+            if header.len() > 3 {
+                assert_eq!(
+                    eml_header_end(source.as_bytes(), header.len() - 3),
+                    Some(header.len())
+                );
+            }
+        }
+        let parsed =
+            parse_large_eml_headers(b"Subject: synthetic\r\nFrom: fixture@example.invalid\r\n\r\n");
+        assert_eq!(parsed.subject, "synthetic");
+        assert_eq!(parsed.sender, "fixture@example.invalid");
+        assert_eq!(parsed.body_source, BodySource::LargeMessageHeaders);
+        assert!(parsed.attachments.is_empty());
+        let unavailable = parse_large_eml_headers(&[]);
+        assert!(unavailable.body.contains("Headers could not be read"));
+        assert_eq!(unavailable.body_source, BodySource::LargeMessageHeaders);
+    }
+
+    #[test]
     fn readpst_output_capture_is_bounded_while_fully_drained() {
         let bytes = (0..1024 * 1024)
             .map(|index| (index % 251) as u8)
@@ -24575,9 +24803,12 @@ mod tests {
         let oversized = output.join("oversized.eml");
         File::create(&oversized)
             .unwrap()
-            .set_len(MAX_READPST_EXTRACTED_FILE_BYTES + 1)
+            .set_len(512 * 1024 * 1024 + 1)
             .unwrap();
-        assert!(inspect_readpst_output(&output, u64::MAX).is_err());
+        assert!(
+            inspect_readpst_output(&output, readpst_output_byte_limit(1024 * 1024 * 1024)).is_ok()
+        );
+        assert!(inspect_readpst_output(&output, 512 * 1024 * 1024).is_err());
         fs::remove_file(&oversized).unwrap();
         fs::remove_dir_all(workspace).unwrap();
     }

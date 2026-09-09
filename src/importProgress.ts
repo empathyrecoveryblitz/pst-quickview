@@ -1068,15 +1068,19 @@ export function terminalImportPresentation(
             ),
     };
   }
+  const interruptedStage = `at the "${stageLabel(snapshot.stage)}" stage`;
+  const verificationOutcome = snapshot.stage === "verifying"
+    ? "it did not pass internal verification"
+    : "internal verification was not completed";
   if (snapshot.status === "incomplete") {
     return {
       kind: "incomplete",
       headline: `${operation} incomplete for ${name}.`,
       detail:
         priorTimingUnavailable && !usesCurrentOperationTimer
-          ? `Import stopped incomplete. Recorded active time: ${duration}. Earlier active timing was not recorded; it did not pass internal verification.`
+          ? `Import stopped incomplete ${interruptedStage}. Recorded active time: ${duration}. Earlier active timing was not recorded; ${verificationOutcome}.`
           : appendPriorImportTimingWarning(
-              `${operation} stopped incomplete after ${duration}; it did not pass internal verification.`,
+              `${operation} stopped incomplete after ${duration} ${interruptedStage}; ${verificationOutcome}.`,
             ),
     };
   }
@@ -1085,9 +1089,9 @@ export function terminalImportPresentation(
     headline: `${operation} failed for ${name}.`,
     detail:
       priorTimingUnavailable && !usesCurrentOperationTimer
-        ? `Import failed. Recorded active time: ${duration}. Earlier active timing was not recorded; it did not pass internal verification.`
+        ? `Import failed ${interruptedStage}. Recorded active time: ${duration}. Earlier active timing was not recorded; ${verificationOutcome}.`
         : appendPriorImportTimingWarning(
-            `${operation} failed after ${duration}; it did not pass internal verification.`,
+            `${operation} failed after ${duration} ${interruptedStage}; ${verificationOutcome}.`,
           ),
   };
 }
