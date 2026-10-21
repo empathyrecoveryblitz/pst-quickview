@@ -24,7 +24,7 @@ test('update assets use a dedicated directory, exact API-first routing and no HT
 
 test('public asset allowlist rejects source, credentials, API shadows and unexpected download paths', t => {
   const samples = [
-    ['updates/development.json', true], ['updates/artifacts/0.2.0-beta.3.support.2/' + 'a'.repeat(64) + '.app.tar.gz', true], ['_headers', true],
+    ['updates/development.json', true], ['updates/artifacts/0.2.0-beta.3.support.2/' + 'a'.repeat(64) + '.app.tar.gz', true], ['_headers', false],
     ['.gitignore', false], ['.assetsignore', false], ['index.html', false], ['404.html', false], ['_redirects', false],
     ['v3/admin/queue', false], ['v3/requests', false], ['updates/operator.json', false], ['operator.json', false],
     ['updates/artifacts/identity.key', false], ['updates/artifacts/version/archive.pst', false], ['updates/artifacts/version/archive.app.zip', false],
@@ -48,6 +48,8 @@ test('staging placeholders cannot commit software payloads and manifest caching 
   assert.deepEqual(readdirSync(directory).sort(), ['.assetsignore', '.gitignore', '_headers']);
   const ignored = readFileSync(new URL('.gitignore', directory), 'utf8');
   assert.equal(ignored, '*\n!.gitignore\n!.assetsignore\n!_headers\n');
+  assert.equal(lstatSync(new URL('_headers', directory)).isFile(), true);
+  assert.doesNotMatch(readFileSync(new URL('.assetsignore', directory), 'utf8'), /^!_headers\s*$/m);
   const headers = readFileSync(new URL('_headers', directory), 'utf8');
   assert.match(headers, /^\/updates\/development\.json\n  Cache-Control: no-store\n/m);
   assert.match(headers, /^\/updates\/artifacts\/\*\n  Cache-Control: public, max-age=31536000, immutable, no-transform\n/m);

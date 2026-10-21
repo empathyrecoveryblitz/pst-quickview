@@ -142,8 +142,10 @@ only reviewed `.gitignore`, `.assetsignore`, and `_headers` control files; no
 manifest or archive is checked in. `.gitignore` prevents software payloads from
 being committed. `.assetsignore` excludes everything except
 `/updates/development.json`, reviewed immutable archives under
-`/updates/artifacts/<version>/<sha256>.app.tar.gz`, and the `_headers` rules
-which Cloudflare parses rather than serves. A path allowlist is not signature
+`/updates/artifacts/<version>/<sha256>.app.tar.gz`. Keep the physical `_headers`
+control file present and Git-tracked, but excluded from asset eligibility;
+Cloudflare parses its rules, and `/_headers` must return 404. Do not add an
+`!_headers` exception to `.assetsignore`. A path allowlist is not signature
 verification: every staged archive still needs the artifact/source gates.
 
 An authorized deployment may use Wrangler's documented `--assets` directory

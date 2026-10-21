@@ -4,4 +4,3 @@
 !updates/artifacts/
 !updates/artifacts/*/
 !updates/artifacts/*/*.app.tar.gz
-!_headers
