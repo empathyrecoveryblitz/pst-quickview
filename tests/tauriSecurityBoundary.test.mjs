@@ -88,6 +88,10 @@ function parseCsp(csp) {
 
 const supportFallbackCsp = "default-src 'none'; script-src 'self'; style-src 'self'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'; media-src 'none'; base-uri 'none'; form-action 'none'";
 const supportConnectPrefix = "connect-src ipc: http://ipc.localhost ";
+const standardCspHeaderTable = "content-rangecontent-security-policycontent-security-policy-report-onlycontent-type";
+function packagedHeaderInventory() {
+  return "Content-Security-Policy\0".repeat(2) + `${standardCspHeaderTable}\0`.repeat(5);
+}
 function supportLiteralInventory(arch = "arm64") {
   return `\0Content-Security-Policy${supportFallbackCsp}Cache-Control\0${arch === "x86_64" ? "\0" : "tauri"}${supportConnectPrefix}; \0`;
 }
@@ -623,10 +627,7 @@ test("packaged CSP inventory rejects missing, duplicate, and unreviewed policies
     "default-src 'none'; img-src data:; style-src 'unsafe-inline'; " +
     "object-src 'none'; base-uri 'none'; form-action 'none'; " +
     "frame-src 'none'; connect-src 'none'";
-  const headers =
-    "Content-Security-Policy\0Content-Security-Policy\0" +
-    "content-security-policy\0content-security-policy\0" +
-    "content-security-policy\0content-security-policy\0";
+  const headers = packagedHeaderInventory();
   const exact = Buffer.from(`${headers}${productionCsp}\0${printableCsp}${supportLiteralInventory()}`);
 
   assert.equal(verifySyntheticPackagedCsp(exact).status, 0);
@@ -661,10 +662,7 @@ test("packaged CSP boundary retains only reviewed source prefixes for alternate 
     "default-src 'none'; img-src data:; style-src 'unsafe-inline'; " +
     "object-src 'none'; base-uri 'none'; form-action 'none'; " +
     "frame-src 'none'; connect-src 'none'";
-  const headers =
-    "Content-Security-Policy\0Content-Security-Policy\0" +
-    "content-security-policy\0content-security-policy\0" +
-    "content-security-policy\0content-security-policy\0";
+  const headers = packagedHeaderInventory();
   const reviewedPrefix = "PST QuickView";
   const observedAlternateSlice = Buffer.from(
     `${headers}${reviewedPrefix}${productionCsp}\0${printableCsp}${supportLiteralInventory("x86_64")}`,
@@ -698,10 +696,53 @@ test("packaged CSP boundary retains only reviewed source prefixes for alternate 
   );
 });
 
+test("packaged HTTP inventory requires five exact source-proven normal and Report-Only table pairs", () => {
+  const productionCsp = tauriConfig.app.security.csp;
+  const printableCsp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'";
+  assert.equal(Buffer.byteLength(standardCspHeaderTable), 83);
+  assert.equal(createHash("sha256").update(standardCspHeaderTable).digest("hex"), "6fc4a503143b28a476a0b23ee4bfb457d4f35830dec1f62d0f67f9dd902c6cf0");
+  for (const arch of ["x86_64", "arm64"]) {
+    const exact = `${packagedHeaderInventory()}${productionCsp}\0${printableCsp}${supportLiteralInventory(arch)}`;
+    assert.equal(verifySyntheticPackagedCsp(Buffer.from(exact), arch).status, 0);
+    for (const rejected of [
+      exact.replace("content-security-policy", ""),
+      `${exact}\0content-security-policy`,
+      `${exact}\0content-security-policy-report-only`,
+      exact.replace("content-range", "content-rangx"),
+      exact.replace("content-type", "content-typx"),
+      exact.replace("content-security-policycontent-security-policy-report-only", "content-security-policy\0content-security-policy-report-only"),
+      exact.replace("content-security-policy-report-only", "content-security-policy-report-onlx"),
+      exact.replace(standardCspHeaderTable, "content-security-policy\0content-security-policy-report-only"),
+      exact.replace(standardCspHeaderTable, "content-rangecontent-security-policy-report-onlycontent-security-policycontent-type"),
+      exact.replace(`${standardCspHeaderTable}\0`, ""),
+      `${exact}\0${standardCspHeaderTable}`,
+    ]) assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(rejected), arch).status, 0);
+  }
+});
+
+test("production CSP accepts only the exact source-proven arm64 bundle identifier neighbor", () => {
+  const productionCsp = tauriConfig.app.security.csp;
+  const printableCsp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'";
+  const prefix = "com.local.pstquickview";
+  assert.equal(Buffer.byteLength(prefix), 22);
+  assert.equal(createHash("sha256").update(prefix).digest("hex"), "00765e22acd4368132a054ae281c8ca943b4d58a6f12d1643806502ea30613e2");
+  assert.match(readFileSync(new URL("../src-tauri/src/runtime_profile.rs", import.meta.url), "utf8"), /PRODUCTION_BUNDLE_IDENTIFIER: &str = "com\.local\.pstquickview";/);
+  const exact = `${packagedHeaderInventory()}${prefix}${productionCsp}\0${printableCsp}${supportLiteralInventory("arm64")}`;
+  assert.equal(verifySyntheticPackagedCsp(Buffer.from(exact), "arm64").status, 0);
+  const x86 = exact.replace(supportLiteralInventory("arm64"), supportLiteralInventory("x86_64"));
+  assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(x86), "x86_64").status, 0);
+  for (const unreviewed of ["com.local.pstquickviex", `${prefix}/`, `${prefix} `, `${prefix};`, "unknown-printable-prefix"]) {
+    assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(exact.replace(prefix, unreviewed)), "arm64").status, 0);
+  }
+  for (const suffix of ["; script-src https:", " https:", "; future-directive value"]) {
+    assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(exact.replace(productionCsp, `${productionCsp}${suffix}`)), "arm64").status, 0);
+  }
+});
+
 test("packaged support inventory pins exact literals, architecture neighbors, and token coverage", () => {
   const productionCsp = tauriConfig.app.security.csp;
   const printableCsp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'";
-  const headers = "Content-Security-Policy\0".repeat(2) + "content-security-policy\0".repeat(4);
+  const headers = packagedHeaderInventory();
   for (const arch of ["x86_64", "arm64"]) {
     const exact = `${headers}${productionCsp}\0${printableCsp}${supportLiteralInventory(arch)}`;
     assert.equal(verifySyntheticPackagedCsp(Buffer.from(exact), arch).status, 0);

@@ -37,10 +37,20 @@ SUPPORT_CONNECT_BEFORE = {"x86_64": (b"\x00",), "arm64": (b"tauri", b"\x00")}
 SUPPORT_CONNECT_AFTER = b"; "
 CONNECT_TOKEN_PATTERN = re.compile(rb"connect-src", re.IGNORECASE)
 CSP_HEADER = b"Content-Security-Policy"
+# These four consecutive standard-header literals come from the checksum-pinned
+# http 1.4.2 src/header/name.rs, not an active WebView policy. The approved
+# updater build emits five exact copies in each slice (the earlier build had
+# two). Each contains one normal name and one Report-Only name; the substring
+# inventory below counts both. Bare lowercase names never substitute for a table.
+STANDARD_CSP_HEADER_TABLE = (
+    b"content-rangecontent-security-policy"
+    b"content-security-policy-report-onlycontent-type"
+)
+EXPECTED_STANDARD_CSP_HEADER_TABLE_COPIES = 5
 EXPECTED_CSP_HEADER_INVENTORY = Counter(
     {
         b"Content-Security-Policy": 3,
-        b"content-security-policy": 4,
+        b"content-security-policy": 10,
     }
 )
 CSP_HEADER_PATTERN = re.compile(re.escape(CSP_HEADER), re.IGNORECASE)
@@ -51,7 +61,9 @@ CSP_HEADER_PATTERN = re.compile(re.escape(CSP_HEADER), re.IGNORECASE)
 # identity is verified separately. Any other printable prefix fails closed.
 REVIEWED_PACKED_PREFIXES = {
     "x86_64": (b"PST QuickView",),
-    "arm64": (b"index.html", b"PST QuickView"),
+    # Exact PRODUCTION_BUNDLE_IDENTIFIER from runtime_profile.rs, observed
+    # immediately before the production policy only in the updater arm64 slice.
+    "arm64": (b"index.html", b"PST QuickView", b"com.local.pstquickview"),
 }
 CSP_DIRECTIVES = (
     b"base-uri",
@@ -161,12 +173,23 @@ def verify_slice(
             )
         inventory_ranges.append((start, end))
 
-    header_inventory = Counter(
-        match.group() for match in CSP_HEADER_PATTERN.finditer(binary)
-    )
+    header_matches = list(CSP_HEADER_PATTERN.finditer(binary))
+    header_inventory = Counter(match.group() for match in header_matches)
     if header_inventory != EXPECTED_CSP_HEADER_INVENTORY:
         raise VerificationError(
             f"packaged {arch} executable contains an unexpected CSP header inventory"
+        )
+    standard_header_ranges = [
+        (match.start(), match.end())
+        for match in re.finditer(re.escape(STANDARD_CSP_HEADER_TABLE), binary)
+    ]
+    if len(standard_header_ranges) != EXPECTED_STANDARD_CSP_HEADER_TABLE_COPIES or any(
+        match.group() == b"content-security-policy"
+        and not any(start <= match.start() and match.end() <= end for start, end in standard_header_ranges)
+        for match in header_matches
+    ):
+        raise VerificationError(
+            f"packaged {arch} executable contains an unexpected CSP standard-header table inventory"
         )
 
     connect_tokens = list(CONNECT_TOKEN_PATTERN.finditer(binary))

@@ -10,7 +10,8 @@ const config = readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.
 const support = readFileSync(new URL("../src-tauri/src/support_session.rs", import.meta.url), "utf8");
 const production = JSON.parse(config).app.security.csp;
 const printable = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'";
-const headers = "Content-Security-Policy\0Content-Security-Policy\0" + "content-security-policy\0".repeat(4);
+const standardCspHeaderTable = "content-rangecontent-security-policycontent-security-policy-report-onlycontent-type";
+const headers = "Content-Security-Policy\0Content-Security-Policy\0" + `${standardCspHeaderTable}\0`.repeat(5);
 const legacyBaseline = `${headers}${production}\0${printable}`;
 const fallback = "default-src 'none'; script-src 'self'; style-src 'self'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'; media-src 'none'; base-uri 'none'; form-action 'none'";
 const runtimePrefix = "connect-src ipc: http://ipc.localhost ";
@@ -59,7 +60,7 @@ test("CSP inspection reports counts and boundaries while retaining the existing 
   assert.equal(status, 0);
   assert.deepEqual(report.existingVerifier, { passed: true, failureCategory: "none" });
   assert.equal(report.headerSpellings.canonical, 3);
-  assert.equal(report.headerSpellings.lowercase, 4);
+  assert.equal(report.headerSpellings.lowercase, 10);
   assert.equal(report.sourceLiteralObservations.production.occurrences, 1);
   assert.equal(report.sourceLiteralObservations.support_fallback.occurrences, 1);
   assert.deepEqual(report.outsideKnownLiteralDirectiveHistogram, {});
