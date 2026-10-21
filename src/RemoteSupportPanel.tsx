@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SUPPORT_SESSION_CHANGED, type SupportSession } from "./RemoteSupportControl";
 
-export function RemoteSupportPanel() {
+export function RemoteSupportPanel({ onApproved }: { onApproved: () => void }) {
   const [invitation, setInvitation] = useState("");
   const [approved, setApproved] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -13,9 +13,11 @@ export function RemoteSupportPanel() {
     pending.current = true; setBusy(true); setStatus("");
     try {
       const session = await invoke<SupportSession>("start_support_session", { invitation: invitation.trim() });
-      if (!session || !/^[a-f0-9]{32}$/.test(session.sessionId) || session.expiresAt <= Date.now()) throw Error();
+      if (!session || typeof session.sessionId !== "string" || !/^[a-f0-9]{32}$/.test(session.sessionId) || !Number.isSafeInteger(session.expiresAt)
+        || session.expiresAt <= Date.now() || session.expiresAt > Date.now() + 30 * 60 * 1000) throw Error();
       setInvitation(""); setApproved(false); window.dispatchEvent(new Event(SUPPORT_SESSION_CHANGED));
       setStatus("Session approved. Connecting in the support window; connection is not verified until it says Connected. Stop support remains available in the main window.");
+      onApproved();
     } catch { setStatus("Could not start support. Ask your technician for a fresh invitation, or stop the existing session before trying again. No remote access was verified."); }
     finally { pending.current = false; setBusy(false); }
   }

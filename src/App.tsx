@@ -3479,6 +3479,13 @@ function App() {
     closeActivePopover();
   }
 
+  function finishSupportApproval() {
+    clearHelpState();
+    setOpenPopoverId((current) =>
+      closeOpenPopover(current, "help") as CustomPopoverId | null,
+    );
+  }
+
   async function copyDisplayedError(message: string) {
     try {
       await navigator.clipboard.writeText(message);
@@ -10445,7 +10452,7 @@ function App() {
               Close
             </button>
           </header>
-          <RemoteSupportPanel />
+          <RemoteSupportPanel onApproved={finishSupportApproval} />
           <dl className="about-details">
             <div>
               <dt>Version</dt>

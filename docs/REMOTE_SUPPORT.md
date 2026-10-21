@@ -8,8 +8,10 @@ formatting, checking, strict Clippy, and tests have passed in the separate
 GitHub Mac development build, which has also compiled the universal app.
 These source/build results do not establish packaged-Mac acceptance.
 The source-only GitHub development workflow
-produces only a zipped unsigned universal `.app`, after the native and packaged
-checks pass, and has no release/tag write permission. Publishing a source
+produces only a zipped universal development `.app`, after the native and
+packaged checks pass, and has no release/tag write permission. Developer ID
+signing and notarization are not performed; the toolchain may leave an ad-hoc
+signature, which is not a distribution signature. Publishing a source
 snapshot requires explicit owner approval. Mail content and private history
 are excluded. A workflow definition is not evidence that its checks have passed.
 The recipient needs only PST QuickView. No account, VPN client, Codex, SSH
@@ -25,7 +27,9 @@ remote desktop or a remote terminal.
    controller and deliberately chooses **Start support**.
 2. The owner opens **Help → About PST QuickView → Remote Support**, pastes the
    complete private invitation, checks the consent box, and chooses **Approve
-   and connect**. No browser/account setup is needed on the owner's Mac.
+   and connect**. Successful approval closes Help so the shared navigation and
+   search controls are accessible. A failed start leaves Help open for recovery.
+   No browser/account setup is needed on the owner's Mac.
 3. A separate bundled connection window reports negotiation and connection
    state. Only a verified direct encrypted UDP data channel is accepted.
 4. The main window displays a persistent **Stop support** banner, outside Help.
