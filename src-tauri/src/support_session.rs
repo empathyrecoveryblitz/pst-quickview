@@ -151,7 +151,9 @@ fn now_ms() -> SupportResult<u64> {
 
 fn hex_id(value: &str, length: usize) -> bool {
     value.len() == length
-        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn public_ipv4(value: &str) -> bool {
@@ -180,7 +182,9 @@ fn allowed_origin(value: &str) -> bool {
         && label.len() <= 63
         && !label.starts_with('-')
         && !label.ends_with('-')
-        && label.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn parse_invitation(invitation: &str, now: u64) -> SupportResult<SupportConfig> {
@@ -231,7 +235,8 @@ fn parse_invitation(invitation: &str, now: u64) -> SupportResult<SupportConfig> 
 
 fn color(value: &str) -> bool {
     if let Some(hex) = value.strip_prefix('#') {
-        return matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+        return matches!(hex.len(), 3 | 4 | 6 | 8)
+            && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
     }
     let (components, count) = if let Some(inner) = value.strip_prefix("rgba(") {
         (inner, 4)
@@ -250,15 +255,20 @@ fn color(value: &str) -> bool {
     values.len() == count
         && values.iter().enumerate().all(|(index, part)| {
             !part.is_empty()
-                && part.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
                 && part.parse::<f64>().is_ok_and(|number| {
-                    number.is_finite() && (0.0..=if index == 3 { 1.0 } else { 255.0 }).contains(&number)
+                    number.is_finite()
+                        && (0.0..=if index == 3 { 1.0 } else { 255.0 }).contains(&number)
                 })
         })
 }
 
 fn rectangle(x: f64, y: f64, width: f64, height: f64) -> bool {
-    [x, y, width, height].iter().all(|number| number.is_finite())
+    [x, y, width, height]
+        .iter()
+        .all(|number| number.is_finite())
         && (0.0..=4096.0).contains(&x)
         && (0.0..=2160.0).contains(&y)
         && (0.0..=4096.0).contains(&width)
@@ -267,9 +277,9 @@ fn rectangle(x: f64, y: f64, width: f64, height: f64) -> bool {
 
 fn bounded_text(value: &str, maximum: usize) -> bool {
     value.encode_utf16().count() <= maximum
-        && !value.chars().any(|character| {
-            matches!(character as u32, 0..=8 | 11 | 12 | 14..=31 | 127)
-        })
+        && !value
+            .chars()
+            .any(|character| matches!(character as u32, 0..=8 | 11 | 12 | 14..=31 | 127))
 }
 
 fn validate_frame(value: serde_json::Value) -> SupportResult<SupportFrame> {
@@ -293,7 +303,16 @@ fn validate_frame(value: serde_json::Value) -> SupportResult<SupportFrame> {
     for item in &frame.items {
         let valid = match item {
             DrawItem::Box { x, y, w, h, fill } => rectangle(*x, *y, *w, *h) && color(fill),
-            DrawItem::Text { x, y, w, h, text, color: fill, size, weight } => {
+            DrawItem::Text {
+                x,
+                y,
+                w,
+                h,
+                text,
+                color: fill,
+                size,
+                weight,
+            } => {
                 text_count += text.encode_utf16().count();
                 rectangle(*x, *y, *w, *h)
                     && bounded_text(text, 1000)
@@ -313,7 +332,10 @@ fn validate_frame(value: serde_json::Value) -> SupportResult<SupportFrame> {
             || !ids.insert(&target.id)
             || !rectangle(target.x, target.y, target.w, target.h)
             || !bounded_text(&target.label, 100)
-            || target.value.as_ref().is_some_and(|value| !bounded_text(value, 2000))
+            || target
+                .value
+                .as_ref()
+                .is_some_and(|value| !bounded_text(value, 2000))
             || (target.kind != ActionKind::Input && target.value.is_some())
         {
             return Err(invalid());
@@ -329,18 +351,26 @@ fn validate_action(action: &SupportAction) -> bool {
             ActionKind::Click => action.value.is_none() && action.delta_y.is_none(),
             ActionKind::Input => {
                 action.delta_y.is_none()
-                    && action.value.as_ref().is_some_and(|value| bounded_text(value, 2000))
+                    && action
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| bounded_text(value, 2000))
             }
             ActionKind::Scroll => {
                 action.value.is_none()
-                    && action.delta_y.is_some_and(|delta| delta.is_finite() && (-700.0..=700.0).contains(&delta))
+                    && action
+                        .delta_y
+                        .is_some_and(|delta| delta.is_finite() && (-700.0..=700.0).contains(&delta))
             }
         }
 }
 
 impl Session {
     fn status(&self) -> SessionStatus {
-        SessionStatus { session_id: self.id.clone(), expires_at: self.config.expires }
+        SessionStatus {
+            session_id: self.id.clone(),
+            expires_at: self.config.expires,
+        }
     }
 
     fn alive(&self, now: Instant) -> bool {
@@ -355,7 +385,11 @@ impl Session {
 
     fn publish(&mut self, frame: SupportFrame, now: Instant) -> SupportResult<bool> {
         self.heartbeat = now;
-        while self.published.front().is_some_and(|time| now.saturating_duration_since(*time) >= Duration::from_secs(1)) {
+        while self
+            .published
+            .front()
+            .is_some_and(|time| now.saturating_duration_since(*time) >= Duration::from_secs(1))
+        {
             self.published.pop_front();
         }
         if self.frames.iter().any(|(_, prior)| prior.id == frame.id) {
@@ -366,7 +400,12 @@ impl Session {
         }
         self.published.push_back(now);
         self.frames.push_back((now, frame));
-        while self.frames.len() > 3 || self.frames.front().is_some_and(|(time, _)| now.saturating_duration_since(*time) > FRAME_LIFETIME) {
+        while self.frames.len() > 3
+            || self
+                .frames
+                .front()
+                .is_some_and(|(time, _)| now.saturating_duration_since(*time) > FRAME_LIFETIME)
+        {
             self.frames.pop_front();
         }
         Ok(true)
@@ -376,7 +415,11 @@ impl Session {
         if !self.alive(now) || !validate_action(action) {
             return Err(INVALID_ACTION.to_string());
         }
-        while self.actions.front().is_some_and(|time| now.saturating_duration_since(*time) >= Duration::from_secs(1)) {
+        while self
+            .actions
+            .front()
+            .is_some_and(|time| now.saturating_duration_since(*time) >= Duration::from_secs(1))
+        {
             self.actions.pop_front();
         }
         if self.actions.len() >= 10 {
@@ -385,7 +428,10 @@ impl Session {
         let valid_target = self.frames.iter().any(|(time, frame)| {
             now.saturating_duration_since(*time) <= FRAME_LIFETIME
                 && frame.id == action.frame
-                && frame.targets.iter().any(|target| target.id == action.target && target.kind == action.kind)
+                && frame
+                    .targets
+                    .iter()
+                    .any(|target| target.id == action.target && target.kind == action.kind)
         });
         if !valid_target {
             return Err(INVALID_ACTION.to_string());
@@ -396,8 +442,10 @@ impl Session {
 }
 
 fn local_document(url: &tauri::Url, id: &str) -> bool {
-    matches!((url.scheme(), url.host_str()), ("tauri", Some("localhost")) | ("http" | "https", Some("tauri.localhost")))
-        && url.port().is_none()
+    matches!(
+        (url.scheme(), url.host_str()),
+        ("tauri", Some("localhost")) | ("http" | "https", Some("tauri.localhost"))
+    ) && url.port().is_none()
         && url.username().is_empty()
         && url.password().is_none()
         && url.path() == DOCUMENT
@@ -409,9 +457,14 @@ fn support_csp(existing: &str, origin: &str) -> Option<String> {
     if !allowed_origin(origin) {
         return None;
     }
-    let mut directives: Vec<String> = existing.split(';').map(str::trim)
-        .filter(|directive| !directive.is_empty() && directive.split_whitespace().next() != Some("connect-src"))
-        .map(str::to_owned).collect();
+    let mut directives: Vec<String> = existing
+        .split(';')
+        .map(str::trim)
+        .filter(|directive| {
+            !directive.is_empty() && directive.split_whitespace().next() != Some("connect-src")
+        })
+        .map(str::to_owned)
+        .collect();
     // Preserve Tauri's generated script hashes/nonces and every other directive.
     directives.push(format!("connect-src ipc: http://ipc.localhost {origin}"));
     Some(directives.join("; "))
@@ -419,8 +472,15 @@ fn support_csp(existing: &str, origin: &str) -> Option<String> {
 
 fn take_session(app: &tauri::AppHandle, id: Option<&str>) -> Option<String> {
     let state = app.state::<SupportSessionState>();
-    let mut broker = state.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if broker.active.as_ref().is_some_and(|session| id.map_or(true, |id| id == session.id)) {
+    let mut broker = state
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if broker
+        .active
+        .as_ref()
+        .is_some_and(|session| id.map_or(true, |id| id == session.id))
+    {
         broker.active.take().map(|session| session.label)
     } else {
         None
@@ -439,12 +499,21 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: &tauri::RunEvent) 
     match event {
         tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. } => stop_matching(app, None),
         tauri::RunEvent::WindowEvent { label, event, .. }
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed) =>
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) =>
         {
             let relevant = label == "main" || {
                 let state = app.state::<SupportSessionState>();
-                let broker = state.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                broker.active.as_ref().is_some_and(|session| session.label == *label)
+                let broker = state
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                broker
+                    .active
+                    .as_ref()
+                    .is_some_and(|session| session.label == *label)
             };
             if relevant {
                 stop_matching(app, None);
@@ -465,23 +534,39 @@ pub(crate) async fn start_support_session(
     }
     let now = now_ms()?;
     let config = parse_invitation(&invitation, now)?;
-    let origin = config.origin.clone().ok_or_else(|| INVALID_INVITATION.to_string())?;
+    let origin = config
+        .origin
+        .clone()
+        .ok_or_else(|| INVALID_INVITATION.to_string())?;
     let mut random = [0_u8; 16];
-    File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut random))
+    File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut random))
         .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
     let id = hex::encode(random);
     let label = format!("{PREFIX}{id}");
-    let status = SessionStatus { session_id: id.clone(), expires_at: config.expires };
+    let status = SessionStatus {
+        session_id: id.clone(),
+        expires_at: config.expires,
+    };
     let instant = Instant::now();
     let state = app.state::<SupportSessionState>();
     {
-        let mut broker = state.0.lock().map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+        let mut broker = state
+            .0
+            .lock()
+            .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
         if broker.active.is_some() {
             return Err("Stop the current support session before starting another.".to_string());
         }
         broker.active = Some(Session {
-            id: id.clone(), label: label.clone(), deadline: instant + Duration::from_millis(config.expires - now),
-            config, heartbeat: instant, frames: VecDeque::new(), published: VecDeque::new(), actions: VecDeque::new(),
+            id: id.clone(),
+            label: label.clone(),
+            deadline: instant + Duration::from_millis(config.expires - now),
+            config,
+            heartbeat: instant,
+            frames: VecDeque::new(),
+            published: VecDeque::new(),
+            actions: VecDeque::new(),
         });
     }
     let navigation_id = id.clone();
@@ -520,8 +605,15 @@ pub(crate) async fn start_support_session(
             return Err("Could not open the approved support session.".to_string());
         }
     };
-    let still_authorized = state.0.lock().map(|broker| broker.active.as_ref()
-        .is_some_and(|session| session.id == id && session.alive(Instant::now())))
+    let still_authorized = state
+        .0
+        .lock()
+        .map(|broker| {
+            broker
+                .active
+                .as_ref()
+                .is_some_and(|session| session.id == id && session.alive(Instant::now()))
+        })
         .unwrap_or(false);
     if !still_authorized {
         stop_matching(&app, Some(&id));
@@ -553,8 +645,14 @@ pub(crate) fn bootstrap_support_session(
     state: State<SupportSessionState>,
     session_id: String,
 ) -> SupportResult<SupportConfig> {
-    let broker = state.0.lock().map_err(|_| SESSION_UNAVAILABLE.to_string())?;
-    let session = broker.active.as_ref().ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
+    let broker = state
+        .0
+        .lock()
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+    let session = broker
+        .active
+        .as_ref()
+        .ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
     if !session.support_window(window.label(), &session_id) || !session.alive(Instant::now()) {
         return Err(SESSION_UNAVAILABLE.to_string());
     }
@@ -569,12 +667,19 @@ pub(crate) fn support_session_status(
     if window.label() != "main" {
         return Err(SESSION_UNAVAILABLE.to_string());
     }
-    let mut broker = state.0.lock().map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+    let mut broker = state
+        .0
+        .lock()
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
     let now = Instant::now();
-    Ok(broker.active.as_mut().filter(|session| session.alive(now)).map(|session| {
-        session.heartbeat = now;
-        session.status()
-    }))
+    Ok(broker
+        .active
+        .as_mut()
+        .filter(|session| session.alive(now))
+        .map(|session| {
+            session.heartbeat = now;
+            session.status()
+        }))
 }
 
 #[tauri::command]
@@ -588,8 +693,14 @@ pub(crate) fn publish_support_frame(
         return Err(SESSION_UNAVAILABLE.to_string());
     }
     let frame = validate_frame(frame)?;
-    let mut broker = state.0.lock().map_err(|_| SESSION_UNAVAILABLE.to_string())?;
-    let session = broker.active.as_mut().ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
+    let mut broker = state
+        .0
+        .lock()
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+    let session = broker
+        .active
+        .as_mut()
+        .ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
     let now = Instant::now();
     if session.id != session_id || !session.alive(now) {
         return Err(SESSION_UNAVAILABLE.to_string());
@@ -603,13 +714,22 @@ pub(crate) fn poll_support_frame(
     state: State<SupportSessionState>,
     session_id: String,
 ) -> SupportResult<Option<SupportFrame>> {
-    let broker = state.0.lock().map_err(|_| SESSION_UNAVAILABLE.to_string())?;
-    let session = broker.active.as_ref().ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
+    let broker = state
+        .0
+        .lock()
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+    let session = broker
+        .active
+        .as_ref()
+        .ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
     let now = Instant::now();
     if !session.support_window(window.label(), &session_id) || !session.alive(now) {
         return Err(SESSION_UNAVAILABLE.to_string());
     }
-    Ok(session.frames.back().filter(|(time, _)| now.saturating_duration_since(*time) <= FRAME_LIFETIME)
+    Ok(session
+        .frames
+        .back()
+        .filter(|(time, _)| now.saturating_duration_since(*time) <= FRAME_LIFETIME)
         .map(|(_, frame)| frame.clone()))
 }
 
@@ -625,8 +745,14 @@ pub(crate) fn support_submit_action(
         return Err(INVALID_ACTION.to_string());
     }
     {
-        let mut broker = state.0.lock().map_err(|_| SESSION_UNAVAILABLE.to_string())?;
-        let session = broker.active.as_mut().ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
+        let mut broker = state
+            .0
+            .lock()
+            .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+        let session = broker
+            .active
+            .as_mut()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
         if !session.support_window(window.label(), &session_id) || !session.alive(Instant::now()) {
             return Err(SESSION_UNAVAILABLE.to_string());
         }
@@ -649,9 +775,14 @@ pub(crate) fn stop_support_session(
     session_id: String,
 ) -> SupportResult<()> {
     let allowed = {
-        let broker = state.0.lock().map_err(|_| SESSION_UNAVAILABLE.to_string())?;
-        broker.active.as_ref().is_some_and(|session| session.id == session_id
-            && (window.label() == "main" || session.support_window(window.label(), &session_id)))
+        let broker = state
+            .0
+            .lock()
+            .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+        broker.active.as_ref().is_some_and(|session| {
+            session.id == session_id
+                && (window.label() == "main" || session.support_window(window.label(), &session_id))
+        })
     };
     if !allowed {
         return Err(SESSION_UNAVAILABLE.to_string());
@@ -665,13 +796,23 @@ mod tests {
     use super::*;
 
     fn config(expires: u64) -> SupportConfig {
-        SupportConfig { v: 2, sid: "a".repeat(32), key: URL_SAFE_NO_PAD.encode([0_u8; 32]),
-            token: "b".repeat(64), expires, expected_exit: "1.1.1.1".to_string(),
-            role: "guest".to_string(), origin: Some("https://synthetic.run.pinggy-free.link".to_string()) }
+        SupportConfig {
+            v: 2,
+            sid: "a".repeat(32),
+            key: URL_SAFE_NO_PAD.encode([0_u8; 32]),
+            token: "b".repeat(64),
+            expires,
+            expected_exit: "1.1.1.1".to_string(),
+            role: "guest".to_string(),
+            origin: Some("https://synthetic.run.pinggy-free.link".to_string()),
+        }
     }
 
     fn invitation(config: &SupportConfig) -> String {
-        format!("https://synthetic.run.pinggy-free.link/join#{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(config).unwrap()))
+        format!(
+            "https://synthetic.run.pinggy-free.link/join#{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(config).unwrap())
+        )
     }
 
     fn frame(id: char) -> SupportFrame {
@@ -681,8 +822,16 @@ mod tests {
     }
 
     fn session(now: Instant) -> Session {
-        Session { id: "d".repeat(32), label: format!("{PREFIX}{}", "d".repeat(32)), config: config(now_ms().unwrap() + 30_000),
-            deadline: now + Duration::from_secs(30), heartbeat: now, frames: VecDeque::new(), published: VecDeque::new(), actions: VecDeque::new() }
+        Session {
+            id: "d".repeat(32),
+            label: format!("{PREFIX}{}", "d".repeat(32)),
+            config: config(now_ms().unwrap() + 30_000),
+            deadline: now + Duration::from_secs(30),
+            heartbeat: now,
+            frames: VecDeque::new(),
+            published: VecDeque::new(),
+            actions: VecDeque::new(),
+        }
     }
 
     #[test]
@@ -696,7 +845,9 @@ mod tests {
             invitation(&valid).replace("https://", "https://user@"),
             invitation(&valid).replace("/join#", ":443/join#"),
             invitation(&valid).replace("synthetic.run.", "nested.synthetic.run."),
-        ] { assert!(parse_invitation(&malformed, 100_000).is_err()); }
+        ] {
+            assert!(parse_invitation(&malformed, 100_000).is_err());
+        }
         let mut invalid_role = config(120_000);
         invalid_role.role = "controller".to_string();
         let mut invalid_sid = config(120_000);
@@ -705,13 +856,21 @@ mod tests {
         invalid_token.token = "b".repeat(63);
         let mut invalid_key = config(120_000);
         invalid_key.key = "x".repeat(43);
-        for bad in [config(100_000), config(1_900_001), invalid_role, invalid_sid, invalid_token, invalid_key] {
+        for bad in [
+            config(100_000),
+            config(1_900_001),
+            invalid_role,
+            invalid_sid,
+            invalid_token,
+            invalid_key,
+        ] {
             assert!(parse_invitation(&invitation(&bad), 100_000).is_err());
         }
         let mut wrong = config(120_000);
         wrong.origin = Some("https://different.run.pinggy-free.link".to_string());
         assert!(parse_invitation(&invitation(&wrong), 100_000).is_err());
-        wrong = config(120_000); wrong.expected_exit = "127.0.0.1".to_string();
+        wrong = config(120_000);
+        wrong.expected_exit = "127.0.0.1".to_string();
         assert!(parse_invitation(&invitation(&wrong), 100_000).is_err());
     }
 
@@ -723,28 +882,47 @@ mod tests {
             assert!(!record.support_window(label, &record.id));
         }
         assert!(!record.support_window(&record.label, &"e".repeat(32)));
-        let url = format!("tauri://localhost/support/session.html?session={}", record.id);
-        assert!(local_document(&tauri::Url::parse(&url).unwrap(), &record.id));
-        for bad in [url.replace("tauri://localhost", "https://example.invalid"),
-            url.replace("session.html", "session.js"), format!("{url}#remote"), format!("{url}&extra=1")] {
-            assert!(!local_document(&tauri::Url::parse(&bad).unwrap(), &record.id));
+        let url = format!(
+            "tauri://localhost/support/session.html?session={}",
+            record.id
+        );
+        assert!(local_document(
+            &tauri::Url::parse(&url).unwrap(),
+            &record.id
+        ));
+        for bad in [
+            url.replace("tauri://localhost", "https://example.invalid"),
+            url.replace("session.html", "session.js"),
+            format!("{url}#remote"),
+            format!("{url}&extra=1"),
+        ] {
+            assert!(!local_document(
+                &tauri::Url::parse(&bad).unwrap(),
+                &record.id
+            ));
         }
     }
 
     #[test]
     fn vector_frames_reject_html_unknown_keys_oversize_and_unsafe_colors() {
         let valid = serde_json::to_value(frame('a')).unwrap();
-        let mut bad = valid.clone(); bad["html"] = "<script>arbitrary</script>".into();
+        let mut bad = valid.clone();
+        bad["html"] = "<script>arbitrary</script>".into();
         assert!(validate_frame(bad).is_err());
-        let mut bad = valid.clone(); bad["items"][0]["color"] = "url(https://example.invalid)".into();
+        let mut bad = valid.clone();
+        bad["items"][0]["color"] = "url(https://example.invalid)".into();
         assert!(validate_frame(bad).is_err());
-        let mut bad = valid.clone(); bad["items"][0]["text"] = "x".repeat(1001).into();
+        let mut bad = valid.clone();
+        bad["items"][0]["text"] = "x".repeat(1001).into();
         assert!(validate_frame(bad).is_err());
-        let mut bad = valid.clone(); bad["targets"][0]["command"] = "arbitrary".into();
+        let mut bad = valid.clone();
+        bad["targets"][0]["command"] = "arbitrary".into();
         assert!(validate_frame(bad).is_err());
-        let mut bad = valid.clone(); bad["items"] = serde_json::Value::Array(vec![valid["items"][0].clone(); 601]);
+        let mut bad = valid.clone();
+        bad["items"] = serde_json::Value::Array(vec![valid["items"][0].clone(); 601]);
         assert!(validate_frame(bad).is_err());
-        let mut bad = valid; bad["width"] = 5000.into();
+        let mut bad = valid;
+        bad["width"] = 5000.into();
         assert!(validate_frame(bad).is_err());
     }
 
@@ -756,19 +934,47 @@ mod tests {
         assert!(!record.alive(now + HEARTBEAT_TIMEOUT));
         assert!(!record.alive(now + Duration::from_secs(31)));
         record.publish(frame('a'), now).unwrap();
-        record.publish(frame('b'), now + Duration::from_millis(500)).unwrap();
-        assert!(!record.publish(frame('c'), now + Duration::from_millis(600)).unwrap());
-        let mut action = SupportAction { frame: "a".repeat(32), target: "c".repeat(32), kind: ActionKind::Click, value: None, delta_y: None };
-        for _ in 0..10 { record.authorize_action(&action, now + Duration::from_millis(700)).unwrap(); }
-        assert!(record.authorize_action(&action, now + Duration::from_millis(701)).is_err());
+        record
+            .publish(frame('b'), now + Duration::from_millis(500))
+            .unwrap();
+        assert!(!record
+            .publish(frame('c'), now + Duration::from_millis(600))
+            .unwrap());
+        let mut action = SupportAction {
+            frame: "a".repeat(32),
+            target: "c".repeat(32),
+            kind: ActionKind::Click,
+            value: None,
+            delta_y: None,
+        };
+        for _ in 0..10 {
+            record
+                .authorize_action(&action, now + Duration::from_millis(700))
+                .unwrap();
+        }
+        assert!(record
+            .authorize_action(&action, now + Duration::from_millis(701))
+            .is_err());
         action.frame = "f".repeat(32);
-        assert!(record.authorize_action(&action, now + Duration::from_millis(1800)).is_err());
-        action.frame = "a".repeat(32); action.target = "e".repeat(32);
-        assert!(record.authorize_action(&action, now + Duration::from_millis(1800)).is_err());
-        action.target = "c".repeat(32); action.kind = ActionKind::Input; action.value = Some("Synthetic".into());
-        assert!(record.authorize_action(&action, now + Duration::from_millis(1800)).is_err());
-        action.kind = ActionKind::Click; action.value = None;
-        assert!(record.authorize_action(&action, now + Duration::from_millis(2100)).is_err());
+        assert!(record
+            .authorize_action(&action, now + Duration::from_millis(1800))
+            .is_err());
+        action.frame = "a".repeat(32);
+        action.target = "e".repeat(32);
+        assert!(record
+            .authorize_action(&action, now + Duration::from_millis(1800))
+            .is_err());
+        action.target = "c".repeat(32);
+        action.kind = ActionKind::Input;
+        action.value = Some("Synthetic".into());
+        assert!(record
+            .authorize_action(&action, now + Duration::from_millis(1800))
+            .is_err());
+        action.kind = ActionKind::Click;
+        action.value = None;
+        assert!(record
+            .authorize_action(&action, now + Duration::from_millis(2100))
+            .is_err());
     }
 
     #[test]
@@ -776,9 +982,15 @@ mod tests {
         let baseline = "default-src 'none'; script-src 'self' 'nonce-generated'; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'";
         let csp = support_csp(baseline, "https://synthetic.run.pinggy-free.link").unwrap();
         assert!(csp.contains("script-src 'self' 'nonce-generated'"));
-        assert!(csp.contains("connect-src ipc: http://ipc.localhost https://synthetic.run.pinggy-free.link"));
+        assert!(csp.contains(
+            "connect-src ipc: http://ipc.localhost https://synthetic.run.pinggy-free.link"
+        ));
         assert!(!csp.contains("script-src 'unsafe-inline'"));
-        assert!(support_csp(baseline, "https://synthetic.run.pinggy-free.link; script-src *").is_none());
+        assert!(support_csp(
+            baseline,
+            "https://synthetic.run.pinggy-free.link; script-src *"
+        )
+        .is_none());
         assert!(support_csp(baseline, "https://nested.synthetic.run.pinggy-free.link").is_none());
     }
 
@@ -787,21 +999,34 @@ mod tests {
         let now = Instant::now();
         let mut record = session(now);
         for (elapsed, id) in [(0, 'a'), (850, 'b'), (1100, 'c')] {
-            assert!(record.publish(frame(id), now + Duration::from_millis(elapsed)).unwrap());
+            assert!(record
+                .publish(frame(id), now + Duration::from_millis(elapsed))
+                .unwrap());
         }
         let delayed = now + Duration::from_millis(1650);
         assert!(!record.publish(frame('d'), delayed).unwrap());
         assert!(record.alive(delayed));
         assert_eq!(record.frames.back().unwrap().1.id, "c".repeat(32));
-        let action = SupportAction { frame: "c".repeat(32), target: "c".repeat(32),
-            kind: ActionKind::Click, value: None, delta_y: None };
+        let action = SupportAction {
+            frame: "c".repeat(32),
+            target: "c".repeat(32),
+            kind: ActionKind::Click,
+            value: None,
+            delta_y: None,
+        };
         assert!(record.authorize_action(&action, delayed).is_ok());
         assert!(record.publish(frame('c'), delayed).is_err());
     }
 
     #[test]
     fn actions_match_protocol_text_and_scroll_bounds() {
-        let mut action = SupportAction { frame: "a".repeat(32), target: "c".repeat(32), kind: ActionKind::Scroll, value: None, delta_y: Some(700.0) };
+        let mut action = SupportAction {
+            frame: "a".repeat(32),
+            target: "c".repeat(32),
+            kind: ActionKind::Scroll,
+            value: None,
+            delta_y: Some(700.0),
+        };
         assert!(validate_action(&action));
         action.delta_y = Some(700.1);
         assert!(!validate_action(&action));
