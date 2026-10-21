@@ -22,12 +22,20 @@ const CONFIG: &str = include_str!("../../public/support/update-service.json");
 const MANIFEST_LIMIT: usize = 64 * 1024;
 const ARTIFACT_LIMIT: usize = 25 * 1024 * 1024;
 const RESUME_MS: u64 = 90_000;
+const RESUME_CLOCK_MARGIN_MS: u64 = 5_000;
 const CANDIDATE_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const KEYCHAIN_SERVICE: &str = "com.local.pstquickview.support-update-resume";
 const KEYCHAIN_ACCOUNT: &str = "single-use-v1";
 const ACK_DOMAIN: &str = "pst-quickview-update-ack-v1\n";
 const LAUNCH_PROOF_ENV: &str = "PST_QUICKVIEW_UPDATE_RESUME_PROOF";
 static LAUNCH_PROOF: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn update_resume_deadline_ms(now: u64, original_expires: u64) -> u64 {
+    // Keep the wire deadline below the service's strict 90-second cap. Both
+    // endpoints retain their unchanged maximum and original-expiry checks.
+    now.saturating_add(RESUME_MS - RESUME_CLOCK_MARGIN_MS)
+        .min(original_expires)
+}
 
 // First line of run(), before application threads or webviews are created.
 // Only the updater's fixed child process receives this environment value.
@@ -813,7 +821,7 @@ async fn checked_download(app: &tauri::AppHandle) -> UpdateResult<Option<Verifie
     let Some(update) = updater.restore_update(value).map_err(|_| fail())? else {
         return Ok(None);
     };
-    let bytes = bounded_get(&client, &update.download_url.to_string(), ARTIFACT_LIMIT).await?;
+    let bytes = bounded_get(&client, update.download_url.as_ref(), ARTIFACT_LIMIT).await?;
     if bytes.len() as u64 != manifest.size || digest(&bytes) != manifest.artifact_sha256 {
         return Err(fail());
     }
@@ -884,7 +892,7 @@ fn prepare_handoff(
     let parent = crate::support_session::update_parent(app)?;
     let now = now_ms()?;
     let (boot, nanos) = clock_binding()?;
-    let deadline = now.saturating_add(RESUME_MS).min(parent.expires);
+    let deadline = update_resume_deadline_ms(now, parent.expires);
     if deadline <= now.saturating_add(3000) {
         return Err(fail());
     }
@@ -1248,6 +1256,20 @@ pub(crate) fn support_confirm_update_resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn update_deadline_has_clock_margin_without_extending_restart_or_session() {
+        let service_now: u64 = 1_000_000;
+        let device_now = service_now + 2_000;
+        let deadline = update_resume_deadline_ms(device_now, service_now + 200_000);
+        assert_eq!(deadline - device_now, 85_000);
+        assert!(deadline <= service_now + RESUME_MS);
+        assert!(device_now + RESUME_MS > service_now + RESUME_MS);
+        assert_eq!(
+            update_resume_deadline_ms(device_now, device_now + 1000),
+            device_now + 1000
+        );
+        assert_eq!(update_resume_deadline_ms(u64::MAX, u64::MAX), u64::MAX);
+    }
     #[test]
     fn held_keychain_io_cannot_delay_stop_or_commit_after_revocation() {
         use std::sync::{atomic::AtomicBool, mpsc, Arc};

@@ -951,7 +951,7 @@ pub fn format_eta_range(range: EtaRange) -> Option<String> {
 }
 
 const fn div_ceil(value: u64, divisor: u64) -> u64 {
-    value / divisor + (value % divisor != 0) as u64
+    value / divisor + (!value.is_multiple_of(divisor)) as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1154,5 +1154,5 @@ fn decimal(bytes: &[u8], start: usize, end: usize) -> u32 {
 }
 
 const fn is_leap_year(year: u32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }

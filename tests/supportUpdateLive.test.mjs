@@ -43,6 +43,14 @@ test('live update gate exercises real handler crypto with exactly three syntheti
   assert.equal(f.calls.filter(call => call.route.endsWith('/resume')).length, 2); // One success and one rejected reuse.
 });
 
+test('live update gate leaves a clock margin without widening the service restart limit', async () => {
+  const f = await fixture();
+  const result = await runSyntheticUpdateGate({ ...f, now: () => Date.now() + 2000 });
+  assert.equal(result.result, 'PASS');
+  assert.equal(result.liveRequestsAfterCleanup, 0);
+  assert.equal((await f.storage.list({ prefix: 'request:' })).size, 0);
+});
+
 test('live update gate refuses a nonempty queue without mutating any existing request', async () => {
   const f = await fixture(), existing = await createRequest({ expires: Date.now() + 120000 });
   await f.queue.fetch(new Request(f.service.origin + '/v3/requests', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(existing.request) }));

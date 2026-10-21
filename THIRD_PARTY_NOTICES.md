@@ -49,6 +49,15 @@ does not record them. Key runtime components include Tauri (Apache-2.0 OR MIT), 
 generate and retain a complete lockfile-derived inventory plus verified license metadata and copies
 of required license texts; do not infer license terms from package names.
 
+The development updater/runtime supplement is packaged at
+`LICENSES/DEVELOPMENT_RUNTIME_NOTICES.txt`. It contains checksum-verified published
+license and notice texts for the newly added or version-changed updater dependency
+closure and updated Tauri JavaScript runtime API, including complete embedded
+notices from minisign-verify and ring/BoringSSL/once_cell. Its inventory deliberately
+includes optional, build-only and non-macOS packages rather than claiming every
+listed package is linked into each slice. It does not replace the broader
+pre-existing dependency review or the ReadPST Corresponding Source requirement.
+
 ## Assets
 
 The PST QuickView application icon is original project artwork owned by Kev P,

@@ -2114,7 +2114,7 @@ where
             || trashed_at_ms > last_changed_at_ms
             || header
                 .last_changed_at_ms
-                .map_or(true, |metadata_time| last_changed_at_ms > metadata_time)
+                .is_none_or(|metadata_time| last_changed_at_ms > metadata_time)
             || !is_opaque_id(&operation_id)
         {
             return Err(invalid());
@@ -4032,7 +4032,7 @@ where
     let rebootstrap_control = expected
         .selected_record
         .as_ref()
-        .map_or(true, |record| record.sequence == u64::MAX);
+        .is_none_or(|record| record.sequence == u64::MAX);
     let selected_slot = if rebootstrap_control {
         SlotIndex::Primary
     } else {

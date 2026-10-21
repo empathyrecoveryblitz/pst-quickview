@@ -28,6 +28,8 @@ const SERVICE_UNAVAILABLE: &str = "Remote Support is not configured in this appl
 const SERVICE_CONFIG: &str = include_str!("../../public/support/service.json");
 const REVOKE_EVENT: &str = "window.dispatchEvent(new Event('pqv-support-revoked'))";
 const UPDATE_RESTART_EVENT: &str = "window.dispatchEvent(new Event('pqv-support-update-restart'))";
+const SESSION_LIMIT_MS: u64 = 30 * 60 * 1000;
+const REQUEST_CLOCK_MARGIN_MS: u64 = 30_000;
 type SupportResult<T> = Result<T, String>;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -63,7 +65,7 @@ pub(crate) struct QueueBootstrap {
     operator_label: String,
     expires: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    resume: Option<crate::updater::ResumeBootstrap>,
+    resume: Option<Box<crate::updater::ResumeBootstrap>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -223,6 +225,12 @@ fn now_ms() -> SupportResult<u64> {
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .ok_or_else(|| SESSION_UNAVAILABLE.to_string())
+}
+
+fn request_deadline_ms(now: u64) -> u64 {
+    // Advertise less than the service's strict maximum so a small positive
+    // device-clock skew cannot turn a locally approved request into HTTP 400.
+    now.saturating_add(SESSION_LIMIT_MS - REQUEST_CLOCK_MARGIN_MS)
 }
 
 fn hex_id(value: &str, length: usize) -> bool {
@@ -635,7 +643,7 @@ fn take_session(app: &tauri::AppHandle, id: Option<&str>) -> Option<String> {
     if broker
         .active
         .as_ref()
-        .is_some_and(|session| id.map_or(true, |id| id == session.id))
+        .is_some_and(|session| id.is_none_or(|id| id == session.id))
     {
         broker.active.take().map(|session| session.label)
     } else {
@@ -701,10 +709,8 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: &tauri::RunEvent) 
                     .as_ref()
                     .is_some_and(|session| session.label == *label)
             };
-            if relevant {
-                if !crate::updater::expected_update_restart(app) {
-                    stop_matching(app, None);
-                }
+            if relevant && !crate::updater::expected_update_restart(app) {
+                stop_matching(app, None);
             }
         }
         _ => {}
@@ -758,7 +764,7 @@ pub(crate) async fn request_support_session(
         origin: config.origin,
         operator_public_key: config.operator_public_key,
         operator_label: config.operator_label,
-        expires: now.saturating_add(30 * 60 * 1000),
+        expires: request_deadline_ms(now),
         resume: None,
     };
     open_approved_session(app, SessionConfig::Queue(queue), now)
@@ -1167,7 +1173,7 @@ pub(crate) fn open_resumed_session(
             operator_public_key: config.operator_public_key,
             operator_label: config.operator_label,
             expires,
-            resume: Some(resume),
+            resume: Some(Box::new(resume)),
         }),
         now,
     )
@@ -1232,6 +1238,18 @@ mod tests {
         let public_key = hex::decode("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5").unwrap();
         serde_json::json!({"v":3,"origin":"https://synthetic.synthetic.workers.dev",
             "operatorPublicKey":URL_SAFE_NO_PAD.encode(public_key),"operatorLabel":"Fictional helper"})
+    }
+
+    #[test]
+    fn request_deadline_has_clock_margin_without_extending_session_authority() {
+        let service_now: u64 = 1_000_000;
+        let device_now = service_now + 20_000;
+        let deadline = request_deadline_ms(device_now);
+        assert_eq!(deadline - device_now, 29 * 60 * 1000 + 30_000);
+        assert!(deadline <= service_now + SESSION_LIMIT_MS);
+        assert!(deadline < device_now + SESSION_LIMIT_MS);
+        assert!(device_now + SESSION_LIMIT_MS > service_now + SESSION_LIMIT_MS);
+        assert_eq!(request_deadline_ms(u64::MAX), u64::MAX);
     }
 
     #[test]
@@ -1381,7 +1399,7 @@ mod tests {
             operator_public_key: service.operator_public_key,
             operator_label: service.operator_label,
             expires,
-            resume: Some(resume),
+            resume: Some(Box::new(resume)),
         });
         timely.deadline = now + Duration::from_secs(2);
         timely.resume_original_deadline = Some(original);

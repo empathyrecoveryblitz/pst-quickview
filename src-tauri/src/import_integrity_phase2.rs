@@ -485,12 +485,12 @@ fn validate_state_record(record: &WorkspaceImportState, workspace_id: &str) -> A
         != active_session_started.is_some()
         || record.last_activity_at.is_some() != last_activity.is_some()
         || active_session_started.is_some_and(|started| {
-            created.map_or(true, |created| started < created)
-                || updated.map_or(true, |updated| started > updated)
+            created.is_none_or(|created| started < created)
+                || updated.is_none_or(|updated| started > updated)
         })
         || last_activity.is_some_and(|activity| {
-            created.map_or(true, |created| activity < created)
-                || updated.map_or(true, |updated| activity > updated)
+            created.is_none_or(|created| activity < created)
+                || updated.is_none_or(|updated| activity > updated)
         });
     let effective_active_elapsed = record
         .elapsed_duration_ms
@@ -1339,13 +1339,13 @@ fn validate_manifest(manifest: &ImportManifest, workspace_id: &str) -> AppResult
         || !canonical_timestamp(&manifest.updated_at)
         || extraction_started
             .zip(extraction_completed)
-            .map_or(true, |(start, end)| start > end)
+            .is_none_or(|(start, end)| start > end)
         || extraction_completed
             .zip(updated)
-            .map_or(true, |(completed, updated)| completed > updated)
+            .is_none_or(|(completed, updated)| completed > updated)
         || created
             .zip(updated)
-            .map_or(true, |(created, updated)| created > updated)
+            .is_none_or(|(created, updated)| created > updated)
     {
         return Err(AppError::new(
             "Import manifest is malformed or unsupported.",
@@ -2086,7 +2086,7 @@ where
             continue;
         }
         scanned_entries = scanned_entries.saturating_add(1);
-        if scanned_entries % VERIFICATION_SCAN_PROGRESS_BATCH_SIZE == 0 {
+        if scanned_entries.is_multiple_of(VERIFICATION_SCAN_PROGRESS_BATCH_SIZE) {
             on_progress()?;
         }
         let entry_metadata = fs::symlink_metadata(entry.path())
@@ -2619,7 +2619,7 @@ where
         || required_counter("existing_canonical_messages_skipped")
             != Some(manifest.skipped_existing_count)
         || required_counter("parse_failures") != Some(manifest.parse_failure_count)
-        || pass_attachment_count.map_or(true, |count| count > attachments)
+        || pass_attachment_count.is_none_or(|count| count > attachments)
         || !cumulative_attachment_count_valid
         || required_counter("canonical_messages_total") != Some(canonical_messages)
         || required_counter("message_count_indexed") != Some(canonical_messages)

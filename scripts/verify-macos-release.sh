@@ -11,7 +11,7 @@ fi
 # shellcheck source=macos-dylib-validation.sh
 source "${DYLIB_VALIDATION_SCRIPT}"
 EXPECTED_VERSION="${PST_QUICKVIEW_EXPECTED_VERSION:-0.2.0-beta.3.support.1}"
-EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.0.301}"
+EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.301}"
 EXPECTED_PRODUCT_NAME="${PST_QUICKVIEW_EXPECTED_PRODUCT_NAME:-PST QuickView}"
 EXPECTED_IDENTIFIER="${PST_QUICKVIEW_EXPECTED_IDENTIFIER:-com.local.pstquickview}"
 PRODUCTION_IDENTIFIER="com.local.pstquickview"
@@ -335,6 +335,7 @@ for public_file in \
   LICENSE COPYRIGHT.md README.md SECURITY.md CONTRIBUTING.md CODE_OF_CONDUCT.md \
   PUBLIC_GITHUB_AUDIT.md THIRD_PARTY_NOTICES.md \
   LICENSES/GPL-3.0-or-later.txt LICENSES/GPL-2.0-or-later.txt \
+  LICENSES/DEVELOPMENT_RUNTIME_NOTICES.txt \
   docs/PUBLIC_HISTORY.md docs/LICENSE_DECISION.md docs/RELEASE_COMPLIANCE.md \
   docs/READPST_CORRESPONDING_SOURCE.md \
   .github/workflows/ci.yml .github/workflows/release-check.yml
@@ -415,8 +416,8 @@ for name, version in pins.items():
         raise SystemExit(f"dependency pin missing: {name} = {version!r}")
 
 macos = tauri.get("bundle", {}).get("macOS", {})
-if macos.get("bundleVersion") != "0.2.0.301":
-    raise SystemExit("macOS development bundleVersion must be 0.2.0.301")
+if macos.get("bundleVersion") != "0.2.301":
+    raise SystemExit("macOS development bundleVersion must be 0.2.301")
 if macos.get("hardenedRuntime") is not True:
     raise SystemExit("macOS hardenedRuntime must be true")
 build = tauri.get("build", {})
@@ -427,6 +428,7 @@ expected_resources = {
     "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
     "../LICENSES/GPL-3.0-or-later.txt": "LICENSES/GPL-3.0-or-later.txt",
     "../LICENSES/GPL-2.0-or-later.txt": "LICENSES/GPL-2.0-or-later.txt",
+    "../LICENSES/DEVELOPMENT_RUNTIME_NOTICES.txt": "LICENSES/DEVELOPMENT_RUNTIME_NOTICES.txt",
 }
 if tauri.get("bundle", {}).get("resources") != expected_resources:
     raise SystemExit("Tauri legal-resource mapping is incomplete or unexpected")
@@ -469,6 +471,8 @@ check_packaged_resource "LICENSES/GPL-3.0-or-later.txt" \
   "LICENSES/GPL-3.0-or-later.txt" "GPL-3.0-or-later text"
 check_packaged_resource "LICENSES/GPL-2.0-or-later.txt" \
   "LICENSES/GPL-2.0-or-later.txt" "GPL-2.0-or-later text"
+check_packaged_resource "LICENSES/DEVELOPMENT_RUNTIME_NOTICES.txt" \
+  "LICENSES/DEVELOPMENT_RUNTIME_NOTICES.txt" "verified development-runtime notices"
 
 PLIST="${APP_PATH}/Contents/Info.plist"
 APP_EXECUTABLE=""

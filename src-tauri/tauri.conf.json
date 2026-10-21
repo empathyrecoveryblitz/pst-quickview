@@ -50,7 +50,7 @@
       }
     ],
     "macOS": {
-      "bundleVersion": "0.2.0.301",
+      "bundleVersion": "0.2.301",
       "hardenedRuntime": true,
       "infoPlist": "Info.plist"
     },
@@ -61,7 +61,8 @@
       "../LICENSE": "LICENSE",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
       "../LICENSES/GPL-3.0-or-later.txt": "LICENSES/GPL-3.0-or-later.txt",
-      "../LICENSES/GPL-2.0-or-later.txt": "LICENSES/GPL-2.0-or-later.txt"
+      "../LICENSES/GPL-2.0-or-later.txt": "LICENSES/GPL-2.0-or-later.txt",
+      "../LICENSES/DEVELOPMENT_RUNTIME_NOTICES.txt": "LICENSES/DEVELOPMENT_RUNTIME_NOTICES.txt"
     },
     "icon": [
       "icons/32x32.png",

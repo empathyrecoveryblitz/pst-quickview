@@ -62,7 +62,8 @@ export async function runSyntheticUpdateGate({ service: rawService, identity, ex
     const base = { v: 1, parentId: row.original.request.id, parentSid: row.claim.payload.sid,
       nonce: randomBytes(16).toString('hex'), targetVersion: '0.2.0-beta.3.support.2', artifactSha256: randomBytes(32).toString('hex'),
       nativeSessionId: randomBytes(16).toString('hex'), originalExpires: row.original.request.expires,
-      resumeDeadline: Math.min(now() + 90000, row.original.request.expires) };
+      // Keep a small clock margin below the unchanged strict service cap.
+      resumeDeadline: Math.min(now() + 85000, row.original.request.expires) };
     // Save the nonce before transmission so even a lost response can be stopped.
     row.handoff = base;
     const response = await call(row.base + '/handoff', { method: 'POST', token: row.original.request.token, body: base });

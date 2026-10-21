@@ -40,6 +40,9 @@ run_frontend_security_tests() {
     tests/supportUpdateArtifact.test.mjs \
     tests/supportUpdateAssets.test.mjs \
     tests/supportUpdateLive.test.mjs \
+    tests/supportClockSkew.test.mjs \
+    tests/supportRuntimeNotices.test.mjs \
+    tests/supportDevelopmentBuild.test.mjs \
     tests/supportView.test.mjs \
     tests/searchCancellation.test.mjs \
     tests/searchHighlight.test.mjs \

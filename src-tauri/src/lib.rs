@@ -10735,7 +10735,7 @@ fn validated_log_metadata(path: &Path) -> AppResult<Option<fs::Metadata>> {
 }
 
 fn rotate_log_if_needed(path: &Path, max_bytes: u64, backups: usize) -> AppResult<()> {
-    if validated_log_metadata(path)?.map_or(true, |metadata| metadata.len() < max_bytes) {
+    if validated_log_metadata(path)?.is_none_or(|metadata| metadata.len() < max_bytes) {
         return Ok(());
     }
     rotate_existing_log(path, backups)
@@ -13462,7 +13462,7 @@ where
             }
         }
         traversed_entries = traversed_entries.saturating_add(1);
-        if traversed_entries % DISCOVERY_PROGRESS_BATCH_SIZE == 0 {
+        if traversed_entries.is_multiple_of(DISCOVERY_PROGRESS_BATCH_SIZE) {
             on_progress(candidates.len(), true)?;
         }
     }

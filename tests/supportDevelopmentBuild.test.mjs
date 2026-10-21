@@ -2,6 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 const workflow = readFileSync(new URL('../.github/workflows/support-development.yml', import.meta.url), 'utf8');
+test('development Mac build identity increments within the three significant bundle-version components', () => {
+  // Apple ignores additional CFBundleVersion components; a fourth-component
+  // increment would not identify a new build to the operating system.
+  const config = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  const bundleVersion = config.bundle.macOS.bundleVersion;
+  assert.match(bundleVersion, /^\d+\.\d+\.\d+$/);
+  assert.equal(bundleVersion, '0.2.301');
+  assert.equal(config.version, '0.2.0-beta.3.support.1');
+  assert.ok(Number(bundleVersion.split('.')[2]) > 0);
+});
 test('development workflow is Mac app-only, unsigned, and has no release or tag authority', () => {
   assert.match(workflow, /runs-on: macos-15/);
   assert.match(workflow, /branches: \[codex\/remote-support-development\]/);
