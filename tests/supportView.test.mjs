@@ -36,7 +36,7 @@ function fixture(text = 'Fictional visible message') {
   paragraph.add({ nodeType: 3, textContent: text, x: 10, y: 20 });
   const button = body.add(new B(10, 60, 100, 30)); button.dataset.supportControl = 'click';
   button.add({ nodeType: 3, textContent: 'Navigate', x: 10, y: 60 });
-  const doc = { body, hidden: false, defaultView: { innerWidth: 980, innerHeight: 750 }, hit: null,
+  const doc = { body, hidden: false, defaultView: { innerWidth: 980, innerHeight: 750 }, hit: null, ranges: [], rangeRect: null,
     elementFromPoint(x, y) {
       if (this.hit) return this.hit;
       const descend = e => {
@@ -47,12 +47,21 @@ function fixture(text = 'Fictional visible message') {
         } return e;
       }; return descend(body);
     },
-    createRange() { let node, offset; return { setStart(n, i) { node = n; offset = i; }, setEnd() {}, getBoundingClientRect() { return { x: node.x + offset * 8, y: node.y, width: 8, height: 16 }; } }; },
+    createRange() { let node, start, end; return { setStart(n, i) { node = n; start = i; }, setEnd(n, i) { assert.equal(n, node); end = i; }, getBoundingClientRect() { doc.ranges.push({ node, start, end }); return doc.rangeRect?.(node, start, end) ?? { x: node.x + start * 8, y: node.y, width: (end - start) * 8, height: 16 }; } }; },
   };
   let clock = 0; const view = createSupportView(doc, () => clock);
   return { body, paragraph, button, doc, view, advance(ms) { clock += ms; } };
 }
 const texts = f => f.items.filter(item => item.kind === 'text').map(item => item.text).join(' ');
+const paragraphText = frame => frame.items.filter(item => item.kind === 'text' && item.y === 20).map(item => item.text).join('');
+function assertSafeFrame(frame) {
+  validateFrame(frame);
+  const values = frame.items.filter(item => item.kind === 'text').map(item => item.text)
+    .concat(frame.targets.flatMap(target => [target.label, ...(target.value === undefined ? [] : [target.value])]));
+  assert.equal(values.every(value => value.isWellFormed()), true);
+  assert.ok(frame.items.filter(item => item.kind === 'text').every(item => item.text.length <= 1000));
+  assert.ok(frame.items.filter(item => item.kind === 'text').reduce((total, item) => total + item.text.length, 0) <= 12000);
+}
 test('actions reject extra authority, malformed identifiers, controls and bounds', () => {
   const base = { frame: 'a'.repeat(32), target: 'b'.repeat(32), kind: 'click' };
   assert.deepEqual(parseSupportAction(base), base);
@@ -95,4 +104,98 @@ test('only a bounded recent generation of target capabilities is retained', () =
   const f = fixture(), first = f.view.capture();
   f.view.capture(); f.view.capture(); f.view.capture();
   assert.equal(f.view.apply({ frame: first.id, target: first.targets[0].id, kind: 'click' }), false);
+});
+test('control label truncation never splits an astral character at the UTF-16 limit', () => {
+  for (const prefix of [98, 99]) {
+    const f = fixture();
+    f.button.rect.width = 950;
+    const source = 'A'.repeat(prefix) + '\u{1f600}';
+    f.button.children[0].textContent = source;
+    const frame = f.view.capture();
+    assert.equal(frame.targets[0].label, 'A'.repeat(prefix) + (prefix === 98 ? '\u{1f600}' : ''));
+    assert.equal(f.button.children[0].textContent, source);
+    assertSafeFrame(frame);
+  }
+});
+test('DOM ranges use complete code points and preserve visible astral text', () => {
+  const source = 'A\u{1f600}B';
+  const f = fixture(source), node = f.paragraph.children[0];
+  const frame = f.view.capture();
+  assert.deepEqual(f.doc.ranges.filter(range => range.node === node).map(({ start, end }) => [start, end]), [[0, 1], [1, 3], [3, 4]]);
+  assert.equal(paragraphText(frame), source);
+  assert.equal(node.textContent, source);
+  assertSafeFrame(frame);
+});
+test('malformed UTF-16 and prohibited controls are repaired only in outgoing copies', () => {
+  const source = '\ud800A\udc00\u{1f600}\u0000\u007fB';
+  const f = fixture(source);
+  const frame = f.view.capture();
+  assert.equal(paragraphText(frame), '\ufffdA\ufffd\u{1f600}\ufffd\ufffdB');
+  assert.equal(f.paragraph.children[0].textContent, source);
+  assertSafeFrame(frame);
+});
+test('drawing item and aggregate UTF-16 limits never split astral characters', () => {
+  for (const prefix of [998, 999, 1000, 11998, 11999]) {
+    const source = 'A'.repeat(prefix) + '\u{1f600}B';
+    const f = fixture(source);
+    f.button.style.display = 'none';
+    f.doc.rangeRect = (node, start, end) => ({ x: node.x + start * 0.01, y: node.y, width: (end - start) * 0.01, height: 16 });
+    const frame = f.view.capture();
+    const expected = prefix < 11998 ? source : 'A'.repeat(prefix) + (prefix === 11998 ? '\u{1f600}' : '');
+    assert.equal(paragraphText(frame), expected);
+    assert.equal(f.paragraph.children[0].textContent, source);
+    assertSafeFrame(frame);
+    if (prefix >= 11998) assert.equal(frame.truncated, true);
+  }
+});
+test('selected option value and display text use safe bounded copies without exposing other choices', () => {
+  for (const prefix of [1998, 1999]) {
+    const f = fixture();
+    const select = f.body.add(new S('select', 10, 110, 950, 30));
+    select.dataset.supportControl = 'input';
+    const sourceValue = 'V'.repeat(prefix) + '\u{1f600}';
+    const textPrefix = prefix === 1998 ? 65 : 66;
+    const sourceText = 'T'.repeat(textPrefix) + '\u{1f600}';
+    select.value = sourceValue;
+    select.selectedOptions = [{ textContent: sourceText }];
+    select.options = [{ value: sourceValue }, { value: 'HIDDEN_OTHER_OPTION', textContent: 'HIDDEN_OTHER_OPTION' }];
+    const frame = f.view.capture(), target = frame.targets.find(target => target.kind === 'input');
+    assert.equal(target.value, 'V'.repeat(prefix) + (prefix === 1998 ? '\u{1f600}' : ''));
+    assert.equal(frame.items.find(item => item.kind === 'text' && item.y === 110).text, 'T'.repeat(textPrefix) + (textPrefix === 65 ? '\u{1f600}' : ''));
+    assert.equal(select.value, sourceValue);
+    assert.equal(select.selectedOptions[0].textContent, sourceText);
+    assert.doesNotMatch(JSON.stringify(frame), /HIDDEN_OTHER_OPTION/);
+    assertSafeFrame(frame);
+  }
+  const f = fixture();
+  const select = f.body.add(new S('select', 10, 110, 950, 30));
+  select.dataset.supportControl = 'input'; select.value = '\ud800'; select.selectedOptions = [{ textContent: 'Option \udc00' }];
+  const frame = f.view.capture();
+  assert.equal(frame.targets.find(target => target.kind === 'input').value, '\ufffd');
+  assert.equal(frame.items.find(item => item.kind === 'text' && item.y === 110).text, 'Option \ufffd');
+  assert.equal(select.value, '\ud800');
+  assertSafeFrame(frame);
+});
+test('selected display text contributes to the same aggregate frame text limit', () => {
+  const f = fixture();
+  f.paragraph.style.display = 'none'; f.button.style.display = 'none';
+  f.body.rect.width = 4096; f.doc.defaultView.innerWidth = 4096;
+  for (let index = 0; index < 30; index++) {
+    const select = f.body.add(new S('select', 0, index * 20, 4096, 20));
+    select.style.fontSize = '8px'; select.selectedOptions = [{ textContent: '\u{1f600}'.repeat(300) }];
+  }
+  const frame = f.view.capture();
+  assertSafeFrame(frame);
+  assert.equal(frame.items.filter(item => item.kind === 'text').reduce((total, item) => total + item.text.length, 0), 12000);
+  assert.equal(frame.truncated, true);
+});
+test('a partially clipped astral character is omitted whole without disclosing its hidden suffix', () => {
+  const source = 'A\u{1f600}HIDDEN';
+  const f = fixture(source), node = f.paragraph.children[0];
+  f.paragraph.style.overflowX = 'hidden'; f.paragraph.rect.width = 20;
+  const frame = f.view.capture();
+  assert.equal(paragraphText(frame), 'A');
+  assert.deepEqual(f.doc.ranges.filter(range => range.node === node).slice(0, 2).map(({ start, end }) => [start, end]), [[0, 1], [1, 3]]);
+  assert.equal(node.textContent, source);
+  assertSafeFrame(frame);
 });

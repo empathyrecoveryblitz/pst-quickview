@@ -33,6 +33,18 @@ function intersect(a: Box, b: Box): Box | null {
 }
 function bounds(rect: DOMRect): Box { return { x: rect.x, y: rect.y, w: rect.width, h: rect.height }; }
 function color(value: string): string { return /^(?:#[a-f\d]{3,8}|rgba?\([\d.,% ]+\))$/i.test(value) ? value : "rgb(32, 32, 32)"; }
+// Repair only the outgoing mirror copy, never the source DOM. Limits remain
+// UTF-16 units, but neither truncation nor replacement emits a lone surrogate.
+function safeText(value: string, maximum: number): string {
+  let copy = "";
+  for (const point of value) {
+    const code = point.codePointAt(0)!;
+    const character = (code >= 0xd800 && code <= 0xdfff) || code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127 ? "\ufffd" : point;
+    if (copy.length + character.length > maximum) break;
+    copy += character;
+  }
+  return copy;
+}
 function allowedKind(element: Element): SupportAction["kind"] | null {
   if (element.closest(FORBIDDEN) || element.matches(":disabled,[aria-disabled=true]")) return null;
   for (let parent: Element | null = element; parent; parent = parent.parentElement) {
@@ -56,8 +68,18 @@ export function createSupportView(document: Document, now = () => performance.no
     const viewport: Box = { x: 0, y: 0, w: width, h: height };
     const frame: SupportFrame = { v: 1, id: identifier(), width, height, items: [], targets: [], truncated: false };
     const controls = new Map<string, { element: Element; rect: Box; kind: SupportAction["kind"] }>();
-    let glyphs = 0, visited = 0;
-    const append = (item: DrawItem) => { if (frame.items.length >= 590) frame.truncated = true; else frame.items.push(item); };
+    let glyphs = 0, visited = 0, textUnits = 0;
+    const append = (item: DrawItem) => {
+      if (frame.items.length >= 590) { frame.truncated = true; return; }
+      if (item.kind === "text") {
+        const text = safeText(item.text, Math.min(1000, 12000 - textUnits));
+        if (text.length < item.text.length) frame.truncated = true;
+        if (!text) return;
+        textUnits += text.length;
+        item = { ...item, text };
+      }
+      frame.items.push(item);
+    };
     const walk = (element: Element, clip: Box, depth: number) => {
       if (++visited > 2400 || depth > 45 || frame.items.length >= 590) { frame.truncated = true; return; }
       if (element.matches("[data-support-private],script,style,svg,canvas,iframe,video,audio,input[type=password],input[type=file],[hidden]")) return;
@@ -77,7 +99,7 @@ export function createSupportView(document: Document, now = () => performance.no
           let id = tokens.get(element); if (!id) { id = identifier(); tokens.set(element, id); }
           const label = `${kind} control`;
           const target: Target = { ...visible, id, kind, label };
-          if (element instanceof HTMLSelectElement) target.value = element.value.slice(0, 2000);
+          if (element instanceof HTMLSelectElement) target.value = safeText(element.value, 2000);
           frame.targets.push(target); controls.set(id, { element, rect: visible, kind });
         }
       }
@@ -88,7 +110,7 @@ export function createSupportView(document: Document, now = () => performance.no
         // values/prefixes: horizontal scrolling could make those bytes hidden.
         const text = element instanceof HTMLSelectElement ? element.selectedOptions[0]?.textContent ?? "" : "Search input (technician can enter a query)";
         const size = Math.min(40, Math.max(8, parseFloat(style.fontSize) || 13));
-        append({ kind: "text", ...visible, text: text.slice(0, Math.min(1000, Math.floor(visible.w / size))), color: color(style.color), size, weight: 400 });
+        append({ kind: "text", ...visible, text: safeText(text, Math.min(1000, Math.floor(visible.w / size))), color: color(style.color), size, weight: 400 });
         return;
       }
       for (const node of element.childNodes) {
@@ -107,15 +129,19 @@ export function createSupportView(document: Document, now = () => performance.no
           line = null;
         };
         const text = node.textContent;
-        for (let offset = 0; offset < text.length; offset++) {
-          if (++glyphs > 12000 || frame.items.length >= 590) { frame.truncated = true; break; }
-          range.setStart(node, offset); range.setEnd(node, offset + 1);
+        for (let offset = 0; offset < text.length;) {
+          const point = String.fromCodePoint(text.codePointAt(offset)!);
+          if (glyphs + point.length > 12000 || frame.items.length >= 590) { frame.truncated = true; break; }
+          glyphs += point.length;
+          range.setStart(node, offset); range.setEnd(node, offset + point.length);
+          offset += point.length;
+          const character = safeText(point, point.length);
           const charRect = bounds(range.getBoundingClientRect()), shown = intersect(charRect, nextClip);
           if (!shown || shown.h < charRect.h * 0.8 || shown.w < charRect.w * 0.8) { flush(); continue; }
           const top = document.elementFromPoint(shown.x + shown.w / 2, shown.y + shown.h / 2);
           if (top !== element) { flush(); continue; }
-          if (line && Math.abs(line.y - shown.y) < 2 && Math.abs(line.x + line.w - shown.x) < 3 && line.text.length < 999) { line.text += text[offset]; line.w = shown.x + shown.w - line.x; }
-          else { flush(); line = { ...shown, text: text[offset] }; }
+          if (line && Math.abs(line.y - shown.y) < 2 && Math.abs(line.x + line.w - shown.x) < 3 && line.text.length + character.length <= 1000) { line.text += character; line.w = shown.x + shown.w - line.x; }
+          else { flush(); line = { ...shown, text: character }; }
         }
         flush();
       }
@@ -123,7 +149,7 @@ export function createSupportView(document: Document, now = () => performance.no
     walk(document.body, viewport, 0);
     for (const target of frame.targets) {
       const visibleLabels = frame.items.filter((item): item is Extract<DrawItem, { kind: "text" }> => item.kind === "text" && item.x >= target.x && item.y >= target.y && item.x < target.x + target.w && item.y < target.y + target.h);
-      target.label = visibleLabels.map(item => item.text).join(" ").slice(0, 100) || target.label;
+      target.label = safeText(visibleLabels.map(item => item.text).join(" "), 100) || target.label;
     }
     while (new TextEncoder().encode(JSON.stringify(frame)).byteLength > 48 * 1024) { frame.truncated = true; if (frame.items.length) frame.items.pop(); else if (frame.targets.length) frame.targets.pop(); else break; }
     const retained = new Set(frame.targets.map(t => t.id));
