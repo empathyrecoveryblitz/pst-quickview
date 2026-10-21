@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 const inspector = fileURLToPath(new URL("../scripts/inspect-packaged-csp.py", import.meta.url));
 const config = readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8");
@@ -11,6 +12,9 @@ const production = JSON.parse(config).app.security.csp;
 const printable = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'";
 const headers = "Content-Security-Policy\0Content-Security-Policy\0" + "content-security-policy\0".repeat(4);
 const baseline = `${headers}${production}\0${printable}`;
+const fallback = "default-src 'none'; script-src 'self'; style-src 'self'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'; media-src 'none'; base-uri 'none'; form-action 'none'";
+const runtimePrefix = "connect-src ipc: http://ipc.localhost ";
+const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const runner = String.raw`
 import importlib.util,json,sys
 spec=importlib.util.spec_from_file_location("inspector",sys.argv[1])
@@ -19,13 +23,15 @@ spec.loader.exec_module(module)
 value=json.load(sys.stdin)
 try:
  literals=module.source_literals(value["config"].encode(),value["support"].encode())
+ sources=[(name,data.encode()) for name,data in value.get("adjacencySources",{"support_session.rs":value["support"]}).items()]
+ catalog=module.source_adjacency_catalog(sources,literals)
  if value.get("operation")=="literals":
   print(json.dumps({name:{"sha256":module.fingerprint(data),"byteLength":len(data)} for name,data in literals.items()}))
  elif value.get("operation")=="main":
-  module.inspect_app=lambda *_:{"schema":1,"diagnosticOnly":True,"slices":[module.inspect_slice(value["binary"].encode(),"arm64",literals)]}
+  module.inspect_app=lambda *_:{"schema":1,"diagnosticOnly":True,"slices":[module.inspect_slice(value["binary"].encode(),"arm64",literals,catalog)]}
   sys.exit(module.main(["inspect","config","support","binary"]))
  else:
-  print(json.dumps(module.inspect_slice(value["binary"].encode(),value.get("architecture","arm64"),literals)))
+  print(json.dumps(module.inspect_slice(value["binary"].encode(),value.get("architecture","arm64"),literals,catalog)))
 except module.DiagnosticError as error:
  print(json.dumps({"errorCategory":error.args[0]}))
  sys.exit(2)
@@ -60,13 +66,88 @@ test("CSP inspection reports counts and boundaries while retaining the existing 
 });
 
 test("recognized support literals remain observations and never approve an unreviewed policy", () => {
-  const fallback = "default-src 'none'; script-src 'self'; style-src 'self'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'; media-src 'none'; base-uri 'none'; form-action 'none'";
   const { report } = inspect(`${baseline}\0${fallback}\0connect-src ipc: http://ipc.localhost `);
   assert.equal(report.existingVerifier.passed, false);
   assert.equal(report.existingVerifier.failureCategory, "unreviewed_directive");
   assert.equal(report.sourceLiteralObservations.support_fallback.occurrences, 1);
   assert.equal(report.sourceLiteralObservations.support_connect_template.occurrences, 1);
   assert.equal(report.safe, undefined);
+});
+
+test("adjacent complete source literals are fingerprinted longest-first without approving policies", () => {
+  const before = "Content-Security-Policy";
+  const after = "Cache-Control";
+  const { report, output } = inspect(`${baseline}\0${before}${fallback}${after}\0${runtimePrefix}; `);
+  const location = report.sourceLiteralObservations.support_fallback.locations[0];
+  assert.equal(location.adjacency.before.classification, "source_literal_match");
+  assert.deepEqual(location.adjacency.before.matches[0], { sha256: sha256(before), byteLength: before.length, kinds: ["rust_string"] });
+  assert.equal(location.adjacency.after.matches[0].sha256, sha256(after));
+  assert.equal(report.sourceLiteralObservations.support_connect_template.locations[0].adjacency.after.matches[0].sha256, sha256("; "));
+  assert.match(report.adjacencySourceCatalog.sourceSha256, /^[a-f0-9]{64}$/);
+  assert.equal(report.adjacencySourceCatalog.sourceFileCount, 1);
+  assert.equal(report.existingVerifier.passed, false);
+  assert.equal(output.includes(before), false);
+  assert.equal(output.includes(after), false);
+});
+
+test("changed or arbitrary adjacency stays unclassified with only bounded context fingerprints", () => {
+  const before = "SYNTHETIC_UNCLASSIFIED~".repeat(3);
+  const after = "~SYNTHETIC_UNCLASSIFIED".repeat(3);
+  const { report, output } = inspect(`${baseline}\0${before}${fallback}${after}`);
+  const adjacency = report.sourceLiteralObservations.support_fallback.locations[0].adjacency;
+  for (const side of Object.values(adjacency)) {
+    assert.equal(side.classification, "unclassified");
+    assert.deepEqual(side.matches, []);
+    assert.equal(side.contextByteLength, 32);
+  }
+  assert.equal(adjacency.before.contextSha256, sha256(before.slice(-32)));
+  assert.equal(adjacency.after.contextSha256, sha256(after.slice(0, 32)));
+  assert.equal(report.existingVerifier.passed, false);
+  assert.equal(output.includes("SYNTHETIC_UNCLASSIFIED"), false);
+  const changed = inspect(`${baseline}\0Content-Security-Polic~${fallback}~Cache-Control`);
+  const changedAdjacency = changed.report.sourceLiteralObservations.support_fallback.locations[0].adjacency;
+  assert.equal(changedAdjacency.before.classification, "unclassified");
+  assert.equal(changedAdjacency.after.classification, "unclassified");
+});
+
+test("own-crate source set is pinned while comments, raw strings, and test-only literals are excluded", () => {
+  const neighbor = "SYNTHETIC_OTHER_MODULE_LITERAL";
+  const ignored = "SYNTHETIC_COMMENT_LITERAL";
+  const raw = "SYNTHETIC_RAW_LITERAL";
+  const testOnly = "SYNTHETIC_TEST_LITERAL";
+  const extra = `// \"${ignored}\"\nconst RAW: &str = r#\"${raw}\"#;\nconst OWN: &str = \"${neighbor}\";\n#[cfg(test)]\nmod tests { const TEST: &str = \"${testOnly}\"; }`;
+  const options = { adjacencySources: { "support_session.rs": support, "other.rs": extra } };
+  const { report, output } = inspect(`${baseline}\0${neighbor}${fallback}`, options);
+  assert.equal(report.adjacencySourceCatalog.sourceFileCount, 2);
+  assert.equal(report.sourceLiteralObservations.support_fallback.locations[0].adjacency.before.matches[0].sha256, sha256(neighbor));
+  for (const value of [ignored, raw, testOnly]) {
+    const observation = inspect(`${baseline}\0${value}${fallback}`, options).report;
+    assert.equal(observation.sourceLiteralObservations.support_fallback.locations[0].adjacency.before.classification, "unclassified");
+  }
+  const changed = inspect(baseline, { adjacencySources: { ...options.adjacencySources, "other.rs": `${extra}\n// changed` } }).report;
+  assert.notEqual(changed.adjacencySourceCatalog.sourceSha256, report.adjacencySourceCatalog.sourceSha256);
+  assert.equal(output.includes(neighbor), false);
+  assert.equal(output.includes("other.rs"), false);
+});
+
+test("adjacency scanner skips continued byte strings without truncating later production literals", () => {
+  const neighbor = "SYNTHETIC_PRODUCTION_AFTER_TEST_ATTRIBUTE";
+  const extra = '#[cfg(test)]\nfn test_helper() {}\nconst BYTES: &[u8] = b"ignored\\\ncontinued";\nconst QUOTE: char = \'"\';\n' + `const OWN: &str = "${neighbor}";`;
+  const { report } = inspect(`${baseline}\0${neighbor}${fallback}`, { adjacencySources: { "other.rs": extra } });
+  assert.equal(report.sourceLiteralObservations.support_fallback.locations[0].adjacency.before.matches[0].sha256, sha256(neighbor));
+  assert.equal(report.existingVerifier.passed, false);
+});
+
+test("adjacency candidate inventory and reported matches have explicit limits", () => {
+  const sources = Object.fromEntries(Array.from({ length: 129 }, (_, index) => [`${index}.rs`, 'const A: &str = "bounded";']));
+  assert.equal(inspect(baseline, { adjacencySources: sources }).report.errorCategory, "source_adjacency_limit");
+  const values = ["abcdefgh", "bcdefgh", "cdefgh", "defgh", "efgh", "fgh"];
+  const extra = values.map((value, index) => `const A${index}: &str = "${value}";`).join("\n");
+  const { report } = inspect(`${baseline}\0${values[0]}${fallback}`, { adjacencySources: { "other.rs": extra } });
+  const side = report.sourceLiteralObservations.support_fallback.locations[0].adjacency.before;
+  assert.equal(side.matches.length, 4);
+  assert.equal(side.matchesTruncated, true);
+  assert.deepEqual(side.matches.map((match) => match.byteLength), [8, 7, 6, 5]);
 });
 
 test("unknown static content is fingerprinted without dumping strings, paths, or addresses", () => {

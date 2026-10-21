@@ -21,6 +21,12 @@ MAX_OCCURRENCES = 100_000
 MAX_LOCATIONS = 8
 MAX_SAMPLES = 16
 MAX_REPORT_BYTES = 64 * 1024
+MAX_SOURCE_FILES = 128
+MAX_ADJACENCY_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_ADJACENCY_CANDIDATES = 4096
+MAX_ADJACENCY_BYTES = 256
+MAX_ADJACENCY_MATCHES = 4
+ADJACENCY_CONTEXT_BYTES = 32
 ARCHITECTURES = ("x86_64", "arm64")
 
 
@@ -124,6 +130,130 @@ def source_literals(config_bytes, support_bytes):
     }
 
 
+def _ordinary_rust_strings(source):
+    """Conservative lexer: comments, raw/byte strings, and character literals are not candidates."""
+    cursor = 0
+    ordinary = re.compile(r'"(?:[^"\\]|\\[\s\S])*"')
+    character = re.compile(r"'(?:[^'\\\r\n]|\\(?:[^\r\n]|u\{[0-9a-fA-F_]+\}))'")
+    while cursor < len(source):
+        if source.startswith("//", cursor):
+            newline = source.find("\n", cursor)
+            cursor = len(source) if newline < 0 else newline + 1
+        elif source.startswith("/*", cursor):
+            depth, cursor = 1, cursor + 2
+            while cursor < len(source) and depth:
+                if source.startswith("/*", cursor):
+                    depth, cursor = depth + 1, cursor + 2
+                elif source.startswith("*/", cursor):
+                    depth, cursor = depth - 1, cursor + 2
+                else:
+                    cursor += 1
+            if depth:
+                raise DiagnosticError("source_adjacency_unavailable")
+        else:
+            raw = re.match(r'(?:br|r)(#*)"', source[cursor:cursor + 260])
+            if raw and (cursor == 0 or not (source[cursor - 1].isalnum() or source[cursor - 1] == "_")):
+                end = source.find('"' + raw.group(1), cursor + raw.end())
+                if end < 0:
+                    raise DiagnosticError("source_adjacency_unavailable")
+                cursor = end + 1 + len(raw.group(1))
+                continue
+            char = character.match(source, cursor) if source[cursor] == "'" else None
+            if char:
+                cursor = char.end()
+                continue
+            if source[cursor] != '"':
+                cursor += 1
+                continue
+            literal = ordinary.match(source, cursor)
+            if literal is None:
+                raise DiagnosticError("source_adjacency_unavailable")
+            start, cursor = cursor, literal.end()
+            if start and (source[start - 1].isalnum() or source[start - 1] == "_"):
+                continue
+            try:
+                yield _rust_string(literal.group())
+            except DiagnosticError:
+                # Unsupported escapes/non-ASCII are never guessed or classified.
+                continue
+
+
+def source_adjacency_catalog(sources, literals):
+    """Fingerprint bounded own-source candidates; matches are observations, never approvals."""
+    if not sources or len(sources) > MAX_SOURCE_FILES:
+        raise DiagnosticError("source_adjacency_limit")
+    total, digest, candidates = 0, hashlib.sha256(), {}
+
+    def add(value, kind):
+        if not 2 <= len(value) <= MAX_ADJACENCY_BYTES:
+            return
+        candidates.setdefault(value, set()).add(kind)
+        if len(candidates) > MAX_ADJACENCY_CANDIDATES:
+            raise DiagnosticError("source_adjacency_limit")
+
+    for identity, data in sorted(sources):
+        total += len(data)
+        if len(data) > MAX_SOURCE_BYTES or total > MAX_ADJACENCY_SOURCE_BYTES:
+            raise DiagnosticError("source_adjacency_limit")
+        try:
+            source = data.decode("utf-8")
+        except UnicodeError:
+            raise DiagnosticError("source_adjacency_unavailable") from None
+        name = identity.encode("utf-8")
+        digest.update(len(name).to_bytes(4, "big") + name + len(data).to_bytes(8, "big") + data)
+        # Conventional final test modules/files are excluded; ordinary cfg(test)
+        # attributes earlier in a module must not hide later production code.
+        if identity.endswith("_tests.rs"):
+            continue
+        test_module = re.search(r"\n#\[cfg\(test\)\]\s*\nmod tests\s*\{", source)
+        if test_module is not None:
+            source = source[:test_module.start()]
+        for value in _ordinary_rust_strings(source):
+            add(value, "rust_string")
+    add(literals["support_connect_template"], "reviewed_format_fragment")
+    add(b"src/support_session.rs", "fixed_module_identifier")
+    return {"sourceSha256": digest.hexdigest(), "sourceFileCount": len(sources),
+            "sourceByteLength": total, "candidateCount": len(candidates),
+            "candidates": sorted(((value, sorted(kinds)) for value, kinds in candidates.items()),
+                                 key=lambda item: (-len(item[0]), fingerprint(item[0])))}
+
+
+def _adjacency(binary, position, before, catalog):
+    # This only proves matching adjacent bytes, not allocation ownership or safety.
+    available = min(position if before else len(binary) - position, MAX_ADJACENCY_BYTES)
+    context = binary[position - available:position] if before else binary[position:position + available]
+    short_context = context[-ADJACENCY_CONTEXT_BYTES:] if before else context[:ADJACENCY_CONTEXT_BYTES]
+    matches = []
+    total = 0
+    for value, kinds in catalog["candidates"]:
+        if (context.endswith(value) if before else context.startswith(value)):
+            total += 1
+            if len(matches) < MAX_ADJACENCY_MATCHES:
+                matches.append({"sha256": fingerprint(value), "byteLength": len(value), "kinds": kinds})
+    return {"classification": "source_literal_match" if matches else "unclassified",
+            "contextByteLength": len(short_context), "contextSha256": fingerprint(short_context),
+            "matches": matches, "matchesTruncated": total > MAX_ADJACENCY_MATCHES}
+
+
+def _own_crate_sources(support_path, support_bytes):
+    sources, total = [], 0
+    for path in support_path.parent.iterdir():
+        if path.suffix != ".rs" or path.is_symlink() or not path.is_file():
+            continue
+        if len(sources) >= MAX_SOURCE_FILES:
+            raise DiagnosticError("source_adjacency_limit")
+        data = _read_source(path)
+        total += len(data)
+        if total > MAX_ADJACENCY_SOURCE_BYTES:
+            raise DiagnosticError("source_adjacency_limit")
+        if path.name == support_path.name and data != support_bytes:
+            raise DiagnosticError("source_changed")
+        sources.append((path.name, data))
+    if not any(name == support_path.name for name, _ in sources):
+        raise DiagnosticError("source_adjacency_unavailable")
+    return sorted(sources)
+
+
 def _offsets(binary, literal):
     offsets = []
     cursor = 0
@@ -176,7 +306,7 @@ def _failure_category(error):
     return "verifier_failure"
 
 
-def inspect_slice(binary, architecture, literals):
+def inspect_slice(binary, architecture, literals, adjacency_catalog):
     if architecture not in ARCHITECTURES or len(binary) > MAX_SLICE_BYTES:
         raise DiagnosticError("slice_limit_or_architecture")
     try:
@@ -200,6 +330,9 @@ def inspect_slice(binary, architecture, literals):
                 "before": _boundary(binary, start - 1),
                 "after": _boundary(binary, start + len(literal)),
                 "recognizedPrefix": _prefix(binary, start, architecture),
+                **({"adjacency": {"before": _adjacency(binary, start, True, adjacency_catalog),
+                                  "after": _adjacency(binary, start + len(literal), False, adjacency_catalog)}}
+                   if label in ("support_fallback", "support_connect_template") else {}),
             } for start in locations[:MAX_LOCATIONS]],
         }
     spellings = Counter()
@@ -239,6 +372,7 @@ def inspect_slice(binary, architecture, literals):
     return {
         "architecture": architecture, "sha256": fingerprint(binary), "byteLength": len(binary),
         "existingVerifier": existing_gate,
+        "adjacencySourceCatalog": {key: value for key, value in adjacency_catalog.items() if key != "candidates"},
         "headerSpellings": {"canonical": spellings[b"Content-Security-Policy"],
                             "lowercase": spellings[b"content-security-policy"],
                             "otherCase": sum(other_spellings.values()),
@@ -265,6 +399,7 @@ def _file_fingerprint(path):
 def inspect_app(config_path, support_path, binary_path):
     config_bytes, support_bytes = _read_source(config_path), _read_source(support_path)
     literals = source_literals(config_bytes, support_bytes)
+    adjacency_catalog = source_adjacency_catalog(_own_crate_sources(support_path, support_bytes), literals)
     if binary_path.is_symlink() or not binary_path.is_file():
         raise DiagnosticError("binary_unavailable")
     if binary_path.stat().st_size > MAX_BINARY_BYTES:
@@ -286,7 +421,7 @@ def inspect_app(config_path, support_path, binary_path):
                 raise DiagnosticError("architecture_extraction_failed")
             if output.stat().st_size > MAX_SLICE_BYTES:
                 raise DiagnosticError("slice_limit_or_architecture")
-            report["slices"].append(inspect_slice(output.read_bytes(), architecture, literals))
+            report["slices"].append(inspect_slice(output.read_bytes(), architecture, literals, adjacency_catalog))
     return report
 
 

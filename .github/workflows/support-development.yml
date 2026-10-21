@@ -56,10 +56,13 @@ jobs:
       - run: scripts/audit-public-repo.sh
       - name: Build universal app only, without signing
         run: npm run tauri -- build --target universal-apple-darwin --bundles app --no-sign --ci
-      - name: Inspect bounded CSP metadata without exposing binary strings
-        run: python3 scripts/inspect-packaged-csp.py src-tauri/tauri.conf.json src-tauri/src/support_session.rs "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app/Contents/MacOS/pst-quickview"
       - name: Inspect the exact current app; no stale-build fallback
-        run: EXPECT_DMG=0 bash scripts/verify-macos-release.sh "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app"
+        run: |
+          package_status=0
+          EXPECT_DMG=0 bash scripts/verify-macos-release.sh "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app" || package_status=$?
+          diagnostic_status=0
+          python3 scripts/inspect-packaged-csp.py src-tauri/tauri.conf.json src-tauri/src/support_session.rs "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app/Contents/MacOS/pst-quickview" || diagnostic_status=$?
+          if ((package_status != 0 || diagnostic_status != 0)); then exit 1; fi
       - name: Archive app while preserving Mac executable modes and bundle structure
         run: ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app" "$RUNNER_TEMP/PST-QuickView-support-development.zip"
       - uses: actions/upload-artifact@v7
