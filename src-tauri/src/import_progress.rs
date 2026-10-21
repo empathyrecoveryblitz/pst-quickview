@@ -358,15 +358,13 @@ impl ImportProgressSnapshot {
             if self.completed_stages.as_slice() != ProgressStage::ALL {
                 return Err(ContractError::InvalidCompletedStages);
             }
-        } else {
-            if self.completed_stages.contains(&ProgressStage::Complete)
-                || self
-                    .completed_stages
-                    .iter()
-                    .any(|stage| stage.rank() >= self.stage.rank())
-            {
-                return Err(ContractError::InvalidCompletedStages);
-            }
+        } else if self.completed_stages.contains(&ProgressStage::Complete)
+            || self
+                .completed_stages
+                .iter()
+                .any(|stage| stage.rank() >= self.stage.rank())
+        {
+            return Err(ContractError::InvalidCompletedStages);
         }
         Ok(())
     }

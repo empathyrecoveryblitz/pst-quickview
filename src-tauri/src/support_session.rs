@@ -161,14 +161,14 @@ fn public_ipv4(value: &str) -> bool {
         return false;
     };
     let [a, b, c, _] = address.octets();
-    address.to_string() == value
-        && !matches!(a, 0 | 10 | 127 | 224..=255)
-        && !(a == 100 && (64..=127).contains(&b))
-        && !(a == 169 && b == 254)
-        && !(a == 172 && (16..=31).contains(&b))
-        && !(a == 192 && ((b == 0 && matches!(c, 0 | 2)) || b == 168 || (b == 88 && c == 99)))
-        && !(a == 198 && (matches!(b, 18 | 19) || (b == 51 && c == 100)))
-        && !(a == 203 && b == 0 && c == 113)
+    let restricted = matches!(a, 0 | 10 | 127 | 224..=255)
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && ((b == 0 && matches!(c, 0 | 2)) || b == 168 || (b == 88 && c == 99)))
+        || (a == 198 && (matches!(b, 18 | 19) || (b == 51 && c == 100)))
+        || (a == 203 && b == 0 && c == 113);
+    address.to_string() == value && !restricted
 }
 
 fn allowed_origin(value: &str) -> bool {
@@ -498,12 +498,11 @@ fn stop_matching(app: &tauri::AppHandle, id: Option<&str>) {
 pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: &tauri::RunEvent) {
     match event {
         tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. } => stop_matching(app, None),
-        tauri::RunEvent::WindowEvent { label, event, .. }
-            if matches!(
-                event,
-                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
-            ) =>
-        {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed,
+            ..
+        } => {
             let relevant = label == "main" || {
                 let state = app.state::<SupportSessionState>();
                 let broker = state
@@ -872,6 +871,52 @@ mod tests {
         wrong = config(120_000);
         wrong.expected_exit = "127.0.0.1".to_string();
         assert!(parse_invitation(&invitation(&wrong), 100_000).is_err());
+    }
+
+    #[test]
+    fn public_routes_reject_nonpublic_and_noncanonical_ipv4() {
+        for rejected in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "127.0.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "100.64.0.1",
+            "100.127.255.255",
+            "169.254.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.168.0.1",
+            "192.88.99.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "01.1.1.1",
+            "1.1.1.1 ",
+            "1.1.1",
+            "::1",
+        ] {
+            assert!(!public_ipv4(rejected));
+        }
+        for accepted in [
+            "1.1.1.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "169.253.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "192.0.1.1",
+            "192.88.98.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "198.51.99.1",
+            "203.0.112.1",
+        ] {
+            assert!(public_ipv4(accepted));
+        }
     }
 
     #[test]

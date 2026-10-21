@@ -16,4 +16,6 @@ test('development workflow is Mac app-only, unsigned, and has no release or tag 
   assert.ok(verification > 0 && artifact > verification);
   assert.doesNotMatch(workflow, /continue-on-error|if: always\(\)/);
   assert.match(workflow, /if cargo fmt --check; then exit 0; fi\s+cargo fmt\s+git diff --no-ext-diff -- '\*\.rs'\s+exit 1/);
+  const diagnostic = workflow.indexOf('python3 scripts/inspect-packaged-csp.py');
+  assert.ok(diagnostic > 0 && diagnostic < verification);
 });

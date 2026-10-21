@@ -2331,9 +2331,7 @@ mod tests {
     #[test]
     fn marker_parser_uses_utf16_ranges_caps_ranges_and_returns_plain_text() {
         let marked = format!(
-            "plain <tag> 😀 {start}東京{end} العربية {start}café{end}",
-            start = SEARCH_HIGHLIGHT_START,
-            end = SEARCH_HIGHLIGHT_END,
+            "plain <tag> 😀 {SEARCH_HIGHLIGHT_START}東京{SEARCH_HIGHLIGHT_END} العربية {SEARCH_HIGHLIGHT_START}café{SEARCH_HIGHLIGHT_END}"
         );
         let parsed = parse_marked_snippet(&marked).expect("markers should parse");
         assert_eq!(
@@ -2348,13 +2346,7 @@ mod tests {
         assert!(!parsed.text.contains("<mark>"));
 
         let many_ranges = (0..20)
-            .map(|index| {
-                format!(
-                    "{start}term{index}{end}",
-                    start = SEARCH_HIGHLIGHT_START,
-                    end = SEARCH_HIGHLIGHT_END,
-                )
-            })
+            .map(|index| format!("{SEARCH_HIGHLIGHT_START}term{index}{SEARCH_HIGHLIGHT_END}"))
             .collect::<Vec<_>>()
             .join(" ");
         let parsed = parse_marked_snippet(&many_ranges).expect("many markers should parse");

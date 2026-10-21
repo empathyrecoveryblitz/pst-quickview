@@ -56,6 +56,8 @@ jobs:
       - run: scripts/audit-public-repo.sh
       - name: Build universal app only, without signing
         run: npm run tauri -- build --target universal-apple-darwin --bundles app --no-sign --ci
+      - name: Inspect bounded CSP metadata without exposing binary strings
+        run: python3 scripts/inspect-packaged-csp.py src-tauri/tauri.conf.json src-tauri/src/support_session.rs "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app/Contents/MacOS/pst-quickview"
       - name: Inspect the exact current app; no stale-build fallback
         run: EXPECT_DMG=0 bash scripts/verify-macos-release.sh "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app"
       - name: Archive app while preserving Mac executable modes and bundle structure

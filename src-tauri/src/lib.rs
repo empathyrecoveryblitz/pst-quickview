@@ -7314,19 +7314,18 @@ fn resume_index_existing_workspace(
                     &identity.content_fingerprint,
                     &promotion_discovery,
                 ) {
-                    if !import_integrity_phase2::has_staged_manifest(workspace, workspace_id)
-                        .unwrap_or(true)
-                        && verify_replacement_index_with_operation_progress(
-                            app,
-                            workspace,
-                            workspace_id,
-                            &workspace.join("index.sqlite"),
-                            false,
-                        )
-                        .is_ok()
-                    {
-                        promotion_committed = true;
-                    } else {
+                    let active_replacement_is_verified =
+                        !import_integrity_phase2::has_staged_manifest(workspace, workspace_id)
+                            .unwrap_or(true)
+                            && verify_replacement_index_with_operation_progress(
+                                app,
+                                workspace,
+                                workspace_id,
+                                &workspace.join("index.sqlite"),
+                                false,
+                            )
+                            .is_ok();
+                    if !active_replacement_is_verified {
                         if error.code == Some(INDEX_PROMOTION_STATE_UNCERTAIN_CODE) {
                             promotion_state_uncertain = true;
                         }
@@ -8082,9 +8081,7 @@ fn reindex_existing_emls_blocking(
                             false,
                         )
                         .is_ok();
-                if active_replacement_is_verified {
-                    promotion_committed = true;
-                } else {
+                if !active_replacement_is_verified {
                     if error.code == Some(INDEX_PROMOTION_STATE_UNCERTAIN_CODE) {
                         promotion_state_uncertain = true;
                     }
@@ -12535,7 +12532,7 @@ fn available_disk_bytes(path: &Path) -> AppResult<u64> {
         return Err(AppError::new(std::io::Error::last_os_error().to_string()));
     }
 
-    Ok((stat.f_bavail as u64).saturating_mul(stat.f_bsize as u64))
+    Ok(stat.f_bavail.saturating_mul(stat.f_bsize as u64))
 }
 
 fn available_disk_bytes_for_path(path: &Path) -> AppResult<u64> {
@@ -24955,8 +24952,7 @@ mod tests {
         );
         assert!(!conversation_data_is_indexed(&conn).unwrap());
         println!(
-            "migration passed: messages={} attachments={} user_version={}",
-            before_messages, before_attachments, SQLITE_SCHEMA_VERSION_CURRENT
+            "migration passed: messages={before_messages} attachments={before_attachments} user_version={SQLITE_SCHEMA_VERSION_CURRENT}"
         );
     }
 
