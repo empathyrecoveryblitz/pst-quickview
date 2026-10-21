@@ -17,6 +17,8 @@ function fixture({ activeSupport = true } = {}) {
   const find = (node, type) => !node || typeof node !== 'object' ? undefined : node.type === type ? node : node.children?.flat(Infinity).map(child => find(child, type)).find(Boolean);
   const buttons = node => !node || typeof node !== 'object' ? [] : [...(node.type === 'button' ? [node] : []), ...(node.children?.flat(Infinity).flatMap(buttons) || [])];
   return { calls, responses, render, check: () => buttons(render())[0].props.onClick(), install: () => buttons(render())[1]?.props.onClick(),
+    resumeInput: () => find(render(), 'input'),
+    enableResume: () => find(render(), 'input').props.onChange({ target: { checked: true } }),
     disableResume: () => find(render(), 'input').props.onChange({ target: { checked: false } }), flush: () => new Promise(resolve => setImmediate(resolve)) };
 }
 test('update UI performs no automatic check and never exposes remotely actionable approval controls', () => {
@@ -29,7 +31,7 @@ test('only a valid verified candidate and a second deliberate click can request 
   const f = fixture(); f.responses.push({ available: true, pendingId: 'a'.repeat(32), version: '0.2.0-beta.3.support.2' });
   f.check(); f.check(); await f.flush(); assert.equal(f.calls.filter(call => call.command === 'check_verified_update').length, 1); assert.equal(f.calls[0].command, 'check_verified_update');
   f.responses.push({ available: false }); f.install(); await f.flush();
-  assert.equal(f.calls[2].command, 'approve_verified_update'); assert.deepEqual(JSON.parse(JSON.stringify(f.calls[2].args)), { pendingId: 'a'.repeat(32), resume: true });
+  assert.equal(f.calls[2].command, 'approve_verified_update'); assert.deepEqual(JSON.parse(JSON.stringify(f.calls[2].args)), { pendingId: 'a'.repeat(32), resume: false });
 });
 test('malformed or failed check never grants install authority and the owner can explicitly decline resume', async () => {
   for (const candidate of [null, { available: true, pendingId: '../wrong', version: '1.0.0' }, { available: true, pendingId: 'a'.repeat(32), version: '<untrusted>' }, new Error('synthetic')]) {
@@ -42,6 +44,27 @@ test('ordinary updates default to no resumption when no support session is activ
   const f = fixture({ activeSupport: false }); f.responses.push({ available: true, pendingId: 'a'.repeat(32), version: '0.2.0-beta.3.support.2' });
   f.check(); await f.flush(); f.responses.push({ available: false }); f.install(); await f.flush();
   assert.equal(f.calls.find(call => call.command === 'approve_verified_update').args.resume, false);
+});
+test('an unexpired waiting request never silently selects continuation or blocks the ordinary update path', async () => {
+  const f = fixture({ activeSupport: true });
+  f.responses.push({ available: true, pendingId: 'a'.repeat(32), version: '0.2.0-beta.3.support.2' });
+  f.check(); await f.flush();
+  assert.equal(f.resumeInput().props.checked, false);
+  assert.match(source, /only if the separate support window says Connected/);
+  assert.match(source, /Waiting requests cannot resume/);
+  f.responses.push({ available: false }); f.install(); await f.flush();
+  assert.equal(f.calls.find(call => call.command === 'approve_verified_update').args.resume, false);
+});
+test('continuation requires a deliberate additional opt-in and resets for each verified candidate', async () => {
+  const f = fixture({ activeSupport: true });
+  f.responses.push({ available: true, pendingId: 'a'.repeat(32), version: '0.2.0-beta.3.support.2' });
+  f.check(); await f.flush(); assert.equal(f.resumeInput().props.checked, false);
+  f.enableResume(); assert.equal(f.resumeInput().props.checked, true);
+  f.responses.push({ available: true, pendingId: 'c'.repeat(32), version: '0.2.0-beta.3.support.3' });
+  f.check(); await f.flush(); assert.equal(f.resumeInput().props.checked, false);
+  f.enableResume(); f.responses.push({ available: false }); f.install(); await f.flush();
+  const approval = f.calls.find(call => call.command === 'approve_verified_update');
+  assert.equal(approval.args.pendingId, 'c'.repeat(32)); assert.equal(approval.args.resume, true);
 });
 test('resume bootstrap mounts Stop first, suppresses paused capture and fences late completion after Stop', () => {
   assert.match(control, /support_resume_status/); assert.match(control, /resume_support_after_update/);

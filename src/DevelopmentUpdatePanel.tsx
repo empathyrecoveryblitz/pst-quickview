@@ -12,7 +12,7 @@ export function DevelopmentUpdatePanel() {
   const pending = useRef(false);
   async function check() {
     if (pending.current) return;
-    pending.current = true; setBusy(true); setUpdate(null);
+    pending.current = true; setBusy(true); setUpdate(null); setResume(false); setCanResume(false);
     setStatus("Checking and verifying the development update. No installation has been approved.");
     try {
       const next = await invoke<VerifiedUpdate>("check_verified_update");
@@ -21,7 +21,9 @@ export function DevelopmentUpdatePanel() {
         || typeof next.version !== "string" || next.version.length > 128 || !/^[0-9A-Za-z.+-]+$/.test(next.version)) throw Error();
       const session = await invoke<{ sessionId: string; expiresAt: number; updating?: boolean } | null>("support_session_status").catch(() => null);
       const allowed = !!session && /^[a-f0-9]{32}$/.test(session.sessionId) && Number.isSafeInteger(session.expiresAt) && session.expiresAt > Date.now() && session.updating !== true;
-      setCanResume(allowed); setResume(allowed); setUpdate(next);
+      // A native session can still be waiting; it is not proof of connection.
+      // Continuation always needs a separate deliberate local opt-in.
+      setCanResume(allowed); setResume(false); setUpdate(next);
       setStatus("A signed development update is verified and ready. Nothing will be installed until you approve it on this Mac.");
     } catch { setStatus("No verified update is available. The installed app has not been changed."); }
     finally { pending.current = false; setBusy(false); }
@@ -48,6 +50,7 @@ export function DevelopmentUpdatePanel() {
         <label className="support-approval"><input type="checkbox" checked={resume} disabled={busy || !canResume} onChange={event => setResume(event.target.checked)} />
           Resume the currently approved, connected support session after the update (same helper only, within 90 seconds and the original session expiry).
         </label>
+        <p>Choose resume only if the separate support window says Connected. Waiting requests cannot resume; leave this off to update and restart without support.</p>
         <p>A restart is required. Stop cancels support resumption. macOS may ask for local permission; no protection is bypassed.</p>
         <button type="button" disabled={busy} onClick={() => void install()}>{resume ? "Update and resume support" : "Update and restart without support"}</button>
       </> : null}
