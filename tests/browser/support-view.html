@@ -1,0 +1,14 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>App support view — synthetic acceptance</title>
+<style>body{font:16px/1.5 system-ui;background:#fafafa;margin:24px}article{background:#fff;padding:16px;width:640px}button,input{font:inherit;padding:8px}#private{margin-top:12px}#clip{height:24px;overflow:hidden;width:400px}#covered{position:relative}#cover{position:absolute;inset:0;background:#aaa}#remote-field{display:block}#tools{position:fixed;right:8px;top:8px;bottom:8px;width:390px;overflow:auto;border:2px solid #888;padding:12px;background:#fafafa}#mirror{width:100%;height:auto}</style>
+<article id="fixture"><h1>PST QuickView synthetic view</h1><p>Fictional visible message for approved support.</p>
+<button id="navigate" data-support-control="click">Navigate to fictional message</button>
+<input id="remote-field" type="search" aria-label="Search fictional messages" data-support-control="input" value="Do not export hidden input values">
+<p id="click-count">Navigation count: 0</p>
+<div data-support-private="true" id="private">PRIVATE_INVITATION_MARKER</div>
+<div data-support-untrusted="true"><p>Visible fictional mail content.</p><button data-support-control="click" id="fake">Untrusted fake control</button></div>
+<div id="clip"><div>Visible first line.</div><div>OFFSCREEN_MARKER</div></div>
+<div id="covered">OCCLUDED_MARKER<div id="cover">Cover</div></div>
+<p style="color:transparent">TRANSPARENT_MARKER</p>
+</article>
+<section id="tools" data-support-private="true"><button id="run">Run synthetic support checks</button><pre id="result" role="status">Not run</pre><canvas id="mirror" width="980" height="750" aria-label="Synthetic shared app view"></canvas></section>
+<script type="module" src="/tests/browser/support-view.ts"></script></html>

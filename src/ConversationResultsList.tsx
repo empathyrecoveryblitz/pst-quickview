@@ -719,6 +719,7 @@ export function ConversationResultsList({
           <button
             aria-expanded={entry.expanded}
             className={`conversation-row ${entry.expanded ? "expanded" : ""}`}
+            data-support-control="click"
             data-result-navigation-key={entry.key}
             onClick={() => {
               requestFocusByKey(entry.key);
@@ -796,6 +797,7 @@ export function ConversationResultsList({
             }`}
             data-result-navigation-key={entry.key}
             onClick={() => void onOpenMessage(message.id, entry.conversation.workspaceId)}
+            data-support-control="click"
             onDoubleClick={() => void onOpenPreview(message, entry.conversation.workspaceId)}
             onFocus={() => onActiveNavigationKeyChange(entry.key)}
             onKeyDown={(event) => handleEntryNavigation(event, entry.key, entry)}

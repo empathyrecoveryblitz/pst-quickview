@@ -34,6 +34,20 @@ export type WorkspaceSummary = {
   fingerprintStrategy: string;
   workspaceLocationMode: WorkspaceLocationMode;
   workspaceLocationLabel: string;
+  pstSizeBytes: number;
+  integrityState: WorkspaceIntegrityState;
+  integrityClassification: WorkspaceIntegrityClassification;
+  sourceAvailability: WorkspaceSourceAvailability;
+  canResumeIndexing: boolean;
+  canRepairIndex: boolean;
+  canRebuildConversations: boolean;
+  resumeDetails: ResumeDetails | null;
+  hasLastVerification: boolean;
+  conversationState: string;
+  completedImportDurationMs: number | null;
+  lastActivityAt: string | null;
+  activeImportElapsedMs: number;
+  currentStageElapsedMs: number;
 };
 
 export type Folder = {
@@ -43,6 +57,10 @@ export type Folder = {
   name: string;
   messageCount: number;
   directMessageCount: number;
+  activeMessageCount: number;
+  activeDirectMessageCount: number;
+  localTrashMessageCount: number;
+  localTrashDirectMessageCount: number;
 };
 
 export type SearchHighlightRange = {
@@ -81,6 +99,17 @@ export type MessageListItem = {
   workspacePath?: string;
 };
 
+export type LocalTrashQueryHealth = {
+  workspaceId: string;
+  available: boolean;
+  canReset: boolean;
+  sidecarPresent: boolean;
+  schemaVersion: number | null;
+  stateRevision: number;
+  fingerprintMatch: boolean;
+  lastErrorCode: string | null;
+};
+
 export type MessagePageResult = {
   items: MessageListItem[];
   requestedOffset: number;
@@ -88,6 +117,7 @@ export type MessagePageResult = {
   hasMore: boolean;
   nextCursor: string | null;
   paginationMode: "cursor" | "offset";
+  localTrashStates: LocalTrashQueryHealth[];
 };
 
 export type MessageCountResult = {
@@ -144,6 +174,7 @@ export type ConversationPageResult = {
   hasMore: boolean;
   indexedWorkspaceCount: number;
   unindexedWorkspaces: ConversationWorkspaceIssue[];
+  localTrashStates: LocalTrashQueryHealth[];
 };
 
 export type ConversationCountResult = {
@@ -171,6 +202,46 @@ export type SearchFilters = {
   hasAttachments: "any" | "yes" | "no";
   dateFrom: string | null;
   dateTo: string | null;
+};
+
+export type MessageVisibility = "active" | "trashed";
+
+export type LocalTrashSummary = {
+  workspaceId: string;
+  available: boolean;
+  canReset: boolean;
+  sidecarPresent: boolean;
+  trashedMessageCount: number;
+  orphanedStateCount: number;
+  schemaVersion: number | null;
+  stateRevision: number;
+  lastChangedAt: string | null;
+  fingerprintMatch: boolean;
+  lastErrorCode: string | null;
+};
+
+export type LocalTrashMutationResult = {
+  workspaceId: string;
+  result:
+    | "moved"
+    | "already_trashed"
+    | "restored"
+    | "already_active"
+    | "undone";
+  changedCount: number;
+  stateRevision: number;
+  operationId: string | null;
+};
+
+export type LocalTrashUndoState = {
+  workspaceId: string;
+  operationId: string;
+  expectedRevision: number;
+};
+
+export type LocalTrashResetResult = {
+  workspaceId: string;
+  reset: boolean;
 };
 
 export type Attachment = {
@@ -211,6 +282,9 @@ export type MessageDetail = MessageListItem & {
   bodyHtmlAvailable: boolean;
   emlPath: string;
   canReindexFromEml: boolean;
+  inLocalTrash: boolean;
+  localTrashAvailable: boolean;
+  localTrashErrorCode: string | null;
   attachments: Attachment[];
 };
 
@@ -321,6 +395,9 @@ export type SourceEmlView = {
   bodyText: string;
   bodySource: "text_plain" | "html_converted" | "rtf_converted" | "missing" | "parse_error" | string;
   bodyHtmlAvailable: boolean;
+  inLocalTrash: boolean;
+  localTrashAvailable: boolean;
+  localTrashErrorCode: string | null;
   sanitizedHtml: string;
   remoteImagesBlocked: boolean;
   remoteImageCount: number;
@@ -362,13 +439,6 @@ export type SavePrintableHtmlResult = {
   error: string | null;
 };
 
-export type ImportProgress = {
-  stage: string;
-  current: number | null;
-  total: number | null;
-  message: string;
-};
-
 export type CancelImportResult = {
   requested: boolean;
   pid: number | null;
@@ -388,6 +458,84 @@ export type WorkspaceSize = {
 };
 
 export type WorkspaceLocationMode = "app_support" | "next_to_pst";
+
+export type WorkspaceIntegrityState =
+  | "preflight"
+  | "extracting"
+  | "extraction_complete"
+  | "discovering"
+  | "indexing"
+  | "building_conversations"
+  | "verifying"
+  | "complete"
+  | "cancelled"
+  | "incomplete"
+  | "failed";
+
+export type WorkspaceIntegrityClassification = "complete" | "incomplete" | "unsupported";
+
+export type WorkspaceSourceAvailability = "available" | "unavailable" | "changed";
+
+export type ResumeDetails = {
+  pstBasename: string;
+  lastCompletedStage: string;
+  interruptedStage: string;
+  discoveredCandidates: number;
+  canonicalIndexed: number;
+  remainingCandidates: number | null;
+  lastSuccessfulUpdate: string;
+  elapsedDurationMs: number;
+  stageElapsedDurationMs: number;
+  lastActivityAt: string | null;
+  reason: string;
+};
+
+export type VerificationLevel = "quick" | "full";
+
+export type VerificationResult =
+  | "verified"
+  | "incomplete"
+  | "repairable"
+  | "source_unavailable"
+  | "source_changed"
+  | "extraction_inconsistent"
+  | "database_inconsistent"
+  | "unsupported"
+  | "failed";
+
+export type PossibleDuplicateGroupDetail = {
+  opaqueId: string;
+  signals: string[];
+};
+
+export type VerificationReport = {
+  formatVersion: number;
+  operationId: string;
+  workspaceId: string;
+  verificationLevel: VerificationLevel;
+  result: VerificationResult;
+  workspaceState: WorkspaceIntegrityState;
+  discoveredCandidates: number;
+  canonicalMessages: number;
+  insertedMessages: number;
+  skippedExistingMessages: number;
+  parseFailures: number;
+  attachments: number;
+  folders: number;
+  ftsRows: number;
+  conversationState: string;
+  missingCanonicalRecords: number;
+  unexpectedCanonicalRecords: number;
+  possibleDuplicateGroups: number;
+  possibleDuplicateGroupDetails: PossibleDuplicateGroupDetail[];
+  sourceIntegrity: "passed" | "unavailable" | "changed";
+  startedAt: string;
+  completedAt: string;
+  elapsedDurationMs: number;
+  completedImportDurationMs: number | null;
+  warnings: string[];
+  recommendedActions: string[];
+};
 
 export type WorkspacePreflight = {
   originalPstPath: string;
@@ -418,11 +566,19 @@ export type ExistingWorkspace = {
   canResume: boolean;
   canReimport: boolean;
   messageCount: number;
+  canOpen: boolean;
+  integrityState: WorkspaceIntegrityState;
+  integrityClassification: WorkspaceIntegrityClassification;
+  canRepairIndex: boolean;
+  canRebuildConversations: boolean;
+  resumeDetails: ResumeDetails | null;
+  hasLastVerification: boolean;
 };
 
 export type PstOpenPlan = {
   pstPath: string;
   fingerprint: string;
+  workspaceId: string;
   selectedWorkspacePath: string;
   selectedWorkspaceLocationMode: WorkspaceLocationMode;
   selectedWorkspaceLocationLabel: string;

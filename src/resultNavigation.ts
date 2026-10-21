@@ -254,6 +254,7 @@ export function didResultNavigationContextChange(
     previous.includeSubfolders !== next.includeSubfolders ||
     !sameConversationScopes(previous.conversationScopes, next.conversationScopes) ||
     previous.sessionGeneration !== next.sessionGeneration ||
+    previous.visibility !== next.visibility ||
     (mode === "messages"
       ? previous.messageSort !== next.messageSort
       : previous.conversationSort !== next.conversationSort)

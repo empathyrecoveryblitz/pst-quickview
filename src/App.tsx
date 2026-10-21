@@ -12,9 +12,9 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { RemoteSupportPanel } from "./RemoteSupportPanel";
+import { RemoteSupportControl } from "./RemoteSupportControl";
 import type {
   AppDiagnostics,
   Attachment,
@@ -36,7 +36,11 @@ import type {
   ExportOriginalEmlResult,
   Folder,
   HtmlRenderResult,
-  ImportProgress,
+  LocalTrashMutationResult,
+  LocalTrashQueryHealth,
+  LocalTrashResetResult,
+  LocalTrashSummary,
+  LocalTrashUndoState,
   MessageDiagnostics,
   MessageDetail,
   MessageCountResult,
@@ -48,12 +52,58 @@ import type {
   ReadpstStatus,
   SavePrintableHtmlResult,
   SourceEmlView,
+  VerificationReport,
+  WorkspaceIntegrityClassification,
   WorkspaceLocationMode,
   WorkspacePreflight,
   WorkspaceSearchCount,
   WorkspaceSize,
   WorkspaceSummary,
+  MessageVisibility,
 } from "./types";
+import {
+  completedImportDurationText,
+  formatCompactDuration as formatImportDuration,
+  importCounterRows,
+  importEtaPresentation,
+  importHeadline,
+  importIdentityPresentation,
+  importProgressSemantics,
+  importStageExplanation,
+  importStageTracker,
+  lastActivityText,
+  materialImportAnnouncementKey,
+  materialImportAnnouncementText,
+  parseImportProgressSnapshot,
+  processHealthText,
+  reduceImportProgress,
+  stageLabel as importStageLabel,
+  terminalImportPresentation,
+  unitProgressText,
+  type ImportCounterKey,
+  type ImportProgressSnapshot,
+  type ImportSourceIdentityPeer,
+} from "./importProgress";
+import {
+  createWorkspaceIntegrityOperationToken,
+  formatElapsedDuration,
+  integrityOperationIsCancellable,
+  integrityOperationLabel,
+  integrityOperationRunningLabel,
+  isVerificationReportForOperation,
+  isWorkspaceIntegrityOperationCurrent,
+  possibleDuplicateSummary,
+  resumeProgressDescription,
+  verificationHeadline,
+  verificationLevelLabel,
+  verificationResultLabel,
+  workspaceIntegrityActions,
+  workspaceIntegrityStateLabel,
+  workspaceSourceAvailabilityMessage,
+  workspaceSummaryWithVerification,
+  type WorkspaceIntegrityOperationKind,
+  type WorkspaceIntegrityOperationToken,
+} from "./workspaceIntegrity";
 import packageInfo from "../package.json";
 import {
   appearanceStorageKey,
@@ -64,6 +114,8 @@ import {
 } from "./appearance";
 import {
   defaultWorkspaceFolderSelection,
+  isLocalTrashFolderSelection,
+  localTrashWorkspaceFolderSelection,
   normalizeStoredFolderSelection,
   resolveWorkspaceFolderSelection,
   type WorkspaceFolderSelection,
@@ -141,9 +193,51 @@ import {
   resetResultNavigationMode,
   setResultNavigationActiveKey,
 } from "./resultNavigation";
+import {
+  closeOpenPopover,
+  createDismissiblePopoverController,
+  toggleOpenPopover,
+} from "./popoverBehavior";
+import {
+  buildFolderHierarchy,
+  resolveFolderPresentationSelection,
+  saveFolderHierarchyMode,
+  storedFolderHierarchyMode,
+  type FolderHierarchyMode,
+  type PresentationFolderNode,
+} from "./folderHierarchy";
+import {
+  aggregateLocalTrashSummaries,
+  createLocalTrashOperationToken,
+  createLocalTrashResetToken,
+  effectiveAllOpenLocalTrashQueryScope,
+  initialLocalTrashUndoState,
+  isLocalTrashMutationResponseCurrent,
+  isLocalTrashResetResponseCurrent,
+  isLocalTrashUndoCurrent,
+  localTrashActionDisclosure,
+  localTrashResetDisclosure,
+  localTrashStorageDisclosure,
+  reduceLocalTrashUndoState,
+  type LocalTrashOperationToken,
+  type LocalTrashResetToken,
+} from "./localTrash";
 
-type FolderNode = Folder & { children: FolderNode[] };
-type ImportAction = "import" | "open_existing" | "resume_index" | "reimport";
+type FolderNode = PresentationFolderNode;
+type CustomPopoverId =
+  | "advanced_search"
+  | "recent"
+  | "workspace"
+  | "layout"
+  | "workspace_details"
+  | "import_progress"
+  | "help";
+type ImportAction =
+  | "import"
+  | "open_existing"
+  | "resume_index"
+  | "repair_index"
+  | "reimport";
 type ReaderMode = "plain_text" | "sanitized_html";
 type SourceEmlMode = "rendered" | "plain_text" | "raw_source";
 type LayoutMode = "three_column" | "outlook";
@@ -157,10 +251,14 @@ type OpenPstSession = {
   workspaceSize: WorkspaceSize | null;
   folders: Folder[];
   folderSelection: WorkspaceFolderSelection;
-  status: "complete" | "importing" | "error";
+  canonicalFolderSelection: WorkspaceFolderSelection;
+  localTrashSummary: LocalTrashSummary;
+  status: WorkspaceIntegrityClassification;
 };
 type WorkspaceOperationState = {
-  progress: ImportProgress | null;
+  progress: ImportProgressSnapshot | null;
+  progressOperationId: string | null;
+  progressReceivedAtMonotonicMs: number | null;
   running: boolean;
   notice: string | null;
   error: string | null;
@@ -168,6 +266,11 @@ type WorkspaceOperationState = {
   deleteResult: DeleteResult | null;
   deleteStatuses: string[];
   deleteConfirmOpen: boolean;
+  integrityOperationKind: WorkspaceIntegrityOperationKind | null;
+  integrityOperationId: string | null;
+  verificationReport: VerificationReport | null;
+  verificationReportOpen: boolean;
+  repairConfirmOpen: boolean;
 };
 type WorkspaceDeleteToast = {
   workspaceId: string;
@@ -203,9 +306,15 @@ type PendingPreflightOpen = {
   allowDuplicate: boolean;
   importAction: ImportAction;
 };
+type PendingPlannedRepair = {
+  plan: PstOpenPlan;
+  existingWorkspace: ExistingWorkspace;
+};
 
 const emptyWorkspaceOperationState = (): WorkspaceOperationState => ({
   progress: null,
+  progressOperationId: null,
+  progressReceivedAtMonotonicMs: null,
   running: false,
   notice: null,
   error: null,
@@ -213,6 +322,11 @@ const emptyWorkspaceOperationState = (): WorkspaceOperationState => ({
   deleteResult: null,
   deleteStatuses: [],
   deleteConfirmOpen: false,
+  integrityOperationKind: null,
+  integrityOperationId: null,
+  verificationReport: null,
+  verificationReportOpen: false,
+  repairConfirmOpen: false,
 });
 type PrintablePreview = {
   title: string;
@@ -239,15 +353,19 @@ type ExpandedConversationRequestIdentity = SearchOperationIdentity & {
 };
 type SourceEmlContext =
   | { kind: "workspace"; workspaceId: string; messageId: number }
-  | { kind: "standalone"; messagePath: string };
+  | { kind: "standalone"; stableId: string };
 type PreviewWindowTarget =
   | { kind: "workspace"; workspaceId: string; messageId: number }
-  | { kind: "standalone"; messagePath: string };
+  | { kind: "standalone"; stableId: string };
+type PreviewWindowRequest =
+  | { kind: "workspace"; workspaceId: string; messageId: number }
+  | { kind: "standalone"; stableId: string };
+type PreviewWindowOpenResult = { created: boolean };
 const missingReadpstCommand = "brew install libpst";
 const workspaceLocationStorageKey = "pstQuickView.workspaceLocationMode";
 const paneWidthStorageKey = "pstQuickView.paneWidths";
 const folderHiddenStorageKey = "pstQuickView.folderPaneHidden";
-const collapsedFolderPathsStorageKey = "pstQuickView.collapsedFolderPaths";
+const collapsedFolderIdentitiesStorageKey = "pstQuickView.collapsedFoldersByHierarchy";
 const layoutModeStorageKey = "pstQuickView.layoutMode";
 const messageListDisplayStorageKey = "pstQuickView.messageListDisplayMode";
 const listModeStorageKey = "pstQuickView.listMode";
@@ -275,9 +393,21 @@ const searchDebounceMs = 350;
 const defaultAdvancedSearchFilters: AdvancedSearchFilters = defaultSearchFilterDraft;
 const advancedSearchToggleId = "advanced-search-toggle";
 const advancedSearchPanelId = "advanced-search-panel";
+const recentPopoverPanelId = "recent-popover-panel";
+const workspacePopoverPanelId = "workspace-popover-panel";
+const layoutPopoverPanelId = "layout-popover-panel";
+const workspaceDetailsPanelId = "workspace-details-panel";
+const importProgressDetailsPanelId = "import-progress-details-panel";
+const helpDialogId = "help-dialog";
 const relevanceSortHelpId = "relevance-sort-help";
-const loadRemoteImagesActionLabel = "Load remote images for this message";
-const loadingRemoteImagesStatus = "Loading remote images for this message.";
+const repairIndexDescriptionId = "repair-index-description";
+const repairConfirmTitleId = "repair-index-confirm-title";
+const repairConfirmDescriptionId = "repair-index-confirm-description";
+const localTrashResetTitleId = "local-trash-reset-title";
+const localTrashResetDescriptionId = "local-trash-reset-description";
+const verificationReportTitleId = "verification-report-title";
+const remoteImagesBlockedMessage =
+  "Remote images are blocked for privacy and security.";
 
 type PaneWidths = typeof defaultPaneWidths;
 
@@ -287,6 +417,67 @@ function getErrorMessage(error: unknown): string {
     return String((error as BackendError).message);
   }
   return "An unknown error occurred.";
+}
+
+function getBackendErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object" || !("code" in error)) return null;
+  const code = (error as BackendError).code;
+  return typeof code === "string" && code.length > 0 ? code : null;
+}
+
+function unavailableLocalTrashSummary(
+  workspaceId: string,
+  lastErrorCode = "LOCAL_TRASH_UNAVAILABLE",
+): LocalTrashSummary {
+  return {
+    workspaceId,
+    available: false,
+    canReset: false,
+    sidecarPresent: false,
+    trashedMessageCount: 0,
+    orphanedStateCount: 0,
+    schemaVersion: null,
+    stateRevision: 0,
+    lastChangedAt: null,
+    fingerprintMatch: false,
+    lastErrorCode,
+  };
+}
+
+function localTrashHealthLabel(summary: LocalTrashSummary | null): string {
+  if (!summary) return "Unavailable";
+  if (
+    summary.available &&
+    summary.fingerprintMatch &&
+    summary.lastErrorCode == null
+  ) return "Available";
+  return "Unavailable - messages remain visible in normal views";
+}
+
+function workspaceActiveMessageCount(session: OpenPstSession): number {
+  return session.folders.reduce(
+    (total, folder) =>
+      total +
+      Math.max(
+        0,
+        Number.isSafeInteger(folder.activeDirectMessageCount)
+          ? folder.activeDirectMessageCount
+          : folder.directMessageCount,
+      ),
+    0,
+  );
+}
+
+function isLocalTrashHealthy(summary: LocalTrashSummary | null): boolean {
+  return Boolean(
+    summary?.available &&
+      summary.fingerprintMatch &&
+      summary.lastErrorCode == null,
+  );
+}
+
+function canResetLocalTrashState(summary: LocalTrashSummary | null): boolean {
+  return summary?.canReset === true;
 }
 
 function errorSummary(error: string): string {
@@ -490,15 +681,24 @@ function initialBooleanPreference(key: string, fallback: boolean): boolean {
   return fallback;
 }
 
-function initialCollapsedFolderPaths(): string[] {
-  if (typeof window === "undefined") return [];
+type CollapsedFolderIdentitiesByMode = Record<FolderHierarchyMode, Set<string>>;
+
+function initialCollapsedFolderIdentities(): CollapsedFolderIdentitiesByMode {
+  if (typeof window === "undefined") {
+    return { simplified: new Set(), original: new Set() };
+  }
   try {
-    const stored = JSON.parse(window.localStorage.getItem(collapsedFolderPathsStorageKey) ?? "[]");
-    return Array.isArray(stored)
-      ? stored.filter((item): item is string => typeof item === "string")
-      : [];
+    const stored = JSON.parse(
+      window.localStorage.getItem(collapsedFolderIdentitiesStorageKey) ?? "{}",
+    ) as Partial<Record<FolderHierarchyMode, unknown>>;
+    const identities = (value: unknown) =>
+      new Set(Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []);
+    return {
+      simplified: identities(stored.simplified),
+      original: identities(stored.original),
+    };
   } catch {
-    return [];
+    return { simplified: new Set(), original: new Set() };
   }
 }
 
@@ -523,52 +723,34 @@ function initialListMode(): ListMode {
     : "messages";
 }
 
-function buildFolderTree(folders: Folder[]): FolderNode[] {
-  const nodes = new Map<number, FolderNode>();
-  for (const folder of folders) {
-    nodes.set(folder.id, { ...folder, children: [] });
-  }
-
-  const roots: FolderNode[] = [];
-  for (const node of nodes.values()) {
-    if (node.parentId && nodes.has(node.parentId)) {
-      nodes.get(node.parentId)!.children.push(node);
-    } else {
-      roots.push(node);
-    }
-  }
-
-  const sortNodes = (items: FolderNode[]) => {
-    items.sort((a, b) => a.name.localeCompare(b.name));
-    items.forEach((item) => sortNodes(item.children));
-  };
-  sortNodes(roots);
-
-  return roots;
-}
-
-function folderCollapseKey(folder: Folder, workspaceId: string | null): string {
-  return `${workspaceId ?? "active"}:${folder.path || `id:${folder.id}`}`;
+function folderCollapseKey(folder: FolderNode, _workspaceId?: string | null): string {
+  return folder.canonicalIdentity;
 }
 
 function workspaceRootCollapseKey(workspaceId: string): string {
-  return `workspace:${workspaceId}`;
+  return `workspace:${workspaceId.length}:${workspaceId}`;
 }
 
-function collectCollapsibleFolderKeys(nodes: FolderNode[], workspaceId: string | null): string[] {
+function collectCollapsibleFolderKeys(
+  nodes: readonly FolderNode[],
+  _workspaceId?: string | null,
+): string[] {
   const keys: string[] = [];
-  const visit = (items: FolderNode[]) => {
-    for (const item of items) {
-      if (item.children.length) keys.push(folderCollapseKey(item, workspaceId));
-      visit(item.children);
-    }
-  };
-  visit(nodes);
+  const pending = [...nodes];
+  while (pending.length) {
+    const item = pending.pop()!;
+    if (item.children.length) keys.push(folderCollapseKey(item));
+    pending.push(...item.children);
+  }
   return keys;
 }
 
 function formatCount(count: number): string {
   return new Intl.NumberFormat().format(count);
+}
+
+function formatCandidateProgress(progress: { current: number; total: number }): string {
+  return `Processed ${formatCount(progress.current)} of ${formatCount(progress.total)} extracted message candidates`;
 }
 
 function BreakableFilesystemPath({ path }: { path: string }) {
@@ -610,6 +792,62 @@ function formatOptionalBytes(bytes: number | null): string {
 
 function formatMaybeBytes(bytes: number | null): string {
   return bytes == null ? "" : formatBytes(bytes);
+}
+
+const importStageCounterKeys: Record<
+  ImportProgressSnapshot["stage"],
+  readonly ImportCounterKey[]
+> = {
+  preflight: [],
+  extracting: ["outputFilesObserved", "outputBytesObserved", "workspaceBytesWritten"],
+  discovering: ["candidatesDiscovered"],
+  indexing: [
+    "candidatesProcessed",
+    "canonicalMessages",
+    "insertedMessages",
+    "skippedExistingMessages",
+    "parseFailures",
+    "attachmentsIndexed",
+  ],
+  building_conversations: ["conversationRecordsProcessed", "conversationRecordsTotal"],
+  verifying: [
+    "verificationChecksCompleted",
+    "verificationChecksTotal",
+    "missingCanonicalRecords",
+    "unexpectedCanonicalRecords",
+    "possibleDuplicateGroups",
+  ],
+  complete: [
+    "candidatesDiscovered",
+    "canonicalMessages",
+    "attachmentsIndexed",
+    "missingCanonicalRecords",
+    "unexpectedCanonicalRecords",
+    "possibleDuplicateGroups",
+  ],
+};
+
+function monotonicMilliseconds(): number {
+  return typeof performance === "undefined" ? 0 : performance.now();
+}
+
+function importWarningText(code: ImportProgressSnapshot["warningCodes"][number]): string {
+  switch (code) {
+    case "no_recent_activity_signal":
+      return "No recent measurable activity signal.";
+    case "source_unavailable":
+      return "The source PST is currently unavailable.";
+    case "source_changed":
+      return "The available source no longer matches the recorded identity.";
+    case "possible_duplicate_groups":
+      return "Possible duplicate source-record groups were observed; no records were suppressed.";
+    case "verification_incomplete":
+      return "Internal verification is incomplete.";
+    case "progress_signal_unavailable":
+      return "This stage does not provide a measurable progress signal.";
+    case "prior_timing_unavailable":
+      return "Only active time recorded since this workspace entered Phase 3 is available.";
+  }
 }
 
 function yesNo(value: boolean): string {
@@ -1190,7 +1428,7 @@ function diagnosticNotes(diagnostics: MessageDiagnostics): string[] {
     notes.push("HTML recovered from Outlook RTF.");
   }
   if (diagnostics.remoteImagesDetected) {
-    notes.push("Remote images detected; they remain blocked unless loaded for this message.");
+    notes.push("Remote images detected; they remain blocked for privacy and security.");
   }
   if (diagnostics.cidImagesDetected) {
     notes.push("CID/embedded image references detected.");
@@ -1233,23 +1471,24 @@ function FolderRows({
   onSelect,
   level = 0,
 }: {
-  nodes: FolderNode[];
+  nodes: readonly FolderNode[];
   workspaceId: string;
   selectedWorkspaceId: string | null;
   selectedFolderId: number | null;
   includeSubfolders: boolean;
   collapsedFolderPaths: Set<string>;
   onToggleCollapse: (folder: FolderNode, workspaceId: string) => void;
-  onSelect: (folder: Folder, workspaceId: string) => void;
+  onSelect: (folder: FolderNode, workspaceId: string) => void;
   level?: number;
 }) {
   return (
     <>
       {nodes.map((node) => {
         const isCollapsed = collapsedFolderPaths.has(folderCollapseKey(node, workspaceId));
-        const isSelected = selectedWorkspaceId === workspaceId && selectedFolderId === node.id;
+        const isSelected =
+          selectedWorkspaceId === workspaceId && selectedFolderId === node.canonicalFolderId;
         return (
-          <div key={node.id}>
+          <div key={node.presentationId}>
             <div
               className={`folder-row folder-row-composite ${isSelected ? "selected" : ""}`}
               style={{ paddingLeft: `${12 + level * 14}px` }}
@@ -1257,22 +1496,26 @@ function FolderRows({
               <button
                 type="button"
                 className="folder-toggle-button"
+                data-support-control="click"
                 onClick={() => onToggleCollapse(node, workspaceId)}
                 disabled={!node.children.length}
                 title={isCollapsed ? "Expand folder" : "Collapse folder"}
-                aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${node.name}`}
+                aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${node.displayName}`}
+                aria-expanded={node.children.length ? !isCollapsed : undefined}
               >
                 {node.children.length ? (isCollapsed ? ">" : "v") : ""}
               </button>
               <button
                 type="button"
                 className="folder-select-button"
+                data-support-control="click"
                 onClick={() => onSelect(node, workspaceId)}
-                title={node.path || "Root folder"}
+                title={node.originalPath || "PST root"}
+                aria-current={isSelected ? "true" : undefined}
               >
-                <span className="folder-name">{node.name}</span>
+                <span className="folder-name">{node.displayName}</span>
                 <span className="folder-count">
-                  {includeSubfolders ? node.messageCount : node.directMessageCount}
+                  {includeSubfolders ? node.descendantMessageCount : node.directMessageCount}
                 </span>
               </button>
             </div>
@@ -1296,34 +1539,10 @@ function FolderRows({
   );
 }
 
-function previewWindowParams(): PreviewWindowTarget | null {
-  if (typeof window === "undefined") return null;
+function isMessagePreviewRoute(): boolean {
+  if (typeof window === "undefined") return false;
   const params = new URLSearchParams(window.location.search);
-  const standaloneMessagePath = params.get("standaloneMessagePath");
-  if (standaloneMessagePath) {
-    return { kind: "standalone", messagePath: standaloneMessagePath };
-  }
-  const workspaceId = params.get("previewWorkspaceId");
-  const messageId = Number(params.get("previewMessageId"));
-  if (!workspaceId || !Number.isFinite(messageId)) return null;
-  return { kind: "workspace", workspaceId, messageId };
-}
-
-function previewWindowLabel(workspaceId: string, messageId: number): string {
-  const safeWorkspaceId = workspaceId.replace(/[^a-zA-Z0-9:/_-]/g, "_");
-  return `message-preview-${safeWorkspaceId}-${messageId}`;
-}
-
-function standalonePreviewWindowLabel(stableId: string): string {
-  return `message-preview-file-${stableId.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
-}
-
-function stringifyWindowError(error: unknown): string {
-  if (typeof error === "string") return error;
-  if (error && typeof error === "object" && "payload" in error) {
-    return String((error as { payload: unknown }).payload);
-  }
-  return getErrorMessage(error);
+  return params.get("messagePreview") === "1";
 }
 
 function sourceMessageFormatLabel(view: SourceEmlView | null): "EML" | "MSG" {
@@ -1342,10 +1561,39 @@ function rawSourceSearchLabel(view: SourceEmlView): string {
     : "Search raw EML source";
 }
 
+function MessagePreviewBootstrap() {
+  const [target, setTarget] = useState<PreviewWindowTarget | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let current = true;
+    invoke<PreviewWindowTarget>("get_preview_window_target")
+      .then((result) => {
+        if (current) setTarget(result);
+      })
+      .catch((err) => {
+        if (current) setError(getErrorMessage(err));
+      });
+    return () => {
+      current = false;
+    };
+  }, []);
+
+  if (target) return <MessagePreviewWindow target={target} />;
+  return (
+    <main className="preview-window-shell">
+      <section className="source-eml-modal source-eml-window" aria-label="Message Preview">
+        <p className={error ? "message-action-status action-error" : "message-action-status"}>
+          {error ?? "Loading message preview."}
+        </p>
+      </section>
+    </main>
+  );
+}
+
 function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
   const [sourceEmlView, setSourceEmlView] = useState<SourceEmlView | null>(null);
   const [sourceEmlMode, setSourceEmlMode] = useState<SourceEmlMode>("rendered");
-  const [sourceEmlRemoteAllowed, setSourceEmlRemoteAllowed] = useState(false);
   const [sourceEmlStatus, setSourceEmlStatus] = useState<string | null>("Loading message preview.");
   const [sourceEmlSaveResult, setSourceEmlSaveResult] = useState<ExportOriginalEmlResult | null>(
     null,
@@ -1372,25 +1620,20 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
     return () => window.removeEventListener("storage", handleStorage);
   }, []);
 
-  async function loadSourceEml(allowRemoteResources = false) {
+  async function loadSourceEml() {
     setError(null);
-    setSourceEmlStatus(
-      allowRemoteResources ? loadingRemoteImagesStatus : "Loading message preview.",
-    );
+    setSourceEmlStatus("Loading message preview.");
     try {
       const result =
         target.kind === "workspace"
           ? await invoke<SourceEmlView>("get_source_eml_view", {
               workspaceId: target.workspaceId,
               messageId: target.messageId,
-              allowRemoteResources,
             })
           : await invoke<SourceEmlView>("get_standalone_message_view", {
-              path: target.messagePath,
-              allowRemoteResources,
+              stableId: target.stableId,
             });
       setSourceEmlView(result);
-      setSourceEmlRemoteAllowed(allowRemoteResources);
       setSourceEmlStatus(null);
       const windowTitle = result.subject || "Message Preview";
       document.title = windowTitle;
@@ -1402,8 +1645,8 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
   }
 
   useEffect(() => {
-    void loadSourceEml(false);
-  }, [target.kind, target.kind === "workspace" ? target.workspaceId : target.messagePath]);
+    void loadSourceEml();
+  }, [target.kind, target.kind === "workspace" ? target.workspaceId : target.stableId]);
 
   function buildPreviewPrintable(): PrintablePreview | null {
     if (!sourceEmlView) return null;
@@ -1422,7 +1665,7 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
     } else if (sourceEmlView.sanitizedHtml.trim()) {
       bodyHtml = `<div class="html-body">${makeSanitizedHtmlPrintable(sourceEmlView.sanitizedHtml)}</div>`;
       bodyModeLabel = "Rendered View";
-      if (sourceEmlView.remoteImagesBlocked && !sourceEmlRemoteAllowed) {
+      if (sourceEmlView.remoteImagesBlocked) {
         note = "Remote images were blocked for this print.";
       }
     } else {
@@ -1506,7 +1749,7 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
               messageId: target.messageId,
             })
           : await invoke<ExportOriginalEmlResult>("save_standalone_source_message_as", {
-              path: target.messagePath,
+              stableId: target.stableId,
             });
       setSourceEmlSaveResult(result);
       if (result.exported) {
@@ -1535,7 +1778,7 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
               attachmentId,
             })
           : await invoke<ExportAttachmentResult>("export_standalone_message_attachment", {
-              path: target.messagePath,
+              stableId: target.stableId,
               attachmentId,
             });
       setExportResults((current) => ({ ...current, [attachmentId]: result }));
@@ -1559,7 +1802,7 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
               attachmentId,
             })
           : await invoke<ExportAttachmentResult>("open_standalone_message_attachment", {
-              path: target.messagePath,
+              stableId: target.stableId,
               attachmentId,
             });
       setExportResults((current) => ({ ...current, [attachmentId]: result }));
@@ -1622,6 +1865,9 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
         <header className="source-eml-header">
           <div>
             <h2>{sourceEmlView?.subject || "Message Preview"}</h2>
+            {sourceEmlView?.inLocalTrash ? (
+              <span className="local-trash-badge">In Local Trash</span>
+            ) : null}
             <p title={sourceEmlView?.sourcePath}>
               {sourceEmlView?.sourcePath ?? "Loading message source."}
             </p>
@@ -1848,17 +2094,9 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
             <section className="source-eml-body">
               {sourceEmlMode === "rendered" ? (
                 <>
-                  {sourceEmlView.remoteImagesBlocked && !sourceEmlRemoteAllowed ? (
+                  {sourceEmlView.remoteImagesBlocked ? (
                     <div className="remote-image-notice">
-                      <span>Remote images are blocked.</span>
-                      <button
-                        type="button"
-                        onClick={() => void loadSourceEml(true)}
-                        aria-label={loadRemoteImagesActionLabel}
-                        title={loadRemoteImagesActionLabel}
-                      >
-                        {loadRemoteImagesActionLabel}
-                      </button>
+                      <span>{remoteImagesBlockedMessage}</span>
                     </div>
                   ) : null}
                   {sourceEmlView.sanitizedHtml.trim() ? (
@@ -1871,6 +2109,7 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
                         if ((event.target as HTMLElement).closest("a")) event.preventDefault();
                       }}
                       dangerouslySetInnerHTML={{ __html: sourceEmlView.sanitizedHtml }}
+                      data-support-untrusted="true"
                     />
                   ) : (
                     <>
@@ -1914,9 +2153,8 @@ function MessagePreviewWindow({ target }: { target: PreviewWindowTarget }) {
 }
 
 function App() {
-  const previewParams = previewWindowParams();
-  if (previewParams) {
-    return <MessagePreviewWindow target={previewParams} />;
+  if (isMessagePreviewRoute()) {
+    return <MessagePreviewBootstrap />;
   }
 
   const [readpstStatus, setReadpstStatus] = useState<ReadpstStatus | null>(null);
@@ -1925,17 +2163,35 @@ function App() {
   const [workspaceSize, setWorkspaceSize] = useState<WorkspaceSize | null>(null);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [selectedFolderId, setSelectedFolderId] = useState<number | null>(null);
+  const [messageVisibility, setMessageVisibility] = useState<MessageVisibility>("active");
   const [allOpenFolderSelection, setAllOpenFolderSelection] = useState<AllOpenFolderSelection>({
     workspaceId: null,
     folderId: null,
   });
+  const [localTrashAllOpenWorkspaceId, setLocalTrashAllOpenWorkspaceId] = useState<
+    string | null
+  >(null);
   const [includeSubfolders, setIncludeSubfolders] = useState(true);
   const [foldersHidden, setFoldersHidden] = useState(() =>
     initialBooleanPreference(folderHiddenStorageKey, false),
   );
-  const [collapsedFolderPaths, setCollapsedFolderPaths] = useState<Set<string>>(
-    () => new Set(initialCollapsedFolderPaths()),
+  const [folderHierarchyMode, setFolderHierarchyMode] = useState<FolderHierarchyMode>(() =>
+    storedFolderHierarchyMode(typeof window === "undefined" ? null : window.localStorage),
   );
+  const [collapsedFolderIdentitiesByMode, setCollapsedFolderIdentitiesByMode] = useState(
+    initialCollapsedFolderIdentities,
+  );
+  const collapsedFolderPaths = collapsedFolderIdentitiesByMode[folderHierarchyMode];
+  function setCollapsedFolderPaths(
+    update: Set<string> | ((current: Set<string>) => Set<string>),
+  ) {
+    setCollapsedFolderIdentitiesByMode((current) => {
+      const currentModeState = current[folderHierarchyMode];
+      const nextModeState =
+        typeof update === "function" ? update(currentModeState) : update;
+      return { ...current, [folderHierarchyMode]: nextModeState };
+    });
+  }
   const [messages, setMessages] = useState<MessageListItem[]>([]);
   const [messageTotalCount, setMessageTotalCount] = useState(0);
   const [messageHasMore, setMessageHasMore] = useState(false);
@@ -1943,6 +2199,14 @@ function App() {
     createSearchExactCountState(0),
   );
   const [listMode, setListMode] = useState<ListMode>(initialListMode);
+  const previousActiveListModeRef = useRef<ListMode>(initialListMode());
+  const [localTrashUndo, setLocalTrashUndo] = useState<LocalTrashUndoState | null>(
+    initialLocalTrashUndoState,
+  );
+  const [localTrashStatus, setLocalTrashStatus] = useState<string | null>(null);
+  const [localTrashError, setLocalTrashError] = useState<string | null>(null);
+  const [localTrashMutationPending, setLocalTrashMutationPending] = useState(false);
+  const [localTrashResetConfirmOpen, setLocalTrashResetConfirmOpen] = useState(false);
   const [resultNavigation, setResultNavigation] = useState(createResultNavigationState);
   const setMessageNavigationKey = useCallback((key: string | null) => {
     setResultNavigation((current) => setResultNavigationActiveKey(current, "messages", key));
@@ -1971,7 +2235,7 @@ function App() {
   >({});
   const [selectedMessage, setSelectedMessage] = useState<MessageDetail | null>(null);
   const [search, setSearch] = useState("");
-  const [advancedSearchOpen, setAdvancedSearchOpen] = useState(false);
+  const [openPopoverId, setOpenPopoverId] = useState<CustomPopoverId | null>(null);
   const [searchFilters, setSearchFilters] = useState<AdvancedSearchFilters>(
     defaultAdvancedSearchFilters,
   );
@@ -2012,9 +2276,9 @@ function App() {
   const [workspaceOperationStates, setWorkspaceOperationStates] = useState<
     Record<string, WorkspaceOperationState>
   >({});
+  const [progressClockTick, setProgressClockTick] = useState(0);
   const [isBusy, setIsBusy] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
-  const [aboutOpen, setAboutOpen] = useState(false);
   const [appearance, setAppearance] = useState<AppearanceMode>(() =>
     storedAppearance(typeof window === "undefined" ? null : window.localStorage),
   );
@@ -2029,6 +2293,9 @@ function App() {
   const [foregroundOperationWorkspaceId, setForegroundOperationWorkspaceId] = useState<
     string | null
   >(null);
+  const [foregroundImportAction, setForegroundImportAction] =
+    useState<ImportAction | null>(null);
+  const [restoringPlannedWorkspace, setRestoringPlannedWorkspace] = useState(false);
   const [exportResults, setExportResults] = useState<Record<number, ExportAttachmentResult>>({});
   const [exportingAttachmentId, setExportingAttachmentId] = useState<number | null>(null);
   const [openingAttachmentId, setOpeningAttachmentId] = useState<number | null>(null);
@@ -2041,7 +2308,6 @@ function App() {
   const [sourceEmlView, setSourceEmlView] = useState<SourceEmlView | null>(null);
   const [sourceEmlContext, setSourceEmlContext] = useState<SourceEmlContext | null>(null);
   const [sourceEmlMode, setSourceEmlMode] = useState<SourceEmlMode>("rendered");
-  const [sourceEmlRemoteAllowed, setSourceEmlRemoteAllowed] = useState(false);
   const [isLoadingSourceEml, setIsLoadingSourceEml] = useState(false);
   const [sourceEmlStatus, setSourceEmlStatus] = useState<string | null>(null);
   const [sourceEmlSaveResult, setSourceEmlSaveResult] = useState<ExportOriginalEmlResult | null>(
@@ -2054,9 +2320,6 @@ function App() {
   const [messageDiagnostics, setMessageDiagnostics] = useState<MessageDiagnostics | null>(null);
   const [messageDiagnosticsError, setMessageDiagnosticsError] = useState<string | null>(null);
   const [isLoadingMessageDiagnostics, setIsLoadingMessageDiagnostics] = useState(false);
-  const [remoteImagesAllowedMessageId, setRemoteImagesAllowedMessageId] = useState<number | null>(
-    null,
-  );
   const [workspaceLocationMode, setWorkspaceLocationMode] = useState<WorkspaceLocationMode>(
     initialWorkspaceLocationMode,
   );
@@ -2067,6 +2330,8 @@ function App() {
   const [pendingOpenPlan, setPendingOpenPlan] = useState<PstOpenPlan | null>(null);
   const [pendingPreflightOpen, setPendingPreflightOpen] =
     useState<PendingPreflightOpen | null>(null);
+  const [pendingPlannedRepair, setPendingPlannedRepair] =
+    useState<PendingPlannedRepair | null>(null);
   const [pendingWorkspaceFlowOwnerId, setPendingWorkspaceFlowOwnerId] = useState<string | null>(
     null,
   );
@@ -2078,14 +2343,37 @@ function App() {
     !initialSavedSession()?.entries.length,
   );
   const [restoreStatus, setRestoreStatus] = useState<string | null>(null);
-  const progressEventsEnabledRef = useRef(false);
   const operationWorkspaceIdRef = useRef<string | null>(null);
   const activeWorkspaceIdRef = useRef<string | null>(null);
+  const activeWorkspaceChangeSequenceRef = useRef(0);
+  const restoringPlannedWorkspaceRef = useRef(false);
+  const integrityOperationSequenceRef = useRef(0);
+  const progressOperationSequenceRef = useRef(0);
+  const integrityOperationTokensRef = useRef<
+    Map<string, WorkspaceIntegrityOperationToken>
+  >(new Map());
   const workspaceOperationDismissTimersRef = useRef<Map<string, number>>(new Map());
+  const workspaceOperationDismissGenerationsRef = useRef<Map<string, number>>(new Map());
+  const repairConfirmDialogRef = useRef<HTMLElement | null>(null);
+  const repairConfirmCancelRef = useRef<HTMLButtonElement | null>(null);
+  const repairConfirmReturnFocusRef = useRef<HTMLElement | null>(null);
+  const localTrashResetDialogRef = useRef<HTMLElement | null>(null);
+  const localTrashResetCancelRef = useRef<HTMLButtonElement | null>(null);
+  const localTrashResetReturnFocusRef = useRef<HTMLElement | null>(null);
+  const localTrashResetWorkspaceIdRef = useRef<string | null>(null);
+  const verificationReportHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const verificationReportReturnFocusRef = useRef<HTMLElement | null>(null);
   const paneLayoutRef = useRef<HTMLElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const previewScrollRef = useRef<HTMLDivElement | null>(null);
-  const advancedSearchToggleRef = useRef<HTMLButtonElement | null>(null);
+  const activePopoverTriggerRef = useRef<HTMLElement | null>(null);
+  const advancedSearchPanelRef = useRef<HTMLDivElement | null>(null);
+  const recentPopoverPanelRef = useRef<HTMLDivElement | null>(null);
+  const workspacePopoverPanelRef = useRef<HTMLDivElement | null>(null);
+  const layoutPopoverPanelRef = useRef<HTMLDivElement | null>(null);
+  const workspaceDetailsPanelRef = useRef<HTMLDivElement | null>(null);
+  const importProgressDetailsPanelRef = useRef<HTMLDivElement | null>(null);
+  const helpDialogRef = useRef<HTMLElement | null>(null);
   const searchApplicationRef = useRef<SearchApplicationState | null>(null);
   if (searchApplicationRef.current == null) {
     searchApplicationRef.current = createSearchApplicationState(appliedSearchVersion.snapshot);
@@ -2113,12 +2401,87 @@ function App() {
   const expandedConversationRequestsRef = useRef<
     Map<string, ExpandedConversationRequestIdentity>
   >(new Map());
+  const localTrashOperationSequenceRef = useRef(0);
+  const activeLocalTrashOperationRef = useRef<LocalTrashOperationToken | null>(null);
+  const activeLocalTrashResetRef = useRef<LocalTrashResetToken | null>(null);
+  const localTrashUndoMessageRef = useRef<{ workspaceId: string; messageId: number } | null>(null);
+  const localTrashSummaryRequestSequenceRef = useRef<Map<string, number>>(new Map());
+  const openPstSessionsRef = useRef<OpenPstSession[]>([]);
+  const preserveSelectedMessageRef = useRef<string | null>(null);
   const externalFileOpenChainRef = useRef<Promise<void>>(Promise.resolve());
   const externalPstQueueRef = useRef<string[]>([]);
   const externalPstProcessingRef = useRef(false);
   const activeExternalPstPathRef = useRef<string | null>(null);
   const externalBatchEnqueueRef = useRef<(batch: ExternalFileOpenBatch) => void>(() => undefined);
   const restorePromptTimerRef = useRef<number | null>(null);
+  const advancedSearchOpen = openPopoverId === "advanced_search";
+  const aboutOpen = openPopoverId === "help";
+
+  function popoverPanelFor(id: CustomPopoverId): HTMLElement | null {
+    switch (id) {
+      case "advanced_search":
+        return advancedSearchPanelRef.current;
+      case "recent":
+        return recentPopoverPanelRef.current;
+      case "workspace":
+        return workspacePopoverPanelRef.current;
+      case "layout":
+        return layoutPopoverPanelRef.current;
+      case "workspace_details":
+        return workspaceDetailsPanelRef.current;
+      case "import_progress":
+        return importProgressDetailsPanelRef.current;
+      case "help":
+        return helpDialogRef.current;
+    }
+  }
+
+  function clearHelpState() {
+    setAppDiagnostics(null);
+    setAboutStatus(null);
+  }
+
+  function closeActivePopover() {
+    if (openPopoverId === "help") clearHelpState();
+    activePopoverTriggerRef.current = null;
+    setOpenPopoverId(null);
+  }
+
+  function togglePopover(id: CustomPopoverId, trigger: HTMLElement) {
+    const next = toggleOpenPopover(openPopoverId, id) as CustomPopoverId | null;
+    if (openPopoverId === "help" && next !== "help") clearHelpState();
+    if (next == null) {
+      activePopoverTriggerRef.current = null;
+    } else {
+      activePopoverTriggerRef.current = trigger;
+    }
+    setOpenPopoverId(next);
+  }
+
+  useEffect(() => {
+    const attachedPopoverId = openPopoverId;
+    if (!attachedPopoverId) return;
+    const controller = createDismissiblePopoverController({
+      documentTarget: document,
+      windowTarget: window,
+      trigger: activePopoverTriggerRef.current,
+      panel: popoverPanelFor(attachedPopoverId),
+      onDismiss: () => {
+        if (attachedPopoverId === "help") clearHelpState();
+        activePopoverTriggerRef.current = null;
+        setOpenPopoverId((current) =>
+          closeOpenPopover(current, attachedPopoverId) as CustomPopoverId | null,
+        );
+      },
+    });
+    return controller.attach();
+  }, [openPopoverId]);
+
+  useEffect(() => {
+    if (openPopoverId === "help") clearHelpState();
+    activePopoverTriggerRef.current = null;
+    setOpenPopoverId(null);
+  }, [workspace?.id]);
 
   function clearSearchDebounceTimer() {
     if (searchDebounceTimerRef.current != null) {
@@ -2228,6 +2591,18 @@ function App() {
     }
   }, [appearance]);
 
+  const hasLiveImportProgress = Object.values(workspaceOperationStates).some(
+    (operation) => operation.progress?.status === "active",
+  );
+
+  useEffect(() => {
+    if (!hasLiveImportProgress) return;
+    const interval = window.setInterval(() => {
+      setProgressClockTick((current) => current + 1);
+    }, 1_000);
+    return () => window.clearInterval(interval);
+  }, [hasLiveImportProgress]);
+
   function updateWorkspaceOperationState(
     workspaceId: string,
     update: Partial<WorkspaceOperationState>,
@@ -2241,7 +2616,16 @@ function App() {
     }));
   }
 
+  function createProgressOperationId(prefix: "import" | "reindex"): string {
+    progressOperationSequenceRef.current += 1;
+    return `${prefix}-${progressOperationSequenceRef.current}`;
+  }
+
   function clearWorkspaceOperationDismissTimer(workspaceId: string) {
+    workspaceOperationDismissGenerationsRef.current.set(
+      workspaceId,
+      (workspaceOperationDismissGenerationsRef.current.get(workspaceId) ?? 0) + 1,
+    );
     const timeout = workspaceOperationDismissTimersRef.current.get(workspaceId);
     if (timeout != null) {
       window.clearTimeout(timeout);
@@ -2251,6 +2635,7 @@ function App() {
 
   function clearWorkspaceOperationState(workspaceId: string) {
     clearWorkspaceOperationDismissTimer(workspaceId);
+    integrityOperationTokensRef.current.delete(workspaceId);
     setWorkspaceOperationStates((current) => {
       if (!current[workspaceId]) return current;
       const next = { ...current };
@@ -2261,26 +2646,54 @@ function App() {
 
   function scheduleWorkspaceOperationDismiss(workspaceId: string) {
     clearWorkspaceOperationDismissTimer(workspaceId);
+    const dismissGeneration = workspaceOperationDismissGenerationsRef.current.get(workspaceId);
     const timeout = window.setTimeout(() => {
-      updateWorkspaceOperationState(workspaceId, {
-        progress: null,
-        notice: null,
+      if (
+        workspaceOperationDismissGenerationsRef.current.get(workspaceId) !== dismissGeneration
+      ) {
+        return;
+      }
+      setWorkspaceOperationStates((current) => {
+        const state = current[workspaceId];
+        if (state?.running === true || state?.progress?.status === "active") return current;
+        return {
+          ...current,
+          [workspaceId]: {
+            ...(state ?? emptyWorkspaceOperationState()),
+            progress: null,
+            progressOperationId: null,
+            progressReceivedAtMonotonicMs: null,
+            notice: null,
+          },
+        };
       });
       setForegroundOperationWorkspaceId((current) =>
         current === workspaceId ? null : current,
       );
       workspaceOperationDismissTimersRef.current.delete(workspaceId);
-    }, 5200);
+    }, 12_000);
     workspaceOperationDismissTimersRef.current.set(workspaceId, timeout);
   }
 
   function completeWorkspaceOperation(workspaceId: string, message: string) {
-    updateWorkspaceOperationState(workspaceId, {
-      progress: null,
-      running: false,
-      notice: message,
-      error: null,
-      setupCommand: null,
+    setWorkspaceOperationStates((current) => {
+      const operation = current[workspaceId] ?? emptyWorkspaceOperationState();
+      const preserveProgressSlot =
+        operation.progressOperationId !== null &&
+        (operation.progress === null || operation.progress.status === "active");
+      return {
+        ...current,
+        [workspaceId]: {
+          ...operation,
+          progress: operation.progress,
+          progressOperationId: preserveProgressSlot ? operation.progressOperationId : null,
+          progressReceivedAtMonotonicMs: operation.progressReceivedAtMonotonicMs,
+          running: false,
+          notice: message,
+          error: null,
+          setupCommand: null,
+        },
+      };
     });
     scheduleWorkspaceOperationDismiss(workspaceId);
   }
@@ -2312,17 +2725,177 @@ function App() {
     });
   }
 
+  function beginWorkspaceIntegrityOperation(
+    workspaceId: string,
+    kind: WorkspaceIntegrityOperationKind,
+  ): WorkspaceIntegrityOperationToken | null {
+    if (integrityOperationTokensRef.current.size > 0) return null;
+    clearWorkspaceOperationDismissTimer(workspaceId);
+    integrityOperationSequenceRef.current += 1;
+    const operation = createWorkspaceIntegrityOperationToken(
+      workspaceId,
+      kind,
+      integrityOperationSequenceRef.current,
+    );
+    integrityOperationTokensRef.current.set(workspaceId, operation);
+    updateWorkspaceOperationState(workspaceId, {
+      progress: null,
+      progressOperationId:
+        kind === "load_last_verification" ? null : operation.operationId,
+      progressReceivedAtMonotonicMs: null,
+      running: true,
+      notice: null,
+      error: null,
+      setupCommand: null,
+      integrityOperationKind: kind,
+      integrityOperationId: operation.operationId,
+      verificationReportOpen: false,
+      repairConfirmOpen: false,
+      ...(kind === "load_last_verification" ? {} : { verificationReport: null }),
+    });
+    return operation;
+  }
+
+  function workspaceIntegrityOperationIsCurrent(
+    operation: WorkspaceIntegrityOperationToken,
+  ): boolean {
+    return isWorkspaceIntegrityOperationCurrent(
+      integrityOperationTokensRef.current.get(operation.workspaceId),
+      operation,
+    );
+  }
+
+  function finishWorkspaceIntegrityOperation(
+    operation: WorkspaceIntegrityOperationToken,
+    noticeMessage: string,
+    report?: VerificationReport | null,
+  ) {
+    if (!workspaceIntegrityOperationIsCurrent(operation)) return;
+    integrityOperationTokensRef.current.delete(operation.workspaceId);
+    setWorkspaceOperationStates((current) => {
+      const state = current[operation.workspaceId] ?? emptyWorkspaceOperationState();
+      const preserveProgressSlot =
+        state.progressOperationId === operation.operationId &&
+        (state.progress === null || state.progress.status === "active");
+      return {
+        ...current,
+        [operation.workspaceId]: {
+          ...state,
+          progress: state.progress,
+          progressOperationId: preserveProgressSlot ? state.progressOperationId : null,
+          progressReceivedAtMonotonicMs: state.progressReceivedAtMonotonicMs,
+          running: false,
+          notice: noticeMessage,
+          error: null,
+          setupCommand: null,
+          integrityOperationKind: null,
+          integrityOperationId: null,
+          ...(report === undefined ? {} : { verificationReport: report }),
+        },
+      };
+    });
+    scheduleWorkspaceOperationDismiss(operation.workspaceId);
+  }
+
+  function failWorkspaceIntegrityOperation(
+    operation: WorkspaceIntegrityOperationToken,
+    message: string,
+  ) {
+    if (!workspaceIntegrityOperationIsCurrent(operation)) return;
+    integrityOperationTokensRef.current.delete(operation.workspaceId);
+    setWorkspaceOperationStates((current) => {
+      const state = current[operation.workspaceId] ?? emptyWorkspaceOperationState();
+      const preserveProgressSlot =
+        state.progressOperationId === operation.operationId &&
+        (state.progress === null || state.progress.status === "active");
+      return {
+        ...current,
+        [operation.workspaceId]: {
+          ...state,
+          progress: state.progress,
+          progressOperationId: preserveProgressSlot ? state.progressOperationId : null,
+          progressReceivedAtMonotonicMs: state.progressReceivedAtMonotonicMs,
+          running: false,
+          notice: null,
+          error: message,
+          setupCommand: null,
+          integrityOperationKind: null,
+          integrityOperationId: null,
+        },
+      };
+    });
+  }
+
+  function updateWorkspaceSummaryFromVerification(
+    workspaceId: string,
+    report: VerificationReport,
+  ) {
+    setOpenPstSessions((current) =>
+      current.map((session) => {
+        if (session.workspace.id !== workspaceId) return session;
+        const nextWorkspace = workspaceSummaryWithVerification(session.workspace, report);
+        return {
+          ...session,
+          workspace: nextWorkspace,
+          status: nextWorkspace.integrityClassification,
+        };
+      }),
+    );
+    if (activeWorkspaceIdRef.current === workspaceId) {
+      setWorkspace((current) =>
+        current?.id === workspaceId ? workspaceSummaryWithVerification(current, report) : current,
+      );
+    }
+  }
+
+  function showVerificationReport(
+    workspaceId: string,
+    report: VerificationReport,
+    returnFocus?: HTMLElement | null,
+  ) {
+    if (returnFocus) verificationReportReturnFocusRef.current = returnFocus;
+    updateWorkspaceOperationState(workspaceId, {
+      verificationReport: report,
+      verificationReportOpen: true,
+    });
+    if (activeWorkspaceIdRef.current === workspaceId) {
+      window.requestAnimationFrame(() => verificationReportHeadingRef.current?.focus());
+    }
+  }
+
+  function closeVerificationReport(workspaceId: string) {
+    updateWorkspaceOperationState(workspaceId, { verificationReportOpen: false });
+    const returnFocus = verificationReportReturnFocusRef.current;
+    verificationReportReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) returnFocus.focus();
+    });
+  }
+
   function failWorkspaceOperation(
     workspaceId: string,
     message: string,
     operationSetupCommand: string | null = null,
   ) {
     clearWorkspaceOperationDismissTimer(workspaceId);
-    updateWorkspaceOperationState(workspaceId, {
-      running: false,
-      error: message,
-      setupCommand: operationSetupCommand,
-      notice: null,
+    setWorkspaceOperationStates((current) => {
+      const operation = current[workspaceId] ?? emptyWorkspaceOperationState();
+      const preserveProgressSlot =
+        operation.progressOperationId !== null &&
+        (operation.progress === null || operation.progress.status === "active");
+      return {
+        ...current,
+        [workspaceId]: {
+          ...operation,
+          progress: operation.progress,
+          progressOperationId: preserveProgressSlot ? operation.progressOperationId : null,
+          progressReceivedAtMonotonicMs: operation.progressReceivedAtMonotonicMs,
+          running: false,
+          error: message,
+          setupCommand: operationSetupCommand,
+          notice: null,
+        },
+      };
     });
   }
 
@@ -2330,30 +2903,65 @@ function App() {
     clearWorkspaceOperationDismissTimer(workspaceId);
     updateWorkspaceOperationState(workspaceId, {
       progress: null,
+      progressOperationId: null,
+      progressReceivedAtMonotonicMs: null,
       notice: null,
     });
   }
 
-  const folderTree = useMemo(() => buildFolderTree(folders), [folders]);
+  const folderHierarchy = useMemo(
+    () => buildFolderHierarchy(folders, workspace?.id ?? "inactive", folderHierarchyMode),
+    [folderHierarchyMode, folders, workspace?.id],
+  );
+  const folderTree = folderHierarchy.roots;
   const openSessionFolderTrees = useMemo(
     () =>
-      openPstSessions.map((session) => ({
-        session,
-        tree: buildFolderTree(session.folders),
-      })),
-    [openPstSessions],
+      openPstSessions.map((session) => {
+        const hierarchy = buildFolderHierarchy(
+          session.folders,
+          session.workspace.id,
+          folderHierarchyMode,
+        );
+        return { session, hierarchy, tree: hierarchy.roots };
+      }),
+    [folderHierarchyMode, openPstSessions],
   );
+  const retainedTechnicalWrapperCount = folderHierarchy.diagnostics.filter(
+    (diagnostic) => diagnostic.code === "technical_wrapper_has_direct_messages",
+  ).length;
+  useEffect(() => {
+    if (!import.meta.env.DEV || retainedTechnicalWrapperCount === 0) return;
+    console.warn(
+      `Folder presentation retained ${retainedTechnicalWrapperCount} proven technical wrapper${
+        retainedTechnicalWrapperCount === 1 ? "" : "s"
+      } because direct messages were present. No folder names or paths were logged.`,
+    );
+  }, [retainedTechnicalWrapperCount, workspace?.id]);
   const openWorkspaceIds = useMemo(
     () => openPstSessions.map((session) => session.workspace.id),
     [openPstSessions],
   );
+  const activeOpenPstSession = workspace
+    ? openPstSessions.find((session) => session.workspace.id === workspace.id) ?? null
+    : null;
+  const activeLocalTrashSummary = workspace
+    ? activeOpenPstSession?.localTrashSummary ?? unavailableLocalTrashSummary(workspace.id)
+    : null;
+  const allOpenLocalTrashSummary = useMemo(
+    () =>
+      aggregateLocalTrashSummaries(
+        openWorkspaceIds,
+        openPstSessions.map((session) => session.localTrashSummary),
+      ),
+    [openPstSessions, openWorkspaceIds],
+  );
   const activeWorkspaceOperation = workspace
     ? workspaceOperationStates[workspace.id] ?? null
     : null;
+  const anyWorkspaceIntegrityOperationRunning = Object.values(workspaceOperationStates).some(
+    (operation) => operation.running && operation.integrityOperationKind != null,
+  );
   const operationWorkspaceId = operationWorkspaceIdRef.current;
-  const operationWorkspaceIsOpen = operationWorkspaceId
-    ? openWorkspaceIds.includes(operationWorkspaceId)
-    : false;
   const pendingWorkspaceFlowBelongsToActiveTab =
     pendingWorkspaceFlowOwnerId === (workspace?.id ?? null);
   const foregroundOperationCanDisplay =
@@ -2367,11 +2975,22 @@ function App() {
   const visibleWorkspaceOperation =
     foregroundWorkspaceOperation ?? activeWorkspaceOperation;
   const canSwitchTabsDuringOperation =
-    isImporting && operationWorkspaceId != null && operationWorkspaceIsOpen;
+    isImporting &&
+    !restoringPlannedWorkspace &&
+    operationWorkspaceId != null;
+  const effectiveAllOpenScope = effectiveAllOpenLocalTrashQueryScope(
+    {
+      selectedWorkspaceId: allOpenFolderSelection.workspaceId,
+      folderId: allOpenFolderSelection.folderId,
+      includeSubfolders,
+    },
+    messageVisibility,
+    localTrashAllOpenWorkspaceId,
+  );
   const allOpenSelectedWorkspaceId =
-    searchScope === "all_open" ? allOpenFolderSelection.workspaceId : null;
+    searchScope === "all_open" ? effectiveAllOpenScope.selectedWorkspaceId : null;
   const allOpenSelectedFolderId =
-    searchScope === "all_open" ? allOpenFolderSelection.folderId : null;
+    searchScope === "all_open" ? effectiveAllOpenScope.folderId : null;
   const allOpenSelectedSession = allOpenSelectedWorkspaceId
     ? openPstSessions.find((session) => session.workspace.id === allOpenSelectedWorkspaceId) ?? null
     : null;
@@ -2379,6 +2998,18 @@ function App() {
     allOpenSelectedSession && allOpenSelectedFolderId != null
       ? allOpenSelectedSession.folders.find((folder) => folder.id === allOpenSelectedFolderId) ?? null
       : null;
+  const currentFolderPresentationSelection = resolveFolderPresentationSelection(
+    folderHierarchy,
+    selectedFolderId,
+  );
+  const allOpenSelectedHierarchy = allOpenSelectedWorkspaceId
+    ? openSessionFolderTrees.find(
+        ({ session }) => session.workspace.id === allOpenSelectedWorkspaceId,
+      )?.hierarchy ?? null
+    : null;
+  const allOpenFolderPresentationSelection = allOpenSelectedHierarchy
+    ? resolveFolderPresentationSelection(allOpenSelectedHierarchy, allOpenSelectedFolderId)
+    : null;
   const activeSearchWorkspaceIds =
     searchScope === "all_open"
       ? allOpenSelectedWorkspaceId
@@ -2398,16 +3029,21 @@ function App() {
         (openWorkspaceIds.length === 1 ? openWorkspaceIds[0] : null))
       : (workspace?.id ?? null);
   const effectiveFolderId =
-    searchScope === "all_open"
+    messageVisibility === "trashed"
+      ? null
+      : searchScope === "all_open"
       ? allOpenSelectedFolderId
       : searchFilters.folderScope === "all"
         ? null
         : selectedFolderId;
   const effectiveIncludeSubfolders =
-    searchScope === "all_open"
+    messageVisibility === "trashed"
+      ? false
+      : searchScope === "all_open"
       ? includeSubfolders
       : searchFilters.folderScope === "current_subfolders";
   const conversationScopes = useMemo<ConversationWorkspaceScope[]>(() => {
+    if (messageVisibility === "trashed") return [];
     if (searchScope === "all_open") {
       if (allOpenSelectedWorkspaceId) {
         return [
@@ -2440,6 +3076,7 @@ function App() {
     effectiveIncludeSubfolders,
     includeSubfolders,
     openWorkspaceIds,
+    messageVisibility,
     searchScope,
     workspace,
   ]);
@@ -2468,6 +3105,7 @@ function App() {
           messageSort: sortOrder,
           conversationSort,
           sessionGeneration: activeSessionGeneration,
+          visibility: messageVisibility,
         },
       ),
     [
@@ -2478,6 +3116,7 @@ function App() {
       effectiveFolderId,
       effectiveIncludeSubfolders,
       listMode,
+      messageVisibility,
       search,
       searchFilters,
       searchScope,
@@ -2515,13 +3154,19 @@ function App() {
     appliedSelectedSession && appliedSearch.folderId != null
       ? appliedSelectedSession.folders.find((folder) => folder.id === appliedSearch.folderId) ?? null
       : null;
+  const appliedLocalTrashAvailable = appliedSelectedWorkspaceId
+    ? isLocalTrashHealthy(appliedSelectedSession?.localTrashSummary ?? null)
+    : allOpenLocalTrashSummary.available;
   const highlightTerms = useMemo(
     () => highlightTermsForSnapshot(appliedSearch),
     [appliedSearch],
   );
-  const collapsedFolderPathList = useMemo(
-    () => Array.from(collapsedFolderPaths).sort(),
-    [collapsedFolderPaths],
+  const collapsedFolderIdentityLists = useMemo(
+    () => ({
+      simplified: Array.from(collapsedFolderIdentitiesByMode.simplified).sort(),
+      original: Array.from(collapsedFolderIdentitiesByMode.original).sort(),
+    }),
+    [collapsedFolderIdentitiesByMode],
   );
   const paneLayoutModeClass =
     layoutMode === "outlook" ? "pane-layout-outlook" : "pane-layout-three";
@@ -2538,7 +3183,6 @@ function App() {
     setSourceEmlView(null);
     setSourceEmlContext(null);
     setSourceEmlMode("rendered");
-    setSourceEmlRemoteAllowed(false);
     setIsLoadingSourceEml(false);
     setSourceEmlStatus(null);
     setSourceEmlSaveResult(null);
@@ -2560,23 +3204,41 @@ function App() {
 
     void (async () => {
       try {
-        unlistenImport = await listen<ImportProgress>("import-progress", (event) => {
-          const workspaceId = operationWorkspaceIdRef.current;
-          if (!progressEventsEnabledRef.current || !workspaceId) return;
-
-          const stage = event.payload.stage.toLowerCase();
-          if (stage === "complete") {
-            completeWorkspaceOperation(workspaceId, event.payload.message);
-          } else if (stage === "cancelled") {
-            completeWorkspaceOperation(workspaceId, event.payload.message);
-          } else {
-            updateWorkspaceOperationState(workspaceId, {
-              progress: event.payload,
-              running: true,
-              notice: null,
-              error: null,
-            });
+        unlistenImport = await listen<unknown>("import-progress", (event) => {
+          const parsed = parseImportProgressSnapshot(event.payload);
+          if (!parsed.ok) return;
+          const incoming = parsed.value;
+          const integrityOperation = integrityOperationTokensRef.current.get(incoming.workspaceId);
+          if (
+            integrityOperation &&
+            typeof event.payload === "object" &&
+            event.payload !== null &&
+            "operationId" in event.payload &&
+            event.payload.operationId !== integrityOperation.operationId
+          ) {
+            return;
           }
+          const receivedAt = monotonicMilliseconds();
+
+          setWorkspaceOperationStates((current) => {
+            const operation = current[incoming.workspaceId];
+            if (!operation || operation.progressOperationId !== incoming.operationId) return current;
+            const reduced = reduceImportProgress(operation.progress, incoming, {
+              acceptedWorkspaceIds: Object.keys(current),
+            });
+            if (!reduced.accepted || !reduced.changed) return current;
+            return {
+              ...current,
+              [incoming.workspaceId]: {
+                ...operation,
+                progress: reduced.snapshot,
+                progressReceivedAtMonotonicMs: receivedAt,
+                running: reduced.snapshot.status === "active",
+                notice: null,
+                error: null,
+              },
+            };
+          });
         });
         unlistenExternal = await listen<ExternalFileOpenBatch>(
           "external-file-open",
@@ -2621,17 +3283,9 @@ function App() {
   useEffect(() => {
     let disposed = false;
     let unlistenDrop: (() => void) | null = null;
-    void getCurrentWebview()
-      .onDragDropEvent((event) => {
-        if (event.payload.type === "enter" || event.payload.type === "over") {
-          setDropOverlayVisible(true);
-          return;
-        }
-        setDropOverlayVisible(false);
-        if (event.payload.type === "drop") {
-          void handleDroppedFiles(event.payload.paths);
-        }
-      })
+    void listen<boolean>("external-file-drag-active", (event) => {
+      setDropOverlayVisible(event.payload);
+    })
       .then((unlisten) => {
         if (disposed) {
           unlisten();
@@ -2655,16 +3309,6 @@ function App() {
     externalFileOpenChainRef.current = externalFileOpenChainRef.current
       .catch(() => undefined)
       .then(() => processExternalFileOpenBatch(batch));
-  }
-
-  async function handleDroppedFiles(paths: string[]) {
-    setDropOverlayVisible(false);
-    try {
-      const batch = await invoke<ExternalFileOpenBatch>("prepare_external_file_opens", { paths });
-      externalBatchEnqueueRef.current(batch);
-    } catch (err) {
-      appendVisibleError(`Could not process dropped files: ${getErrorMessage(err)}`);
-    }
   }
 
   async function processExternalFileOpenBatch(batch: ExternalFileOpenBatch) {
@@ -2759,6 +3403,8 @@ function App() {
     }
     setPendingOpenPlan(null);
     setPendingPreflightOpen(null);
+    setPendingPlannedRepair(null);
+    repairConfirmReturnFocusRef.current = null;
     setPendingWorkspaceFlowOwnerId(null);
     finishExternalPstRequest(pstPath);
   }
@@ -2830,9 +3476,7 @@ function App() {
   }
 
   function closeAbout() {
-    setAboutOpen(false);
-    setAppDiagnostics(null);
-    setAboutStatus(null);
+    closeActivePopover();
   }
 
   async function copyDisplayedError(message: string) {
@@ -2854,11 +3498,13 @@ function App() {
   }
 
   async function openRecentPst(path: string) {
+    if (localTrashMutationPending) return;
     setError(null);
     setNotice(null);
     setSetupCommand(null);
     setPendingPreflightOpen(null);
     setPendingOpenPlan(null);
+    setPendingPlannedRepair(null);
     setPendingWorkspaceFlowOwnerId(null);
     setIsBusy(true);
 
@@ -2897,7 +3543,7 @@ function App() {
         invalidateSearchLifecycle(resetSnapshot);
       }
       setSearch("");
-      setAdvancedSearchOpen(false);
+      closeActivePopover();
       setSearchFilters(defaultAdvancedSearchFilters);
       setAllOpenFolderSelection({ workspaceId: null, folderId: null });
 
@@ -2984,8 +3630,27 @@ function App() {
   }, [workspaceLocationMode]);
 
   useEffect(() => {
-    activeWorkspaceIdRef.current = workspace?.id ?? null;
+    const nextWorkspaceId = workspace?.id ?? null;
+    if (activeWorkspaceIdRef.current !== nextWorkspaceId) {
+      activeWorkspaceChangeSequenceRef.current += 1;
+      activeWorkspaceIdRef.current = nextWorkspaceId;
+    }
   }, [workspace?.id]);
+
+  useEffect(() => {
+    if (
+      localTrashResetConfirmOpen &&
+      localTrashResetWorkspaceIdRef.current !== (workspace?.id ?? null)
+    ) {
+      localTrashResetWorkspaceIdRef.current = null;
+      localTrashResetReturnFocusRef.current = null;
+      setLocalTrashResetConfirmOpen(false);
+    }
+  }, [localTrashResetConfirmOpen, workspace?.id]);
+
+  useEffect(() => {
+    openPstSessionsRef.current = openPstSessions;
+  }, [openPstSessions]);
 
   useEffect(() => {
     window.localStorage.setItem(paneWidthStorageKey, JSON.stringify(paneWidths));
@@ -2997,10 +3662,14 @@ function App() {
 
   useEffect(() => {
     window.localStorage.setItem(
-      collapsedFolderPathsStorageKey,
-      JSON.stringify(collapsedFolderPathList),
+      collapsedFolderIdentitiesStorageKey,
+      JSON.stringify(collapsedFolderIdentityLists),
     );
-  }, [collapsedFolderPathList]);
+  }, [collapsedFolderIdentityLists]);
+
+  useEffect(() => {
+    saveFolderHierarchyMode(window.localStorage, folderHierarchyMode);
+  }, [folderHierarchyMode]);
 
   useEffect(() => {
     window.localStorage.setItem(layoutModeStorageKey, layoutMode);
@@ -3011,8 +3680,11 @@ function App() {
   }, [messageListDisplayMode]);
 
   useEffect(() => {
-    window.localStorage.setItem(listModeStorageKey, listMode);
-  }, [listMode]);
+    if (messageVisibility === "active") {
+      window.localStorage.setItem(listModeStorageKey, listMode);
+      previousActiveListModeRef.current = listMode;
+    }
+  }, [listMode, messageVisibility]);
 
   useEffect(() => {
     saveSearchScope(window.localStorage, searchScope);
@@ -3106,6 +3778,7 @@ function App() {
         window.clearTimeout(timeout);
       }
       workspaceOperationDismissTimersRef.current.clear();
+      workspaceOperationDismissGenerationsRef.current.clear();
     },
     [],
   );
@@ -3181,13 +3854,11 @@ function App() {
     }
 
     let cancelled = false;
-    const allowRemoteImages = remoteImagesAllowedMessageId === selectedMessage.id;
     const messageWorkspaceId = selectedMessage.workspaceId ?? workspace.id;
     setIsRenderingHtml(true);
     invoke<HtmlRenderResult>("render_message_html", {
       workspaceId: messageWorkspaceId,
       messageId: selectedMessage.id,
-      allowRemoteImages,
     })
       .then((result) => {
         if (!cancelled) setHtmlRender(result);
@@ -3211,45 +3882,60 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [workspace, selectedMessage, readerMode, remoteImagesAllowedMessageId]);
+  }, [workspace, selectedMessage, readerMode]);
 
   async function loadWorkspaceSession(
     nextWorkspace: WorkspaceSummary,
     requestedSelection?: WorkspaceFolderSelection,
   ): Promise<OpenPstSession> {
-    const [nextFolders, nextWorkspaceSize] = await Promise.all([
+    const [nextFolders, nextWorkspaceSize, nextLocalTrashSummary] = await Promise.all([
       invoke<Folder[]>("list_folders", {
         workspaceId: nextWorkspace.id,
       }),
       invoke<WorkspaceSize>("get_workspace_size", {
         workspaceId: nextWorkspace.id,
       }),
+      invoke<LocalTrashSummary>("read_local_trash_summary", {
+        workspaceId: nextWorkspace.id,
+      }).catch(() => unavailableLocalTrashSummary(nextWorkspace.id)),
     ]);
 
-    const existingSelection = openPstSessions.find(
+    const existingSession = openPstSessions.find(
       (session) => session.workspace.id === nextWorkspace.id,
-    )?.folderSelection;
+    );
+    const existingSelection = existingSession?.folderSelection;
     const activeSelection =
       workspace?.id === nextWorkspace.id
-        ? {
-            workspaceId: nextWorkspace.id,
-            folderId: selectedFolderId,
-            virtualFolder: selectedFolderId == null ? "all_mail" as const : null,
-            includeSubfolders,
-          }
+        ? messageVisibility === "trashed"
+          ? localTrashWorkspaceFolderSelection(nextWorkspace.id, includeSubfolders)
+          : {
+              workspaceId: nextWorkspace.id,
+              folderId: selectedFolderId,
+              virtualFolder: selectedFolderId == null ? "all_mail" as const : null,
+              includeSubfolders,
+            }
         : null;
     const folderSelection = resolveWorkspaceFolderSelection(
       nextWorkspace.id,
       nextFolders,
       requestedSelection ?? existingSelection ?? activeSelection,
     );
+    const canonicalFolderSelection = isLocalTrashFolderSelection(folderSelection)
+      ? resolveWorkspaceFolderSelection(
+          nextWorkspace.id,
+          nextFolders,
+          existingSession?.canonicalFolderSelection ?? defaultWorkspaceFolderSelection(nextWorkspace.id),
+        )
+      : folderSelection;
 
     return {
       workspace: nextWorkspace,
       workspaceSize: nextWorkspaceSize,
       folders: nextFolders,
       folderSelection,
-      status: "complete",
+      canonicalFolderSelection,
+      localTrashSummary: nextLocalTrashSummary,
+      status: nextWorkspace.integrityClassification,
     };
   }
 
@@ -3258,8 +3944,14 @@ function App() {
       const existingIndex = current.findIndex(
         (session) => session.workspace.id === nextSession.workspace.id,
       );
-      if (existingIndex === -1) return [...current, nextSession];
-      return current.map((session, index) => (index === existingIndex ? nextSession : session));
+      const next =
+        existingIndex === -1
+          ? [...current, nextSession]
+          : current.map((session, index) =>
+              index === existingIndex ? nextSession : session,
+            );
+      openPstSessionsRef.current = next;
+      return next;
     });
   }
 
@@ -3268,15 +3960,28 @@ function App() {
       nextSession;
     const selection = nextSession.folderSelection;
 
+    activeWorkspaceChangeSequenceRef.current += 1;
     activeWorkspaceIdRef.current = nextWorkspace.id;
     setWorkspace(nextWorkspace);
     setWorkspaceSize(nextWorkspaceSize);
     setFolders(nextFolders);
-    setSelectedFolderId(selection.folderId);
-    setIncludeSubfolders(selection.includeSubfolders);
+    const canonicalSelection = nextSession.canonicalFolderSelection;
+    const opensLocalTrash = isLocalTrashFolderSelection(selection);
+    if (searchScope === "current") {
+      setLocalTrashAllOpenWorkspaceId(null);
+      setMessageVisibility(opensLocalTrash ? "trashed" : "active");
+      if (opensLocalTrash) {
+        previousActiveListModeRef.current = listMode;
+        setListMode("messages");
+      }
+    } else if (messageVisibility === "trashed") {
+      setListMode("messages");
+    }
+    setSelectedFolderId(canonicalSelection.folderId);
+    setIncludeSubfolders(canonicalSelection.includeSubfolders);
     setSearchFilters((current) => ({
       ...current,
-      folderScope: selection.includeSubfolders ? "current_subfolders" : "current",
+      folderScope: canonicalSelection.includeSubfolders ? "current_subfolders" : "current",
     }));
     setInitializingWorkspaceId(nextWorkspace.id);
     setActiveSessionGeneration((current) => current + 1);
@@ -3299,7 +4004,6 @@ function App() {
       resetPrintableStatus();
       resetSourceEmlViewer();
       setHtmlRender(null);
-      setRemoteImagesAllowedMessageId(null);
     }
   }
 
@@ -3324,9 +4028,12 @@ function App() {
     workspaceId: string,
     options: RefreshWorkspaceOptions = {},
   ) {
+    if (restoringPlannedWorkspaceRef.current) return;
+    if (localTrashMutationPending) return;
     if (workspace?.id === workspaceId) return;
 
     const previousWorkspaceId = activeWorkspaceIdRef.current;
+    activeWorkspaceChangeSequenceRef.current += 1;
     activeWorkspaceIdRef.current = workspaceId;
     setError(null);
     try {
@@ -3335,30 +4042,42 @@ function App() {
         resetMessageList: options.resetMessageList ?? !isCrossPstSearch,
       });
     } catch (err) {
+      activeWorkspaceChangeSequenceRef.current += 1;
       activeWorkspaceIdRef.current = previousWorkspaceId;
       setError(getErrorMessage(err));
     }
   }
 
   async function closeWorkspaceTab(workspaceId: string) {
+    if (localTrashMutationPending) return;
     setError(null);
+    if (workspaceOperationStates[workspaceId]?.running === true || isImporting) {
+      setError("Cancel or finish the active workspace operation before closing its tab.");
+      return;
+    }
     try {
       const remainingSessions = openPstSessions.filter(
         (session) => session.workspace.id !== workspaceId,
       );
       const nextActive = await invoke<WorkspaceSummary | null>("close_workspace", { workspaceId });
       invalidateSearchLifecycle();
+      localTrashSummaryRequestSequenceRef.current.delete(workspaceId);
       setOpenPstSessions(remainingSessions);
       clearWorkspaceOperationState(workspaceId);
       if (pendingWorkspaceFlowOwnerId === workspaceId) {
         const pendingPstPath = pendingOpenPlan?.pstPath ?? pendingPreflightOpen?.plan.pstPath;
         setPendingOpenPlan(null);
         setPendingPreflightOpen(null);
+        setPendingPlannedRepair(null);
+        repairConfirmReturnFocusRef.current = null;
         setPendingWorkspaceFlowOwnerId(null);
         if (pendingPstPath) finishExternalPstRequest(pendingPstPath);
       }
       if (allOpenFolderSelection.workspaceId === workspaceId) {
         setAllOpenFolderSelection({ workspaceId: null, folderId: null });
+      }
+      if (localTrashAllOpenWorkspaceId === workspaceId) {
+        setLocalTrashAllOpenWorkspaceId(null);
       }
 
       if (workspace?.id !== workspaceId) return;
@@ -3449,6 +4168,7 @@ function App() {
             offset,
             searchGeneration: request.generation,
             searchOperationId: requestIdentity.operationId,
+            visibility: snapshot.visibility,
           })
         : await invoke<MessagePageResult>("list_messages", {
             workspaceId: snapshot.singleWorkspaceId,
@@ -3461,8 +4181,10 @@ function App() {
             cursor: requestCursor,
             searchGeneration: request.generation,
             searchOperationId: requestIdentity.operationId,
-          });
+            visibility: snapshot.visibility,
+      });
       if (!requestIsCurrent()) return;
+      reconcileLocalTrashQueryHealth(result.localTrashStates);
       if (result.paginationMode !== paginationMode) {
         throw new Error("Search pagination mode did not match the active request.");
       }
@@ -3501,8 +4223,13 @@ function App() {
       setSearchError(null);
       if (!append) {
         setSelectedMessage((current) => {
+          const currentWorkspaceId = current?.workspaceId ?? snapshot.activeWorkspaceId;
+          const currentKey = current
+            ? `${currentWorkspaceId ?? ""}:${current.id}`
+            : null;
           if (
             !current ||
+            preserveSelectedMessageRef.current === currentKey ||
             normalizedResult.items.some(
               (item) =>
                 item.id === current.id &&
@@ -3513,7 +4240,6 @@ function App() {
             return current;
           }
           setHtmlRender(null);
-          setRemoteImagesAllowedMessageId(null);
           setExportResults({});
           resetPrintableStatus();
           resetSourceEmlViewer();
@@ -3572,6 +4298,7 @@ function App() {
             searchFilters: backendSearchFilters(snapshot),
             searchGeneration: request.generation,
             searchOperationId: requestIdentity.operationId,
+            visibility: snapshot.visibility,
           })
         : await invoke<MessageCountResult>("count_messages", {
             workspaceId: snapshot.singleWorkspaceId,
@@ -3581,6 +4308,7 @@ function App() {
             searchFilters: backendSearchFilters(snapshot),
             searchGeneration: request.generation,
             searchOperationId: requestIdentity.operationId,
+            visibility: snapshot.visibility,
           });
       if (!requestIsCurrent()) return;
       setMessageTotalCount(result.totalCount);
@@ -3676,8 +4404,10 @@ function App() {
         offset,
         searchGeneration: request.generation,
         searchOperationId: requestIdentity.operationId,
+        visibility: snapshot.visibility,
       });
       if (!requestIsCurrent()) return;
+      reconcileLocalTrashQueryHealth(result.localTrashStates);
 
       setConversationHasMore(result.hasMore);
       setConversationIndexedWorkspaceCount(result.indexedWorkspaceCount);
@@ -3741,6 +4471,7 @@ function App() {
         searchFilters: backendSearchFilters(snapshot),
         searchGeneration: request.generation,
         searchOperationId: requestIdentity.operationId,
+        visibility: snapshot.visibility,
       });
       if (!requestIsCurrent()) return;
       setConversationTotalCount(result.totalCount);
@@ -3819,6 +4550,7 @@ function App() {
         offset: append ? current?.items.length ?? 0 : 0,
         searchGeneration: request.generation,
         searchOperationId: requestIdentity.operationId,
+        visibility: snapshot.visibility,
       });
       const activeRequest = expandedConversationRequestsRef.current.get(key);
       if (
@@ -3910,20 +4642,27 @@ function App() {
         clearAppliedSearchSnapshot(currentSearch.applied.snapshot, searchScope),
       );
     }
-    progressEventsEnabledRef.current = false;
     operationWorkspaceIdRef.current = null;
     activeWorkspaceIdRef.current = null;
+    integrityOperationTokensRef.current.clear();
+    repairConfirmReturnFocusRef.current = null;
+    verificationReportReturnFocusRef.current = null;
     setForegroundOperationWorkspaceId(null);
+    setForegroundImportAction(null);
     for (const workspaceId of workspaceOperationDismissTimersRef.current.keys()) {
       clearWorkspaceOperationDismissTimer(workspaceId);
     }
+    workspaceOperationDismissGenerationsRef.current.clear();
     setWorkspace(null);
     setOpenPstSessions([]);
+    openPstSessionsRef.current = [];
     setWorkspaceOperationStates({});
     setWorkspaceSize(null);
     setFolders([]);
     setSelectedFolderId(null);
+    setMessageVisibility("active");
     setAllOpenFolderSelection({ workspaceId: null, folderId: null });
+    setLocalTrashAllOpenWorkspaceId(null);
     setInitializingWorkspaceId(null);
     setMessages([]);
     setMessageTotalCount(0);
@@ -3939,8 +4678,19 @@ function App() {
     setConversationWorkspaceIssues([]);
     setExpandedConversations({});
     setSelectedMessage(null);
+    preserveSelectedMessageRef.current = null;
+    activeLocalTrashOperationRef.current = null;
+    activeLocalTrashResetRef.current = null;
+    localTrashUndoMessageRef.current = null;
+    localTrashSummaryRequestSequenceRef.current.clear();
+    localTrashResetWorkspaceIdRef.current = null;
+    setLocalTrashUndo(null);
+    setLocalTrashStatus(null);
+    setLocalTrashError(null);
+    setLocalTrashMutationPending(false);
+    setLocalTrashResetConfirmOpen(false);
     setSearch("");
-    setAdvancedSearchOpen(false);
+    closeActivePopover();
     setSearchFilters(defaultAdvancedSearchFilters);
     setSortOrder("newest");
     setSearchLoading(null);
@@ -3953,13 +4703,13 @@ function App() {
     setReaderMode("plain_text");
     setHtmlRender(null);
     setIsRenderingHtml(false);
-    setRemoteImagesAllowedMessageId(null);
     setIsImporting(false);
     setError(null);
     setNotice(null);
     setSetupCommand(null);
     setPendingOpenPlan(null);
     setPendingPreflightOpen(null);
+    setPendingPlannedRepair(null);
     setPendingWorkspaceFlowOwnerId(null);
   }
 
@@ -3977,11 +4727,13 @@ function App() {
   }
 
   async function openPst() {
+    if (localTrashMutationPending) return;
     setError(null);
     setNotice(null);
     setSetupCommand(null);
     setPendingPreflightOpen(null);
     setPendingOpenPlan(null);
+    setPendingPlannedRepair(null);
     setPendingWorkspaceFlowOwnerId(null);
     setIsBusy(true);
 
@@ -4013,9 +4765,9 @@ function App() {
     setIsBusy(true);
 
     try {
-      const messagePath = await invoke<string | null>("pick_message_file");
-      if (!messagePath) return;
-      await openStandaloneMessageInline(messagePath);
+      const messageFile = await invoke<ExternalFileOpen | null>("pick_message_file");
+      if (!messageFile) return;
+      await openStandaloneMessageInline(messageFile.stableId);
     } catch (err) {
       setError(getErrorMessage(err));
       setSourceEmlStatus(null);
@@ -4025,19 +4777,17 @@ function App() {
     }
   }
 
-  async function openStandaloneMessageInline(messagePath: string) {
+  async function openStandaloneMessageInline(stableId: string) {
     setIsLoadingSourceEml(true);
     setSourceEmlStatus("Opening standalone message.");
     try {
       const result = await invoke<SourceEmlView>("get_standalone_message_view", {
-        path: messagePath,
-        allowRemoteResources: false,
+        stableId,
       });
       setSourceEmlView(result);
-      setSourceEmlContext({ kind: "standalone", messagePath: result.sourcePath });
+      setSourceEmlContext({ kind: "standalone", stableId });
       setSourceEmlMode("rendered");
       setSourceEmlOpen(true);
-      setSourceEmlRemoteAllowed(false);
       setSourceEmlRawSearch("");
       setSourceEmlStatus(null);
     } finally {
@@ -4052,7 +4802,12 @@ function App() {
       (existing) => existing.workspacePath === plan.selectedWorkspacePath,
     );
 
-    if (matchingExisting && plan.existingWorkspaces.length === 1 && matchingExisting.isComplete) {
+    if (
+      matchingExisting &&
+      plan.existingWorkspaces.length === 1 &&
+      matchingExisting.integrityClassification === "complete" &&
+      matchingExisting.canOpen
+    ) {
       await openPlannedPst(plan, matchingExisting, false, "open_existing");
     } else if (plan.existingWorkspaces.length > 0) {
       setPendingWorkspaceFlowOwnerId(activeWorkspaceIdRef.current);
@@ -4142,26 +4897,24 @@ function App() {
     allowDuplicate: boolean,
     importAction: ImportAction = existingWorkspace ? "open_existing" : "import",
   ) {
+    const activeWorkspaceChangeSequenceAtStart = activeWorkspaceChangeSequenceRef.current;
     setError(null);
     setSetupCommand(null);
     setIsBusy(true);
     const expectsProgress = importAction !== "open_existing";
-    const targetWorkspaceId = existingWorkspace?.workspaceId ?? plan.fingerprint;
+    setForegroundImportAction(expectsProgress ? importAction : null);
+    const operationId = createProgressOperationId("import");
+    const targetWorkspaceId = existingWorkspace?.workspaceId ?? plan.workspaceId;
+    clearWorkspaceOperationDismissTimer(targetWorkspaceId);
     operationWorkspaceIdRef.current = targetWorkspaceId;
     setForegroundOperationWorkspaceId(
       openWorkspaceIds.includes(targetWorkspaceId) ? null : targetWorkspaceId,
     );
-    progressEventsEnabledRef.current = expectsProgress;
     setIsImporting(expectsProgress);
     updateWorkspaceOperationState(targetWorkspaceId, {
-      progress: expectsProgress
-        ? {
-            stage: "Checking PST",
-            current: null,
-            total: null,
-            message: "Checking PST and preparing the workspace.",
-          }
-        : null,
+      progress: null,
+      progressOperationId: expectsProgress ? operationId : null,
+      progressReceivedAtMonotonicMs: null,
       running: expectsProgress,
       notice: null,
       error: null,
@@ -4169,6 +4922,9 @@ function App() {
       deleteResult: null,
       deleteStatuses: [],
       deleteConfirmOpen: false,
+      ...(expectsProgress
+        ? { verificationReport: null, verificationReportOpen: false }
+        : {}),
     });
 
     try {
@@ -4178,10 +4934,60 @@ function App() {
         existingWorkspacePath: existingWorkspace?.workspacePath ?? null,
         allowDuplicate,
         importAction,
+        operationId,
       });
-      await refreshWorkspace(nextWorkspace);
+      const activeWorkspaceChangedDuringOperation =
+        activeWorkspaceChangeSequenceRef.current !== activeWorkspaceChangeSequenceAtStart;
+      await refreshWorkspace(nextWorkspace, {
+        onlyIfWorkspaceStillActive: activeWorkspaceChangedDuringOperation,
+      });
+      const currentWorkspaceId = activeWorkspaceIdRef.current;
+      if (
+        activeWorkspaceChangedDuringOperation &&
+        currentWorkspaceId &&
+        currentWorkspaceId !== nextWorkspace.id
+      ) {
+        restoringPlannedWorkspaceRef.current = true;
+        setRestoringPlannedWorkspace(true);
+        try {
+          let restoreWorkspaceId = activeWorkspaceIdRef.current;
+          let restoredStableWorkspace = false;
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            if (!restoreWorkspaceId || restoreWorkspaceId === nextWorkspace.id) {
+              restoredStableWorkspace = true;
+              break;
+            }
+            const restoreSequence = activeWorkspaceChangeSequenceRef.current;
+            const restoredWorkspace = await invoke<WorkspaceSummary>("activate_workspace", {
+              workspaceId: restoreWorkspaceId,
+            });
+            if (restoredWorkspace.id !== restoreWorkspaceId) {
+              throw new Error(
+                "The active workspace changed while repair results were being restored.",
+              );
+            }
+            if (
+              activeWorkspaceIdRef.current === restoreWorkspaceId &&
+              activeWorkspaceChangeSequenceRef.current === restoreSequence
+            ) {
+              restoredStableWorkspace = true;
+              break;
+            }
+            restoreWorkspaceId = activeWorkspaceIdRef.current;
+          }
+          if (!restoredStableWorkspace) {
+            throw new Error(
+              "The active workspace changed repeatedly while repair results were being restored.",
+            );
+          }
+        } finally {
+          restoringPlannedWorkspaceRef.current = false;
+          setRestoringPlannedWorkspace(false);
+        }
+      }
       rememberRecentPst(nextWorkspace.pstPath);
       setPendingOpenPlan(null);
+      setPendingPlannedRepair(null);
       setPendingWorkspaceFlowOwnerId(null);
       setReadpstStatus(await invoke<ReadpstStatus>("check_readpst"));
       if (nextWorkspace.id !== targetWorkspaceId) {
@@ -4190,17 +4996,28 @@ function App() {
       setForegroundOperationWorkspaceId(null);
       completeWorkspaceOperation(
         nextWorkspace.id,
-        nextWorkspace.reusedExisting
-          ? "Opened existing workspace."
+        importAction === "repair_index"
+          ? "Repair Index completed. The verified replacement index is active."
+          : nextWorkspace.reusedExisting
+            ? "Opened existing workspace."
           : importAction === "resume_index"
             ? "Resume indexing completed."
-            : "Workspace import completed.",
+            : nextWorkspace.integrityClassification === "complete"
+              ? "Import completed and passed internal workspace verification."
+              : "Import stopped before internal workspace verification completed.",
       );
     } catch (err) {
       const message = getErrorMessage(err);
       const operationSetupCommand = getSetupCommand(err);
       if (message.toLowerCase().includes("cancelled")) {
-        completeWorkspaceOperation(targetWorkspaceId, "Import cancelled.");
+        completeWorkspaceOperation(
+          targetWorkspaceId,
+          importAction === "repair_index"
+            ? "Repair Index cancelled. The previous active index remains available."
+            : importAction === "resume_index"
+              ? "Resume indexing cancelled."
+              : "Import cancelled.",
+        );
       } else if (operationSetupCommand) {
         clearWorkspaceOperationState(targetWorkspaceId);
         setForegroundOperationWorkspaceId(null);
@@ -4210,28 +5027,344 @@ function App() {
         failWorkspaceOperation(targetWorkspaceId, message);
       }
     } finally {
-      progressEventsEnabledRef.current = false;
       if (operationWorkspaceIdRef.current === targetWorkspaceId) {
         operationWorkspaceIdRef.current = null;
       }
       setIsBusy(false);
       setIsImporting(false);
+      setForegroundImportAction(null);
       finishExternalPstRequest(plan.pstPath);
+    }
+  }
+
+  async function applyIntegrityWorkspaceSummary(
+    operation: WorkspaceIntegrityOperationToken,
+    nextWorkspace: WorkspaceSummary,
+  ): Promise<boolean> {
+    if (!workspaceIntegrityOperationIsCurrent(operation)) return false;
+    if (nextWorkspace.id !== operation.workspaceId) {
+      failWorkspaceIntegrityOperation(
+        operation,
+        "The workspace operation returned a mismatched workspace identity.",
+      );
+      return false;
+    }
+    const nextSession = await loadWorkspaceSession(nextWorkspace);
+    if (!workspaceIntegrityOperationIsCurrent(operation)) return false;
+    if (nextSession.workspace.id !== operation.workspaceId) {
+      failWorkspaceIntegrityOperation(
+        operation,
+        "The refreshed workspace did not match the requested workspace.",
+      );
+      return false;
+    }
+    registerWorkspaceSession(nextSession);
+    if (activeWorkspaceIdRef.current === operation.workspaceId) {
+      applyActiveWorkspaceSession(nextSession, true);
+    }
+    return true;
+  }
+
+  async function verifyWorkspaceImport(
+    workspaceId: string,
+    returnFocus?: HTMLElement | null,
+  ) {
+    const operation = beginWorkspaceIntegrityOperation(
+      workspaceId,
+      "verify",
+    );
+    if (!operation) return;
+    operationWorkspaceIdRef.current = workspaceId;
+
+    try {
+      const report = await invoke<VerificationReport>("verify_workspace_import", {
+        workspaceId,
+        operationId: operation.operationId,
+        verificationLevel: "quick",
+      });
+      if (!workspaceIntegrityOperationIsCurrent(operation)) return;
+      if (!isVerificationReportForOperation(report, operation)) {
+        failWorkspaceIntegrityOperation(
+          operation,
+          "Verification returned a mismatched operation identity.",
+        );
+        return;
+      }
+      updateWorkspaceSummaryFromVerification(workspaceId, report);
+      finishWorkspaceIntegrityOperation(operation, verificationHeadline(report), report);
+      showVerificationReport(workspaceId, report, returnFocus);
+    } catch (err) {
+      failWorkspaceIntegrityOperation(operation, getErrorMessage(err));
+    } finally {
+      if (operationWorkspaceIdRef.current === workspaceId) {
+        operationWorkspaceIdRef.current = null;
+      }
+    }
+  }
+
+  async function viewLastWorkspaceVerification(
+    workspaceId: string,
+    returnFocus?: HTMLElement | null,
+  ) {
+    const inMemoryReport = workspaceOperationStates[workspaceId]?.verificationReport ?? null;
+    const operation = beginWorkspaceIntegrityOperation(
+      workspaceId,
+      "load_last_verification",
+    );
+    if (!operation) return;
+
+    // Fail-closed verification results for malformed or future workspace
+    // metadata are deliberately not written into that workspace. Keep the
+    // current result viewable for this application session without claiming
+    // that a persisted report exists.
+    if (inMemoryReport) {
+      if (!workspaceIntegrityOperationIsCurrent(operation)) return;
+      if (inMemoryReport.workspaceId !== workspaceId) {
+        failWorkspaceIntegrityOperation(
+          operation,
+          "The current verification report did not match this workspace.",
+        );
+        return;
+      }
+      finishWorkspaceIntegrityOperation(
+        operation,
+        "Loaded the current verification report.",
+        inMemoryReport,
+      );
+      showVerificationReport(workspaceId, inMemoryReport, returnFocus);
+      return;
+    }
+
+    try {
+      const report = await invoke<VerificationReport | null>("get_last_workspace_verification", {
+        workspaceId,
+      });
+      if (!workspaceIntegrityOperationIsCurrent(operation)) return;
+      if (!report) {
+        finishWorkspaceIntegrityOperation(operation, "No saved verification report is available.");
+        return;
+      }
+      if (report.workspaceId !== workspaceId) {
+        failWorkspaceIntegrityOperation(
+          operation,
+          "The saved verification report did not match this workspace.",
+        );
+        return;
+      }
+      finishWorkspaceIntegrityOperation(operation, "Loaded the last verification report.", report);
+      showVerificationReport(workspaceId, report, returnFocus);
+    } catch (err) {
+      failWorkspaceIntegrityOperation(operation, getErrorMessage(err));
+    }
+  }
+
+  async function resumeWorkspaceIndexing(workspaceId: string) {
+    const operation = beginWorkspaceIntegrityOperation(
+      workspaceId,
+      "resume_indexing",
+    );
+    if (!operation) return;
+    operationWorkspaceIdRef.current = workspaceId;
+
+    try {
+      const nextWorkspace = await invoke<WorkspaceSummary>("resume_workspace_indexing", {
+        workspaceId,
+        operationId: operation.operationId,
+      });
+      if (!workspaceIntegrityOperationIsCurrent(operation)) return;
+      if (!(await applyIntegrityWorkspaceSummary(operation, nextWorkspace))) return;
+      finishWorkspaceIntegrityOperation(
+        operation,
+        "Resume indexing completed. Existing canonical message IDs were preserved.",
+      );
+    } catch (err) {
+      const message = getErrorMessage(err);
+      if (message.toLocaleLowerCase().includes("cancelled")) {
+        finishWorkspaceIntegrityOperation(operation, "Resume indexing cancelled.");
+      } else {
+        failWorkspaceIntegrityOperation(operation, message);
+      }
+    } finally {
+      if (operationWorkspaceIdRef.current === workspaceId) {
+        operationWorkspaceIdRef.current = null;
+      }
+    }
+  }
+
+  async function repairWorkspaceIndex(workspaceId: string) {
+    const operation = beginWorkspaceIntegrityOperation(
+      workspaceId,
+      "repair_index",
+    );
+    if (!operation) return;
+    operationWorkspaceIdRef.current = workspaceId;
+
+    try {
+      const nextWorkspace = await invoke<WorkspaceSummary>("repair_workspace_index", {
+        workspaceId,
+        operationId: operation.operationId,
+      });
+      if (!workspaceIntegrityOperationIsCurrent(operation)) return;
+      if (!(await applyIntegrityWorkspaceSummary(operation, nextWorkspace))) return;
+      finishWorkspaceIntegrityOperation(
+        operation,
+        "Repair Index completed. The verified replacement index is active.",
+      );
+    } catch (err) {
+      const message = getErrorMessage(err);
+      if (message.toLocaleLowerCase().includes("cancelled")) {
+        finishWorkspaceIntegrityOperation(
+          operation,
+          "Repair Index cancelled. The previous active index remains available.",
+        );
+      } else {
+        failWorkspaceIntegrityOperation(operation, message);
+      }
+    } finally {
+      if (operationWorkspaceIdRef.current === workspaceId) {
+        operationWorkspaceIdRef.current = null;
+      }
+    }
+  }
+
+  async function rebuildWorkspaceConversations(workspaceId: string) {
+    const operation = beginWorkspaceIntegrityOperation(
+      workspaceId,
+      "rebuild_conversations",
+    );
+    if (!operation) return;
+    operationWorkspaceIdRef.current = workspaceId;
+
+    try {
+      const nextWorkspace = await invoke<WorkspaceSummary>("rebuild_workspace_conversations", {
+        workspaceId,
+        operationId: operation.operationId,
+      });
+      if (!workspaceIntegrityOperationIsCurrent(operation)) return;
+      if (!(await applyIntegrityWorkspaceSummary(operation, nextWorkspace))) return;
+      finishWorkspaceIntegrityOperation(
+        operation,
+        "Conversation metadata was rebuilt without rewriting messages, folders, or attachments.",
+      );
+    } catch (err) {
+      const message = getErrorMessage(err);
+      if (message.toLocaleLowerCase().includes("cancelled")) {
+        finishWorkspaceIntegrityOperation(operation, "Conversation rebuild cancelled.");
+      } else {
+        failWorkspaceIntegrityOperation(operation, message);
+      }
+    } finally {
+      if (operationWorkspaceIdRef.current === workspaceId) {
+        operationWorkspaceIdRef.current = null;
+      }
+    }
+  }
+
+  function requestRepairWorkspaceIndex(workspaceId: string, returnFocus: HTMLElement) {
+    repairConfirmReturnFocusRef.current = returnFocus;
+    updateWorkspaceOperationState(workspaceId, { repairConfirmOpen: true });
+    window.requestAnimationFrame(() => repairConfirmCancelRef.current?.focus());
+  }
+
+  function requestPlannedWorkspaceRepair(
+    plan: PstOpenPlan,
+    existingWorkspace: ExistingWorkspace,
+    returnFocus: HTMLElement,
+  ) {
+    repairConfirmReturnFocusRef.current = returnFocus;
+    setPendingPlannedRepair({ plan, existingWorkspace });
+    window.requestAnimationFrame(() => repairConfirmCancelRef.current?.focus());
+  }
+
+  function closeRepairWorkspaceConfirmation(workspaceId: string) {
+    updateWorkspaceOperationState(workspaceId, { repairConfirmOpen: false });
+    const returnFocus = repairConfirmReturnFocusRef.current;
+    repairConfirmReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) returnFocus.focus();
+    });
+  }
+
+  function closePlannedWorkspaceRepairConfirmation() {
+    setPendingPlannedRepair(null);
+    const returnFocus = repairConfirmReturnFocusRef.current;
+    repairConfirmReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) returnFocus.focus();
+    });
+  }
+
+  function confirmRepairWorkspaceIndex(workspaceId: string) {
+    closeRepairWorkspaceConfirmation(workspaceId);
+    void repairWorkspaceIndex(workspaceId);
+  }
+
+  function confirmPlannedWorkspaceRepair() {
+    if (!pendingPlannedRepair) return;
+    const pending = pendingPlannedRepair;
+    setPendingPlannedRepair(null);
+    repairConfirmReturnFocusRef.current = null;
+    void openPlannedPst(
+      pending.plan,
+      pending.existingWorkspace,
+      false,
+      "repair_index",
+    );
+  }
+
+  function closeVisibleRepairConfirmation() {
+    if (pendingPlannedRepair) {
+      closePlannedWorkspaceRepairConfirmation();
+    } else if (workspace) {
+      closeRepairWorkspaceConfirmation(workspace.id);
+    }
+  }
+
+  function confirmVisibleRepair() {
+    if (pendingPlannedRepair) {
+      confirmPlannedWorkspaceRepair();
+    } else if (workspace) {
+      confirmRepairWorkspaceIndex(workspace.id);
+    }
+  }
+
+  function handleRepairConfirmationKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    if (!workspace && !pendingPlannedRepair) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeVisibleRepairConfirmation();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = repairConfirmDialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>("button:not(:disabled), [tabindex]:not([tabindex='-1'])"),
+    );
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
     }
   }
 
   async function reindexExistingEmls(targetWorkspaceId = workspace?.id) {
     if (!targetWorkspaceId) return;
+    const operationId = createProgressOperationId("reindex");
+    clearWorkspaceOperationDismissTimer(targetWorkspaceId);
 
     setError(null);
     setNotice(null);
     updateWorkspaceOperationState(targetWorkspaceId, {
-      progress: {
-        stage: "Scanning extracted EML files",
-        current: null,
-        total: null,
-        message: "Scanning existing extracted EML files.",
-      },
+      progress: null,
+      progressOperationId: operationId,
+      progressReceivedAtMonotonicMs: null,
       running: true,
       notice: null,
       error: null,
@@ -4239,9 +5372,10 @@ function App() {
       deleteResult: null,
       deleteStatuses: [],
       deleteConfirmOpen: false,
+      verificationReport: null,
+      verificationReportOpen: false,
     });
     setHtmlRender(null);
-    setRemoteImagesAllowedMessageId(null);
     setExportResults({});
     resetPrintableStatus();
     resetSourceEmlViewer();
@@ -4249,11 +5383,11 @@ function App() {
     setIsImporting(true);
     operationWorkspaceIdRef.current = targetWorkspaceId;
     setForegroundOperationWorkspaceId(null);
-    progressEventsEnabledRef.current = true;
 
     try {
       const nextWorkspace = await invoke<WorkspaceSummary>("reindex_existing_emls", {
         workspaceId: targetWorkspaceId,
+        operationId,
       });
       await refreshWorkspace(nextWorkspace, {
         onlyIfWorkspaceStillActive: true,
@@ -4279,7 +5413,6 @@ function App() {
         failWorkspaceOperation(targetWorkspaceId, message);
       }
     } finally {
-      progressEventsEnabledRef.current = false;
       if (operationWorkspaceIdRef.current === targetWorkspaceId) {
         operationWorkspaceIdRef.current = null;
       }
@@ -4300,6 +5433,7 @@ function App() {
   async function openMessage(messageId: number, targetWorkspaceId = workspace?.id) {
     if (!targetWorkspaceId) return;
 
+    preserveSelectedMessageRef.current = null;
     const messageListScrollTop = messageListRef.current?.scrollTop ?? null;
     try {
       if (workspace?.id !== targetWorkspaceId) {
@@ -4314,7 +5448,6 @@ function App() {
       setHtmlRender(null);
       setMessageDiagnostics(null);
       setMessageDiagnosticsError(null);
-      setRemoteImagesAllowedMessageId(null);
       const message = await invoke<MessageDetail>("get_message", {
         workspaceId: targetWorkspaceId,
         messageId,
@@ -4340,6 +5473,7 @@ function App() {
   async function openInlineMessagePreview(messageId: number, targetWorkspaceId = workspace?.id) {
     if (!targetWorkspaceId) return;
 
+    preserveSelectedMessageRef.current = null;
     const messageListScrollTop = messageListRef.current?.scrollTop ?? null;
     clearWorkspaceOperationMessages(targetWorkspaceId);
     setIsLoadingSourceEml(true);
@@ -4361,7 +5495,6 @@ function App() {
         invoke<SourceEmlView>("get_source_eml_view", {
           workspaceId: targetWorkspaceId,
           messageId,
-          allowRemoteResources: false,
         }),
       ]);
 
@@ -4370,7 +5503,6 @@ function App() {
       setHtmlRender(null);
       setMessageDiagnostics(null);
       setMessageDiagnosticsError(null);
-      setRemoteImagesAllowedMessageId(null);
       const targetSession =
         openPstSessions.find((session) => session.workspace.id === targetWorkspaceId) ?? null;
       setSelectedMessage({
@@ -4383,7 +5515,6 @@ function App() {
       setSourceEmlContext({ kind: "workspace", workspaceId: targetWorkspaceId, messageId });
       setSourceEmlMode("rendered");
       setSourceEmlOpen(true);
-      setSourceEmlRemoteAllowed(false);
       setSourceEmlStatus(null);
       setSourceEmlSaveResult(null);
       setSourceEmlRawSearch("");
@@ -4400,112 +5531,613 @@ function App() {
     }
   }
 
-  async function focusPreviewWindow(previewWindow: WebviewWindow) {
-    try {
-      await previewWindow.unminimize();
-    } catch (err) {
-      console.warn("Could not unminimize preview window.", err);
-    }
-    try {
-      await previewWindow.show();
-    } catch (err) {
-      console.warn("Could not show preview window.", err);
-    }
-    try {
-      await previewWindow.setFocus();
-    } catch (err) {
-      console.warn("Could not focus preview window.", err);
+  function localTrashSummaryForWorkspace(workspaceId: string): LocalTrashSummary | null {
+    return (
+      openPstSessionsRef.current.find(
+        (session) => session.workspace.id === workspaceId,
+      )?.localTrashSummary ?? null
+    );
+  }
+
+  function replaceLocalTrashWorkspaceState(
+    summary: LocalTrashSummary,
+    refreshedFolders: Folder[] | null,
+  ) {
+    const nextSessions = openPstSessionsRef.current.map((session) =>
+      session.workspace.id === summary.workspaceId
+        ? {
+            ...session,
+            localTrashSummary: summary,
+            folders: refreshedFolders ?? session.folders,
+          }
+        : session,
+    );
+    openPstSessionsRef.current = nextSessions;
+    setOpenPstSessions(nextSessions);
+    if (activeWorkspaceIdRef.current === summary.workspaceId && refreshedFolders) {
+      setFolders(refreshedFolders);
     }
   }
 
-  async function waitForPreviewWindowCreated(previewWindow: WebviewWindow, label: string) {
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      let cleanupCreated: (() => void) | null = null;
-      let cleanupError: (() => void) | null = null;
-      const settle = (callback: () => void) => {
-        if (settled) return;
-        settled = true;
-        cleanupCreated?.();
-        cleanupError?.();
-        callback();
-      };
-      const timeout = window.setTimeout(async () => {
-        const existing = await WebviewWindow.getByLabel(label).catch(() => null);
-        if (existing) {
-          settle(resolve);
-        } else {
-          settle(() => reject(new Error("Timed out waiting for preview window creation.")));
+  async function refreshLocalTrashSummary(workspaceId: string) {
+    const requestSequence =
+      (localTrashSummaryRequestSequenceRef.current.get(workspaceId) ?? 0) + 1;
+    localTrashSummaryRequestSequenceRef.current.set(workspaceId, requestSequence);
+    const [summary, refreshedFolders] = await Promise.all([
+      invoke<LocalTrashSummary>("read_local_trash_summary", { workspaceId }).catch(() =>
+        unavailableLocalTrashSummary(workspaceId),
+      ),
+      invoke<Folder[]>("list_folders", { workspaceId }).catch(() => null),
+    ]);
+    if (localTrashSummaryRequestSequenceRef.current.get(workspaceId) === requestSequence) {
+      replaceLocalTrashWorkspaceState(summary, refreshedFolders);
+    }
+    return summary;
+  }
+
+  function reconcileLocalTrashQueryHealth(states: LocalTrashQueryHealth[]) {
+    const reconciledWorkspaceIds = new Set<string>();
+    for (const health of states) {
+      if (
+        reconciledWorkspaceIds.has(health.workspaceId) ||
+        !openPstSessionsRef.current.some(
+          (session) => session.workspace.id === health.workspaceId,
+        )
+      ) continue;
+      reconciledWorkspaceIds.add(health.workspaceId);
+      const summary = localTrashSummaryForWorkspace(health.workspaceId);
+      const alreadyCurrent = Boolean(
+        summary &&
+          summary.available === health.available &&
+          summary.canReset === health.canReset &&
+          summary.sidecarPresent === health.sidecarPresent &&
+          summary.schemaVersion === health.schemaVersion &&
+          summary.stateRevision === health.stateRevision &&
+          summary.fingerprintMatch === health.fingerprintMatch &&
+          summary.lastErrorCode === health.lastErrorCode,
+      );
+      if (alreadyCurrent) continue;
+      if (!health.available) {
+        replaceLocalTrashWorkspaceState(
+          {
+            workspaceId: health.workspaceId,
+            available: false,
+            canReset: health.canReset,
+            sidecarPresent: health.sidecarPresent,
+            trashedMessageCount: 0,
+            orphanedStateCount: 0,
+            schemaVersion: health.schemaVersion,
+            stateRevision: health.stateRevision,
+            lastChangedAt: null,
+            fingerprintMatch: health.fingerprintMatch,
+            lastErrorCode: health.lastErrorCode ?? "LOCAL_TRASH_UNAVAILABLE",
+          },
+          null,
+        );
+        setLocalTrashUndo((current) =>
+          current?.workspaceId === health.workspaceId ? null : current,
+        );
+        if (localTrashUndoMessageRef.current?.workspaceId === health.workspaceId) {
+          localTrashUndoMessageRef.current = null;
         }
-      }, 5000);
+      }
+      void refreshLocalTrashSummary(health.workspaceId);
+    }
+  }
 
-      previewWindow
-        .once("tauri://created", () => {
-          window.clearTimeout(timeout);
-          settle(resolve);
-        })
-        .then((unlisten) => {
-          cleanupCreated = unlisten;
-        })
-        .catch((error) => {
-          window.clearTimeout(timeout);
-          settle(() => reject(error));
-        });
+  async function refreshLocalTrashPreviewState(workspaceId: string, messageId: number) {
+    try {
+      const refreshed = await invoke<MessageDetail>("get_message", {
+        workspaceId,
+        messageId,
+      });
+      setSelectedMessage((current) =>
+        current &&
+        current.id === messageId &&
+        (current.workspaceId ?? workspace?.id) === workspaceId
+          ? {
+              ...current,
+              inLocalTrash: refreshed.inLocalTrash,
+              localTrashAvailable: refreshed.localTrashAvailable,
+              localTrashErrorCode: refreshed.localTrashErrorCode,
+            }
+          : current,
+      );
+      setSourceEmlView((current) =>
+        current &&
+        current.messageId === messageId &&
+        sourceEmlContext?.kind === "workspace" &&
+        sourceEmlContext.workspaceId === workspaceId
+          ? {
+              ...current,
+              inLocalTrash: refreshed.inLocalTrash,
+              localTrashAvailable: refreshed.localTrashAvailable,
+              localTrashErrorCode: refreshed.localTrashErrorCode,
+            }
+          : current,
+      );
+    } catch {
+      setSelectedMessage((current) =>
+        current &&
+        current.id === messageId &&
+        (current.workspaceId ?? workspace?.id) === workspaceId
+          ? {
+              ...current,
+              localTrashAvailable: false,
+              localTrashErrorCode: "LOCAL_TRASH_UNAVAILABLE",
+            }
+          : current,
+      );
+    }
+  }
 
-      previewWindow
-        .once("tauri://error", (event) => {
-          window.clearTimeout(timeout);
-          settle(() => reject(new Error(stringifyWindowError(event))));
+  function refreshMessagesAfterLocalTrashChange() {
+    forceNextSearchApplication();
+    setActiveSessionGeneration((current) => current + 1);
+  }
+
+  async function changeSelectedMessageLocalTrash(nextTrashed: boolean) {
+    if (
+      !selectedMessage ||
+      localTrashMutationPending ||
+      isBusy ||
+      isImporting ||
+      activeIntegrityOperationRunning
+    ) return;
+    const targetWorkspaceId = selectedMessage.workspaceId ?? workspace?.id;
+    if (!targetWorkspaceId) return;
+    const summary = localTrashSummaryForWorkspace(targetWorkspaceId);
+    if (
+      !summary?.available ||
+      !summary.fingerprintMatch ||
+      !selectedMessage.localTrashAvailable
+    ) {
+      setLocalTrashError(
+        "Local Trash is unavailable for this workspace. The message remains visible in normal views.",
+      );
+      return;
+    }
+
+    localTrashOperationSequenceRef.current += 1;
+    const token = createLocalTrashOperationToken(
+      targetWorkspaceId,
+      summary.stateRevision,
+      localTrashOperationSequenceRef.current,
+    );
+    if (!token) return;
+    activeLocalTrashOperationRef.current = token;
+    setLocalTrashMutationPending(true);
+    setLocalTrashError(null);
+    setLocalTrashStatus(nextTrashed ? "Moving message to Local Trash." : "Restoring message.");
+
+    try {
+      const response = nextTrashed
+        ? await invoke<LocalTrashMutationResult>("move_message_to_local_trash", {
+            workspaceId: targetWorkspaceId,
+            messageId: selectedMessage.id,
+            expectedRevision: token.expectedRevision,
+          })
+        : await invoke<LocalTrashMutationResult>("restore_message_from_local_trash", {
+            workspaceId: targetWorkspaceId,
+            messageId: selectedMessage.id,
+            expectedRevision: token.expectedRevision,
+          });
+      const currentRevision =
+        localTrashSummaryForWorkspace(targetWorkspaceId)?.stateRevision ?? -1;
+      if (
+        !isLocalTrashMutationResponseCurrent({
+          requestToken: token,
+          activeToken: activeLocalTrashOperationRef.current,
+          currentWorkspaceRevision: currentRevision,
+          response,
         })
-        .then((unlisten) => {
-          cleanupError = unlisten;
+      ) {
+        setLocalTrashStatus(null);
+        setLocalTrashError(
+          "Local Trash state changed while this request was running. The latest state was reloaded.",
+        );
+        await refreshLocalTrashSummary(targetWorkspaceId);
+        refreshMessagesAfterLocalTrashChange();
+        return;
+      }
+
+      const selectedKey = `${targetWorkspaceId}:${selectedMessage.id}`;
+      preserveSelectedMessageRef.current = selectedKey;
+      if (response.changedCount > 0) {
+        setSelectedMessage((current) =>
+          current &&
+          current.id === selectedMessage.id &&
+          (current.workspaceId ?? workspace?.id) === targetWorkspaceId
+            ? { ...current, inLocalTrash: nextTrashed }
+            : current,
+        );
+        setSourceEmlView((current) =>
+          current?.messageId === selectedMessage.id &&
+          sourceEmlContext?.kind === "workspace" &&
+          sourceEmlContext.workspaceId === targetWorkspaceId
+            ? { ...current, inLocalTrash: nextTrashed }
+            : current,
+        );
+      }
+      setLocalTrashUndo((current) =>
+        reduceLocalTrashUndoState(current, {
+          type: "mutation_succeeded",
+          response,
+        }),
+      );
+      if (response.result === "moved" && response.changedCount > 0) {
+        localTrashUndoMessageRef.current = {
+          workspaceId: targetWorkspaceId,
+          messageId: selectedMessage.id,
+        };
+      } else if (response.changedCount > 0) {
+        localTrashUndoMessageRef.current = null;
+      }
+      setLocalTrashStatus(
+        response.result === "moved"
+          ? "Moved to Local Trash."
+          : response.result === "restored"
+            ? "Message restored to normal views."
+            : nextTrashed
+              ? "Message is already in Local Trash."
+              : "Message is already active.",
+      );
+      await refreshLocalTrashSummary(targetWorkspaceId);
+      refreshMessagesAfterLocalTrashChange();
+    } catch (err) {
+      const indeterminate =
+        getBackendErrorCode(err) === "LOCAL_TRASH_OPERATION_INDETERMINATE";
+      if (indeterminate) {
+        setLocalTrashUndo((current) =>
+          current?.workspaceId === targetWorkspaceId ? null : current,
+        );
+        if (localTrashUndoMessageRef.current?.workspaceId === targetWorkspaceId) {
+          localTrashUndoMessageRef.current = null;
+        }
+      }
+      setLocalTrashStatus(null);
+      setLocalTrashError(
+        indeterminate
+          ? "Local Trash operation needs reinspection. The latest state was reloaded; check the message status before trying again."
+          : `Local Trash action could not be completed. ${errorSummary(getErrorMessage(err))}`,
+      );
+      await refreshLocalTrashSummary(targetWorkspaceId);
+      if (indeterminate) {
+        await refreshLocalTrashPreviewState(targetWorkspaceId, selectedMessage.id);
+      }
+      refreshMessagesAfterLocalTrashChange();
+    } finally {
+      if (activeLocalTrashOperationRef.current === token) {
+        activeLocalTrashOperationRef.current = null;
+        setLocalTrashMutationPending(false);
+      }
+    }
+  }
+
+  async function undoMostRecentLocalTrashMove() {
+    if (
+      !localTrashUndo ||
+      localTrashMutationPending ||
+      isBusy ||
+      isImporting ||
+      activeIntegrityOperationRunning
+    ) return;
+    const summary = localTrashSummaryForWorkspace(localTrashUndo.workspaceId);
+    if (
+      !summary ||
+      !summary.available ||
+      !summary.fingerprintMatch ||
+      !isLocalTrashUndoCurrent(
+        localTrashUndo,
+        localTrashUndo.workspaceId,
+        summary.stateRevision,
+      )
+    ) {
+      setLocalTrashUndo(null);
+      setLocalTrashError("Undo is no longer available because Local Trash state changed.");
+      return;
+    }
+
+    localTrashOperationSequenceRef.current += 1;
+    const token = createLocalTrashOperationToken(
+      localTrashUndo.workspaceId,
+      localTrashUndo.expectedRevision,
+      localTrashOperationSequenceRef.current,
+    );
+    if (!token) return;
+    activeLocalTrashOperationRef.current = token;
+    setLocalTrashMutationPending(true);
+    setLocalTrashError(null);
+    setLocalTrashStatus("Undoing the most recent move.");
+    try {
+      const response = await invoke<LocalTrashMutationResult>("undo_local_trash_operation", {
+        workspaceId: localTrashUndo.workspaceId,
+        operationId: localTrashUndo.operationId,
+        expectedRevision: localTrashUndo.expectedRevision,
+      });
+      const currentRevision =
+        localTrashSummaryForWorkspace(localTrashUndo.workspaceId)?.stateRevision ?? -1;
+      if (
+        !isLocalTrashMutationResponseCurrent({
+          requestToken: token,
+          activeToken: activeLocalTrashOperationRef.current,
+          currentWorkspaceRevision: currentRevision,
+          response,
         })
-        .catch((error) => {
-          window.clearTimeout(timeout);
-          settle(() => reject(error));
-        });
+      ) {
+        setLocalTrashStatus(null);
+        setLocalTrashError(
+          "Undo was not applied because Local Trash state changed. The latest state was reloaded.",
+        );
+        await refreshLocalTrashSummary(localTrashUndo.workspaceId);
+        refreshMessagesAfterLocalTrashChange();
+        return;
+      }
+      const undoMessage = localTrashUndoMessageRef.current;
+      setSelectedMessage((current) =>
+        current &&
+        undoMessage &&
+        current.id === undoMessage.messageId &&
+        (current.workspaceId ?? workspace?.id) === undoMessage.workspaceId
+          ? { ...current, inLocalTrash: false }
+          : current,
+      );
+      setSourceEmlView((current) =>
+        current &&
+        undoMessage &&
+        sourceEmlContext?.kind === "workspace" &&
+        sourceEmlContext.workspaceId === undoMessage.workspaceId &&
+        current.messageId === undoMessage.messageId
+          ? { ...current, inLocalTrash: false }
+          : current,
+      );
+      setLocalTrashUndo((current) =>
+        reduceLocalTrashUndoState(current, { type: "undo_succeeded", response }),
+      );
+      setLocalTrashStatus("Move undone. The message is visible in normal views.");
+      localTrashUndoMessageRef.current = null;
+      await refreshLocalTrashSummary(localTrashUndo.workspaceId);
+      refreshMessagesAfterLocalTrashChange();
+    } catch (err) {
+      const indeterminate =
+        getBackendErrorCode(err) === "LOCAL_TRASH_OPERATION_INDETERMINATE";
+      const undoMessage = localTrashUndoMessageRef.current;
+      if (indeterminate) {
+        setLocalTrashUndo((current) =>
+          current?.workspaceId === localTrashUndo.workspaceId ? null : current,
+        );
+        if (localTrashUndoMessageRef.current?.workspaceId === localTrashUndo.workspaceId) {
+          localTrashUndoMessageRef.current = null;
+        }
+      }
+      setLocalTrashStatus(null);
+      setLocalTrashError(
+        indeterminate
+          ? "Undo outcome needs reinspection. The latest state was reloaded; check the message status before trying again."
+          : `Undo failed; the message remains in Local Trash. ${errorSummary(getErrorMessage(err))}`,
+      );
+      await refreshLocalTrashSummary(localTrashUndo.workspaceId);
+      if (indeterminate && undoMessage) {
+        await refreshLocalTrashPreviewState(undoMessage.workspaceId, undoMessage.messageId);
+      }
+      refreshMessagesAfterLocalTrashChange();
+    } finally {
+      if (activeLocalTrashOperationRef.current === token) {
+        activeLocalTrashOperationRef.current = null;
+        setLocalTrashMutationPending(false);
+      }
+    }
+  }
+
+  function requestLocalTrashReset(returnFocus: HTMLElement) {
+    if (
+      !workspace ||
+      isBusy ||
+      isImporting ||
+      activeIntegrityOperationRunning ||
+      !canResetLocalTrashState(activeLocalTrashSummary)
+    ) return;
+    localTrashResetWorkspaceIdRef.current = workspace.id;
+    localTrashResetReturnFocusRef.current = returnFocus;
+    setLocalTrashResetConfirmOpen(true);
+    window.requestAnimationFrame(() => localTrashResetCancelRef.current?.focus());
+  }
+
+  function closeLocalTrashResetConfirmation() {
+    setLocalTrashResetConfirmOpen(false);
+    localTrashResetWorkspaceIdRef.current = null;
+    const returnFocus = localTrashResetReturnFocusRef.current;
+    localTrashResetReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) returnFocus.focus();
     });
+  }
+
+  async function confirmLocalTrashReset() {
+    if (
+      !workspace ||
+      localTrashResetWorkspaceIdRef.current !== workspace.id ||
+      isBusy ||
+      isImporting ||
+      activeIntegrityOperationRunning ||
+      !canResetLocalTrashState(activeLocalTrashSummary)
+    ) {
+      closeLocalTrashResetConfirmation();
+      return;
+    }
+    const targetWorkspaceId = workspace.id;
+    localTrashOperationSequenceRef.current += 1;
+    const token = createLocalTrashResetToken(
+      targetWorkspaceId,
+      localTrashOperationSequenceRef.current,
+    );
+    if (!token) {
+      closeLocalTrashResetConfirmation();
+      return;
+    }
+    activeLocalTrashResetRef.current = token;
+    setLocalTrashResetConfirmOpen(false);
+    localTrashResetReturnFocusRef.current = null;
+    localTrashResetWorkspaceIdRef.current = null;
+    setLocalTrashMutationPending(true);
+    setLocalTrashError(null);
+    setLocalTrashStatus("Resetting unhealthy Local Trash state.");
+    try {
+      const result = await invoke<LocalTrashResetResult>("reset_local_trash_state", {
+        workspaceId: targetWorkspaceId,
+      });
+      if (
+        !isLocalTrashResetResponseCurrent(
+          token,
+          activeLocalTrashResetRef.current,
+          activeWorkspaceIdRef.current,
+          result,
+        )
+      ) {
+        setLocalTrashUndo((current) =>
+          result.workspaceId === targetWorkspaceId &&
+          current?.workspaceId === targetWorkspaceId
+            ? null
+            : current,
+        );
+        if (localTrashUndoMessageRef.current?.workspaceId === targetWorkspaceId) {
+          localTrashUndoMessageRef.current = null;
+        }
+        await refreshLocalTrashSummary(targetWorkspaceId);
+        return;
+      }
+      setLocalTrashUndo((current) =>
+        current?.workspaceId === targetWorkspaceId ? null : current,
+      );
+      if (localTrashUndoMessageRef.current?.workspaceId === targetWorkspaceId) {
+        localTrashUndoMessageRef.current = null;
+      }
+      preserveSelectedMessageRef.current = null;
+      setMessageVisibility("active");
+      setLocalTrashAllOpenWorkspaceId(null);
+      setListMode(previousActiveListModeRef.current);
+      const resetSessions = openPstSessionsRef.current.map((session) =>
+        session.workspace.id === targetWorkspaceId
+          ? { ...session, folderSelection: session.canonicalFolderSelection }
+          : session,
+      );
+      openPstSessionsRef.current = resetSessions;
+      setOpenPstSessions(resetSessions);
+      setSelectedMessage((current) =>
+        current && (current.workspaceId ?? targetWorkspaceId) === targetWorkspaceId
+          ? { ...current, inLocalTrash: false, localTrashAvailable: true, localTrashErrorCode: null }
+          : current,
+      );
+      setSourceEmlView((current) =>
+        current &&
+        sourceEmlContext?.kind === "workspace" &&
+        sourceEmlContext.workspaceId === targetWorkspaceId
+          ? {
+              ...current,
+              inLocalTrash: false,
+              localTrashAvailable: true,
+              localTrashErrorCode: null,
+            }
+          : current,
+      );
+      setLocalTrashStatus(
+        result.reset
+          ? "Local Trash state reset. Messages, the canonical index, and source PST were unchanged."
+          : "Local Trash state did not require a reset.",
+      );
+      await refreshLocalTrashSummary(targetWorkspaceId);
+      refreshMessagesAfterLocalTrashChange();
+    } catch (err) {
+      const indeterminate =
+        getBackendErrorCode(err) === "LOCAL_TRASH_RESET_INDETERMINATE";
+      const targetStillActive =
+        activeLocalTrashResetRef.current === token &&
+        activeWorkspaceIdRef.current === targetWorkspaceId;
+      if (indeterminate) {
+        setLocalTrashUndo((current) =>
+          current?.workspaceId === targetWorkspaceId ? null : current,
+        );
+        if (localTrashUndoMessageRef.current?.workspaceId === targetWorkspaceId) {
+          localTrashUndoMessageRef.current = null;
+        }
+      }
+      if (targetStillActive) {
+        setLocalTrashStatus(null);
+        setLocalTrashError(
+          indeterminate
+            ? "Local Trash reset needs reinspection. The latest state was reloaded; check Local Trash details before trying again."
+            : `Local Trash state could not be reset. ${errorSummary(getErrorMessage(err))}`,
+        );
+      }
+      await refreshLocalTrashSummary(targetWorkspaceId);
+      if (
+        indeterminate &&
+        selectedMessage &&
+        (selectedMessage.workspaceId ?? workspace.id) === targetWorkspaceId
+      ) {
+        await refreshLocalTrashPreviewState(targetWorkspaceId, selectedMessage.id);
+      }
+      if (
+        targetStillActive &&
+        activeLocalTrashResetRef.current === token &&
+        activeWorkspaceIdRef.current === targetWorkspaceId
+      ) {
+        refreshMessagesAfterLocalTrashChange();
+      }
+    } finally {
+      if (activeLocalTrashResetRef.current === token) {
+        activeLocalTrashResetRef.current = null;
+        setLocalTrashMutationPending(false);
+      }
+    }
+  }
+
+  function handleLocalTrashResetKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeLocalTrashResetConfirmation();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = localTrashResetDialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        "button:not(:disabled), [tabindex]:not([tabindex='-1'])",
+      ),
+    );
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   }
 
   async function openStandaloneMessagePreviewWindow(
     file: ExternalFileOpen,
   ): Promise<boolean> {
-    const label = standalonePreviewWindowLabel(file.stableId);
-    const title = file.path.split("/").pop() || "Message Preview";
-    const url = `/?standaloneMessagePath=${encodeURIComponent(file.path)}`;
-
     try {
-      const existing = await WebviewWindow.getByLabel(label);
-      if (existing) {
-        await focusPreviewWindow(existing);
-        return true;
-      }
-
-      const previewWindow = new WebviewWindow(label, {
-        url,
-        title,
-        width: 900,
-        height: 700,
-        minWidth: 720,
-        minHeight: 520,
-        resizable: true,
-        focus: true,
+      const request: PreviewWindowRequest = {
+        kind: "standalone",
+        stableId: file.stableId,
+      };
+      await invoke<PreviewWindowOpenResult>("open_message_preview_window", {
+        request,
       });
-      await waitForPreviewWindowCreated(previewWindow, label);
-      await focusPreviewWindow(previewWindow);
       return true;
-    } catch (err) {
-      const errorMessage = stringifyWindowError(err);
-      console.error("Could not open standalone message pop-out.", err);
-      setError(
-        `Could not open pop-out window for ${file.path}: ${errorMessage}. Opened in-app preview instead.`,
-      );
+    } catch {
+      console.error("Could not open standalone message pop-out.");
+      setError("Could not open a pop-out preview. Opened the message in the app instead.");
       try {
-        await openStandaloneMessageInline(file.path);
+        await openStandaloneMessageInline(file.stableId);
       } catch (fallbackError) {
-        setError(
-          `Could not open ${file.path}: ${getErrorMessage(fallbackError)}. Pop-out error: ${errorMessage}`,
-        );
+        setError(`Could not open the selected message: ${getErrorMessage(fallbackError)}`);
         return false;
       }
       return true;
@@ -4516,37 +6148,21 @@ function App() {
     if (!targetWorkspaceId) return;
 
     clearWorkspaceOperationMessages(targetWorkspaceId);
-    const label = previewWindowLabel(targetWorkspaceId, message.id);
-    const title = message.subject || "Message Preview";
-    const url = `/?previewWorkspaceId=${encodeURIComponent(targetWorkspaceId)}&previewMessageId=${encodeURIComponent(
-      String(message.id),
-    )}`;
 
     try {
-      const existing = await WebviewWindow.getByLabel(label);
-      if (existing) {
-        await focusPreviewWindow(existing);
-        return;
-      }
-
-      const previewWindow = new WebviewWindow(label, {
-        url,
-        title,
-        width: 900,
-        height: 700,
-        minWidth: 720,
-        minHeight: 520,
-        resizable: true,
-        focus: true,
+      const request: PreviewWindowRequest = {
+        kind: "workspace",
+        workspaceId: targetWorkspaceId,
+        messageId: message.id,
+      };
+      await invoke<PreviewWindowOpenResult>("open_message_preview_window", {
+        request,
       });
-      await waitForPreviewWindowCreated(previewWindow, label);
-      await focusPreviewWindow(previewWindow);
-    } catch (err) {
-      const errorMessage = stringifyWindowError(err);
-      console.error("Could not open pop-out message preview.", err);
+    } catch {
+      console.error("Could not open pop-out message preview.");
       showWorkspaceError(
         targetWorkspaceId,
-        `Could not open pop-out window: ${errorMessage}. Opened in-app preview instead.`,
+        "Could not open a pop-out preview. Opened the message in the app instead.",
       );
       await openInlineMessagePreview(message.id, targetWorkspaceId);
     }
@@ -4588,7 +6204,7 @@ function App() {
                 attachmentId,
               })
             : await invoke<ExportAttachmentResult>("export_standalone_message_attachment", {
-                path: sourceEmlContext.messagePath,
+                stableId: sourceEmlContext.stableId,
                 attachmentId,
               });
         setExportResults((current) => ({ ...current, [attachmentId]: result }));
@@ -4652,7 +6268,7 @@ function App() {
                 attachmentId,
               })
             : await invoke<ExportAttachmentResult>("open_standalone_message_attachment", {
-                path: sourceEmlContext.messagePath,
+                stableId: sourceEmlContext.stableId,
                 attachmentId,
               });
         setExportResults((current) => ({ ...current, [attachmentId]: result }));
@@ -4706,14 +6322,12 @@ function App() {
     }
   }
 
-  async function openSourceEml(allowRemoteResources = false) {
+  async function openSourceEml() {
     if (!workspace || !selectedMessage) return;
     const messageWorkspaceId = selectedMessage.workspaceId ?? workspace.id;
 
     clearWorkspaceOperationMessages(messageWorkspaceId);
-    setSourceEmlStatus(
-      allowRemoteResources ? "Loading remote images for this EML." : "Opening source EML.",
-    );
+    setSourceEmlStatus("Opening source EML.");
     setSourceEmlSaveResult(null);
     setIsLoadingSourceEml(true);
 
@@ -4721,7 +6335,6 @@ function App() {
       const result = await invoke<SourceEmlView>("get_source_eml_view", {
         workspaceId: messageWorkspaceId,
         messageId: selectedMessage.id,
-        allowRemoteResources,
       });
       setSourceEmlView(result);
       setSourceEmlContext({
@@ -4730,58 +6343,9 @@ function App() {
         messageId: selectedMessage.id,
       });
       setSourceEmlOpen(true);
-      setSourceEmlRemoteAllowed(allowRemoteResources);
       setSourceEmlStatus(null);
     } catch (err) {
       showWorkspaceError(messageWorkspaceId, getErrorMessage(err));
-      setSourceEmlStatus(null);
-    } finally {
-      setIsLoadingSourceEml(false);
-    }
-  }
-
-  async function loadSourceEmlForCurrentContext(allowRemoteResources = false) {
-    if (!sourceEmlContext) return;
-
-    if (sourceEmlContext.kind === "workspace") {
-      clearWorkspaceOperationMessages(sourceEmlContext.workspaceId);
-      setSourceEmlStatus(
-        allowRemoteResources ? "Loading remote images for this EML." : "Opening source EML.",
-      );
-      setIsLoadingSourceEml(true);
-      try {
-        const result = await invoke<SourceEmlView>("get_source_eml_view", {
-          workspaceId: sourceEmlContext.workspaceId,
-          messageId: sourceEmlContext.messageId,
-          allowRemoteResources,
-        });
-        setSourceEmlView(result);
-        setSourceEmlRemoteAllowed(allowRemoteResources);
-        setSourceEmlStatus(null);
-      } catch (err) {
-        showWorkspaceError(sourceEmlContext.workspaceId, getErrorMessage(err));
-        setSourceEmlStatus(null);
-      } finally {
-        setIsLoadingSourceEml(false);
-      }
-      return;
-    }
-
-    setError(null);
-    setSourceEmlStatus(
-      allowRemoteResources ? loadingRemoteImagesStatus : "Opening standalone message.",
-    );
-    setIsLoadingSourceEml(true);
-    try {
-      const result = await invoke<SourceEmlView>("get_standalone_message_view", {
-        path: sourceEmlContext.messagePath,
-        allowRemoteResources,
-      });
-      setSourceEmlView(result);
-      setSourceEmlRemoteAllowed(allowRemoteResources);
-      setSourceEmlStatus(null);
-    } catch (err) {
-      setError(getErrorMessage(err));
       setSourceEmlStatus(null);
     } finally {
       setIsLoadingSourceEml(false);
@@ -4804,7 +6368,7 @@ function App() {
               messageId: sourceEmlContext.messageId,
             })
           : await invoke<ExportOriginalEmlResult>("save_standalone_source_message_as", {
-              path: sourceEmlContext.messagePath,
+              stableId: sourceEmlContext.stableId,
             });
       setSourceEmlSaveResult(result);
       if (result.exported) {
@@ -4838,7 +6402,7 @@ function App() {
     } else if (sourceEmlView.sanitizedHtml.trim()) {
       bodyHtml = `<div class="html-body">${makeSanitizedHtmlPrintable(sourceEmlView.sanitizedHtml)}</div>`;
       bodyModeLabel = "Rendered View";
-      if (sourceEmlView.remoteImagesBlocked && !sourceEmlRemoteAllowed) {
+      if (sourceEmlView.remoteImagesBlocked) {
         note = "Remote images were blocked for this print.";
       }
     } else {
@@ -5014,22 +6578,48 @@ function App() {
     }
   }
 
-  async function cancelImport() {
-    const targetWorkspaceId = operationWorkspaceIdRef.current;
+  async function cancelImport(snapshot: ImportProgressSnapshot | null) {
+    if (!snapshot || snapshot.status !== "active") return;
+    const currentOperation = workspaceOperationStates[snapshot.workspaceId] ?? null;
+    const currentSnapshot = currentOperation?.progress ?? null;
+    if (
+      !currentSnapshot ||
+      currentSnapshot.status !== "active" ||
+      currentOperation?.progressOperationId !== snapshot.operationId ||
+      currentSnapshot.workspaceId !== snapshot.workspaceId ||
+      currentSnapshot.operationId !== snapshot.operationId ||
+      currentSnapshot.generation !== snapshot.generation ||
+      currentSnapshot.stateRevision !== snapshot.stateRevision ||
+      currentSnapshot.eventSequence !== snapshot.eventSequence
+    ) {
+      return;
+    }
+    const targetWorkspaceId = snapshot.workspaceId;
+    const integrityOperation = targetWorkspaceId
+      ? integrityOperationTokensRef.current.get(targetWorkspaceId) ?? null
+      : null;
     if (targetWorkspaceId) {
       updateWorkspaceOperationState(targetWorkspaceId, {
-        notice: "Cancel import requested.",
+        notice: integrityOperation
+          ? `Cancel ${integrityOperationLabel(integrityOperation.kind).toLocaleLowerCase()} requested.`
+          : "Cancel import requested.",
         error: null,
       });
     }
     try {
-      const result = await invoke<CancelImportResult>("cancel_import");
+      const result = await invoke<CancelImportResult>("cancel_import", {
+        workspaceId: snapshot.workspaceId,
+        operationId: snapshot.operationId,
+        generation: snapshot.generation,
+      });
+      if (integrityOperation && !workspaceIntegrityOperationIsCurrent(integrityOperation)) return;
       if (targetWorkspaceId) {
         updateWorkspaceOperationState(targetWorkspaceId, { notice: result.message });
       } else {
         setNotice(result.message);
       }
     } catch (err) {
+      if (integrityOperation && !workspaceIntegrityOperationIsCurrent(integrityOperation)) return;
       if (targetWorkspaceId) {
         failWorkspaceOperation(targetWorkspaceId, getErrorMessage(err));
       } else {
@@ -5039,6 +6629,10 @@ function App() {
   }
 
   async function deletePlannedWorkspace(plan: PstOpenPlan, existing: ExistingWorkspace) {
+    const confirmed = window.confirm(
+      "Delete this PST QuickView workspace cache? Its app-only organization, including Local Trash state, will also be removed. The original PST will not be deleted.",
+    );
+    if (!confirmed) return;
     setError(null);
     setNotice(null);
     setForegroundOperationWorkspaceId(existing.workspaceId);
@@ -5074,7 +6668,8 @@ function App() {
         setForegroundOperationWorkspaceId(null);
         setWorkspaceDeleteToast({
           workspaceId: existing.workspaceId,
-          message: "Deleted workspace. Original PST was not deleted.",
+          message:
+            "Deleted workspace cache and its Local Trash state. Original PST was not deleted.",
           result,
         });
       } else {
@@ -5095,9 +6690,9 @@ function App() {
   async function deleteCurrentWorkspace() {
     if (!workspace) return;
     const workspaceId = workspace.id;
-    if (isImporting) {
+    if (isImporting || activeIntegrityOperationRunning) {
       updateWorkspaceOperationState(workspaceId, {
-        notice: "Cancel import before deleting this workspace.",
+        notice: "Cancel the current workspace operation before deleting this workspace.",
       });
       return;
     }
@@ -5116,10 +6711,10 @@ function App() {
   async function confirmDeleteCurrentWorkspace() {
     if (!workspace) return;
     const deletedWorkspaceId = workspace.id;
-    if (isImporting) {
+    if (isImporting || activeIntegrityOperationRunning) {
       updateWorkspaceOperationState(deletedWorkspaceId, {
         deleteConfirmOpen: false,
-        notice: "Cancel import before deleting this workspace.",
+        notice: "Cancel the current workspace operation before deleting this workspace.",
       });
       return;
     }
@@ -5137,7 +6732,8 @@ function App() {
         clearWorkspaceOperationState(deletedWorkspaceId);
         setWorkspaceDeleteToast({
           workspaceId: deletedWorkspaceId,
-          message: "Deleted workspace. Original PST was not deleted.",
+          message:
+            "Deleted workspace cache and its Local Trash state. Original PST was not deleted.",
           result,
         });
         const remainingSessions = openPstSessions.filter(
@@ -5146,6 +6742,9 @@ function App() {
         setOpenPstSessions(remainingSessions);
         if (allOpenFolderSelection.workspaceId === deletedWorkspaceId) {
           setAllOpenFolderSelection({ workspaceId: null, folderId: null });
+        }
+        if (localTrashAllOpenWorkspaceId === deletedWorkspaceId) {
+          setLocalTrashAllOpenWorkspaceId(null);
         }
         if (remainingSessions.length > 0) {
           await activateWorkspaceTab(remainingSessions[0].workspace.id, { resetMessageList: true });
@@ -5230,7 +6829,7 @@ function App() {
   }
 
   function collapseAllFolders() {
-    if (searchScope === "all_open" && openPstSessions.length > 1) {
+    if (searchScope === "all_open" && openPstSessions.length > 0) {
       const keys = openSessionFolderTrees.flatMap(({ session, tree }) => [
         workspaceRootCollapseKey(session.workspace.id),
         ...collectCollapsibleFolderKeys(tree, session.workspace.id),
@@ -5273,7 +6872,9 @@ function App() {
     }
     if (removal.clearFolderSelection) {
       if (draftSearchSnapshot.scope === "all_open") {
-        setAllOpenFolderSelection({ workspaceId: null, folderId: null });
+        if (messageVisibility === "active") {
+          setAllOpenFolderSelection({ workspaceId: null, folderId: null });
+        }
       } else {
         selectCurrentWorkspaceFolder(null);
       }
@@ -5290,31 +6891,72 @@ function App() {
     setConversationSort(cleared.conversationSort);
     setIncludeSubfolders(true);
     rememberIncludeSubfolders(true);
-    if (cleared.clearAllOpenFolderSelection) {
+    if (cleared.clearAllOpenFolderSelection && messageVisibility === "active") {
       setAllOpenFolderSelection({ workspaceId: null, folderId: null });
     }
-  }
-
-  function handleAdvancedSearchKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    event.stopPropagation();
-    setAdvancedSearchOpen(false);
-    window.requestAnimationFrame(() => advancedSearchToggleRef.current?.focus());
   }
 
   function rememberWorkspaceFolderSelection(selection: WorkspaceFolderSelection) {
     setOpenPstSessions((current) =>
       current.map((session) =>
         session.workspace.id === selection.workspaceId
-          ? { ...session, folderSelection: selection }
+          ? {
+              ...session,
+              folderSelection: selection,
+              canonicalFolderSelection: selection,
+            }
           : session,
       ),
     );
   }
 
+  function showActiveMessages() {
+    if (messageVisibility === "active") {
+      setLocalTrashAllOpenWorkspaceId(null);
+      return;
+    }
+    const targetWorkspaceId =
+      searchScope === "all_open" ? localTrashAllOpenWorkspaceId : workspace?.id ?? null;
+    setMessageVisibility("active");
+    setLocalTrashAllOpenWorkspaceId(null);
+    setListMode(previousActiveListModeRef.current);
+    setOpenPstSessions((current) =>
+      current.map((session) =>
+        targetWorkspaceId === session.workspace.id &&
+        isLocalTrashFolderSelection(session.folderSelection)
+          ? { ...session, folderSelection: session.canonicalFolderSelection }
+          : session,
+      ),
+    );
+  }
+
+  function showLocalTrash(targetWorkspaceId: string | null) {
+    if (messageVisibility === "active") previousActiveListModeRef.current = listMode;
+    setMessageVisibility("trashed");
+    setListMode("messages");
+    setLocalTrashAllOpenWorkspaceId(
+      searchScope === "all_open" ? targetWorkspaceId : null,
+    );
+    if (targetWorkspaceId) {
+      setOpenPstSessions((current) =>
+        current.map((session) =>
+          session.workspace.id === targetWorkspaceId
+            ? {
+                ...session,
+                folderSelection: localTrashWorkspaceFolderSelection(
+                  targetWorkspaceId,
+                  session.canonicalFolderSelection.includeSubfolders,
+                ),
+              }
+            : session,
+        ),
+      );
+    }
+  }
+
   function selectCurrentWorkspaceFolder(folderId: number | null) {
     if (!workspace) return;
+    showActiveMessages();
     const selection = resolveWorkspaceFolderSelection(workspace.id, folders, {
       workspaceId: workspace.id,
       folderId,
@@ -5328,6 +6970,7 @@ function App() {
   function selectAllOpenWorkspaceFolder(workspaceId: string, folderId: number | null) {
     const session = openPstSessions.find((candidate) => candidate.workspace.id === workspaceId);
     if (!session) return;
+    showActiveMessages();
     const selection = resolveWorkspaceFolderSelection(workspaceId, session.folders, {
       workspaceId,
       folderId,
@@ -5423,7 +7066,7 @@ function App() {
   }
 
   function renderWorkspaceChoice(plan: PstOpenPlan, existing: ExistingWorkspace) {
-    if (existing.isComplete) {
+    if (existing.integrityClassification === "complete" && existing.canOpen) {
       return (
         <button
           type="button"
@@ -5442,10 +7085,34 @@ function App() {
     return (
       <div className="duplicate-workspace-choice" key={existing.workspacePath}>
         <strong>
-          Incomplete {existing.workspaceLocationLabel} workspace - {existing.importStatus}
+          {existing.integrityClassification === "unsupported" ? "Unsupported" : "Incomplete"}{" "}
+          {existing.workspaceLocationLabel} workspace -{" "}
+          {workspaceIntegrityStateLabel(existing.integrityState)}
         </strong>
-        <small>{existing.workspacePath}</small>
-        <div>
+        {existing.resumeDetails ? (
+          <>
+            <span>
+              {resumeProgressDescription(existing.resumeDetails, formatCount)}
+            </span>
+            <small>{existing.resumeDetails.reason}</small>
+          </>
+        ) : (
+          <small>{existing.importStatus}</small>
+        )}
+        <details>
+          <summary>Workspace location</summary>
+          <small>{existing.workspacePath}</small>
+        </details>
+        <div className="workspace-safe-actions">
+          {existing.canOpen ? (
+            <button
+              type="button"
+              onClick={() => void openPlannedPst(plan, existing, false, "open_existing")}
+              disabled={isBusy}
+            >
+              Open workspace
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={() => void openPlannedPst(plan, existing, false, "resume_index")}
@@ -5456,8 +7123,21 @@ function App() {
                 : "Resume is unavailable because this workspace has no extracted EML folder."
             }
           >
-            Resume indexing existing extracted EMLs
+            Resume Indexing
           </button>
+          {existing.canRepairIndex ? (
+            <button
+              type="button"
+              onClick={(event) =>
+                requestPlannedWorkspaceRepair(plan, existing, event.currentTarget)
+              }
+              disabled={isBusy}
+            >
+              Repair Index
+            </button>
+          ) : null}
+        </div>
+        <div className="workspace-destructive-actions" aria-label="Destructive workspace options">
           <button
             type="button"
             onClick={() => void beginPlannedPstOpen(plan, existing, false, "reimport")}
@@ -5475,6 +7155,7 @@ function App() {
             className="danger-action"
             onClick={() => void deletePlannedWorkspace(plan, existing)}
             disabled={isBusy || !existing.canReimport}
+            title="Delete this workspace cache and its Local Trash state after confirmation. The original PST is not deleted."
           >
             Delete workspace
           </button>
@@ -5484,8 +7165,41 @@ function App() {
   }
 
   const selectedFolder = folders.find((folder) => folder.id === selectedFolderId);
+  const folderDetailsSession =
+    searchScope === "all_open"
+      ? allOpenSelectedSession
+      : openPstSessions.find((session) => session.workspace.id === workspace?.id) ?? null;
+  const folderDetailsWorkspace =
+    folderDetailsSession?.workspace ?? (searchScope === "current" ? workspace : null);
+  const folderDetailsHierarchy =
+    searchScope === "all_open" ? allOpenSelectedHierarchy : folderHierarchy;
+  const folderDetailsFolderId =
+    searchScope === "all_open" ? allOpenSelectedFolderId : selectedFolderId;
+  const folderDetailsFolder =
+    folderDetailsSession && folderDetailsFolderId != null
+      ? folderDetailsSession.folders.find((folder) => folder.id === folderDetailsFolderId) ?? null
+      : searchScope === "current"
+        ? selectedFolder ?? null
+        : null;
+  const folderDetailsPresentationNode =
+    folderDetailsHierarchy && folderDetailsFolderId != null
+      ? folderDetailsHierarchy.flatNodes.find(
+          (node) => node.canonicalFolderId === folderDetailsFolderId,
+        ) ?? null
+      : null;
+  const folderDetailsPresentationSelection = folderDetailsHierarchy
+    ? resolveFolderPresentationSelection(folderDetailsHierarchy, folderDetailsFolderId)
+    : null;
+  const folderDetailsWrappersHidden =
+    folderHierarchyMode === "simplified" &&
+    (folderDetailsPresentationSelection?.kind === "promoted_scope" ||
+      folderDetailsPresentationNode?.ancestorWasPromoted === true);
   const displayedFolderName =
-    appliedIsCrossPstSearch
+    appliedSearch.visibility === "trashed"
+      ? appliedIsCrossPstSearch && appliedSelectedWorkspaceId
+        ? `${pstDisplayName(appliedSelectedSession?.workspace ?? null)} - Local Trash`
+        : "Local Trash"
+      : appliedIsCrossPstSearch
       ? appliedSelectedWorkspaceId
         ? `${pstDisplayName(appliedSelectedSession?.workspace ?? null)} - ${
             appliedSearch.folderId == null
@@ -5496,7 +7210,55 @@ function App() {
       : appliedSearch.folderScope === "all" || appliedSearch.folderId == null
       ? "All Mail"
       : appliedSelectedFolder?.name ?? selectedFolder?.name ?? "Messages";
-  const progress = visibleWorkspaceOperation?.progress ?? null;
+  const progressSnapshots = Object.values(workspaceOperationStates).flatMap((operation) =>
+    operation.progress ? [operation.progress] : [],
+  );
+  const progressIdentityPeers: ImportSourceIdentityPeer[] = [
+    ...progressSnapshots.map(({ workspaceId, sourceBasename }) => ({
+      workspaceId,
+      sourceBasename,
+    })),
+    ...openPstSessions.map((session) => ({
+      workspaceId: session.workspace.id,
+      sourceBasename: pstDisplayName(session.workspace),
+    })),
+  ];
+  const selectedWorkspaceProgress = workspace
+    ? workspaceOperationStates[workspace.id]?.progress ?? null
+    : null;
+  const foregroundProgress = foregroundOperationWorkspaceId
+    ? workspaceOperationStates[foregroundOperationWorkspaceId]?.progress ?? null
+    : null;
+  const activeProgress = progressSnapshots.find((candidate) => candidate.status === "active") ?? null;
+  const latestTerminalProgress = progressSnapshots
+    .filter((candidate) => candidate.status !== "active")
+    .reduce<ImportProgressSnapshot | null>((latest, candidate) => {
+      if (latest === null) return candidate;
+      const latestReceived =
+        workspaceOperationStates[latest.workspaceId]?.progressReceivedAtMonotonicMs ?? -1;
+      const candidateReceived =
+        workspaceOperationStates[candidate.workspaceId]?.progressReceivedAtMonotonicMs ?? -1;
+      return candidateReceived > latestReceived ? candidate : latest;
+    }, null);
+  const progress =
+    (selectedWorkspaceProgress?.status === "active" ? selectedWorkspaceProgress : null) ??
+    (foregroundProgress?.status === "active" ? foregroundProgress : null) ??
+    activeProgress ??
+    latestTerminalProgress ??
+    selectedWorkspaceProgress ??
+    foregroundProgress ??
+    null;
+  useEffect(() => {
+    if (openPopoverId !== "import_progress") return;
+    activePopoverTriggerRef.current = null;
+    setOpenPopoverId(null);
+  }, [progress?.operationId]);
+  const progressOperationState = progress
+    ? workspaceOperationStates[progress.workspaceId] ?? null
+    : null;
+  const progressIsBackground = Boolean(
+    progress && workspace && progress.workspaceId !== workspace.id,
+  );
   const workspaceOperationNotice = visibleWorkspaceOperation?.notice ?? null;
   const workspaceOperationError = visibleWorkspaceOperation?.error ?? null;
   const displayedError = workspaceOperationError ?? activeSearchError ?? error;
@@ -5510,17 +7272,128 @@ function App() {
   const deleteStatuses = activeWorkspaceOperation?.deleteStatuses ?? [];
   const deleteConfirmOpen = activeWorkspaceOperation?.deleteConfirmOpen ?? false;
   const activeWorkspaceOperationRunning = activeWorkspaceOperation?.running ?? false;
-  const progressPercent =
-    progress?.current != null && progress.total && progress.total > 0
-      ? Math.round((progress.current / progress.total) * 100)
+  const activeIntegrityOperationKind =
+    activeWorkspaceOperation?.integrityOperationKind ?? null;
+  const activeIntegrityOperationRunning =
+    activeWorkspaceOperationRunning && activeIntegrityOperationKind != null;
+  const activeIntegrityProgress =
+    activeWorkspaceOperation?.progress?.status === "active" &&
+    activeWorkspaceOperation.progressOperationId === activeWorkspaceOperation.progress.operationId
+      ? activeWorkspaceOperation.progress
       : null;
-  const progressCount =
-    progress?.current != null && progress.total != null
-      ? `Indexed ${formatCount(progress.current)} of ${formatCount(progress.total)} discovered EML files`
+  const activeVerificationReport = activeWorkspaceOperation?.verificationReport ?? null;
+  const verificationReportOpen =
+    activeWorkspaceOperation?.verificationReportOpen === true && activeVerificationReport != null;
+  const repairConfirmOpen = activeWorkspaceOperation?.repairConfirmOpen ?? false;
+  const integrityActions = workspace ? workspaceIntegrityActions(workspace) : [];
+  const sourceAvailabilityMessage = workspace
+    ? workspaceSourceAvailabilityMessage(workspace.sourceAvailability)
+    : null;
+  const progressIdentity = progress
+    ? importIdentityPresentation(progress, progressIdentityPeers)
+    : null;
+  const progressTracker = progress ? importStageTracker(progress) : [];
+  const progressSemantics = progress ? importProgressSemantics(progress) : null;
+  const progressUnit = progress
+    ? progress.stage === "indexing" &&
+      progress.determinate &&
+      progress.processedUnits != null &&
+      progress.totalUnits != null &&
+      progress.unitKind === "candidate_records"
+      ? formatCandidateProgress({
+          current: progress.processedUnits,
+          total: progress.totalUnits,
+        })
+      : unitProgressText(progress)
+    : null;
+  const progressAllCounters = progress ? importCounterRows(progress, formatCount) : [];
+  const progressStageCounters = progress
+    ? progressAllCounters.filter((row) => importStageCounterKeys[progress.stage].includes(row.key))
+    : [];
+  const progressTerminal = progress
+    ? terminalImportPresentation(progress, progressIdentityPeers)
+    : null;
+  const progressLiveNow = progressClockTick >= 0 ? monotonicMilliseconds() : 0;
+  const progressLiveDelta =
+    progress?.status === "active" && progressOperationState?.progressReceivedAtMonotonicMs != null
+      ? Math.max(0, progressLiveNow - progressOperationState.progressReceivedAtMonotonicMs)
+      : 0;
+  const progressActiveElapsedMs = progress
+    ? progress.activeElapsedMs +
+      (["new_import", "resumed_import"].includes(progress.operationKind)
+        ? progressLiveDelta
+        : 0)
+    : 0;
+  const progressOperationElapsedMs = progress
+    ? progress.operationElapsedMs + progressLiveDelta
+    : 0;
+  const progressStageElapsedMs = progress
+    ? progress.stageElapsedMs + progressLiveDelta
+    : 0;
+  const progressDisplayedElapsedMs =
+    progress?.operationKind === "repair" || progress?.operationKind === "verification"
+      ? progressOperationElapsedMs
+      : progressActiveElapsedMs;
+  const progressLiveActivityAgeMs =
+    progress?.lastActivityAgeMs == null
+      ? null
+      : progress.lastActivityAgeMs + progressLiveDelta;
+  const progressEta = progress
+    ? importEtaPresentation(progress, progressLiveActivityAgeMs)
+    : null;
+  const progressLastActivity = progress
+    ? lastActivityText(progress, progressLiveActivityAgeMs)
+    : null;
+  const progressHealth = progress
+    ? processHealthText(progress, progressLiveActivityAgeMs)
+    : null;
+  const progressExplanation = progress ? importStageExplanation(progress) : null;
+  const progressFillPercent =
+    progressSemantics?.kind === "determinate"
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            (progressSemantics.ariaValueNow / progressSemantics.ariaValueMax) * 100,
+          ),
+        )
       : null;
+  const progressWorkspaceIsOpen = Boolean(
+    progress && openWorkspaceIds.includes(progress.workspaceId),
+  );
+  const visibleIntegrityOperationKind =
+    progressOperationState?.integrityOperationKind ?? null;
+  const progressCanCancel = Boolean(
+    progress?.status === "active" &&
+      progressOperationState?.running &&
+      progressOperationState.progressOperationId === progress.operationId &&
+      progressOperationState.progress?.generation === progress.generation &&
+      progressOperationState.progress?.stateRevision === progress.stateRevision &&
+      progressOperationState.progress?.eventSequence === progress.eventSequence &&
+      (!visibleIntegrityOperationKind
+        ? progress.operationKind !== "verification"
+        : integrityOperationIsCancellable(visibleIntegrityOperationKind)),
+  );
+  const progressAnnouncementKey = progress
+    ? materialImportAnnouncementKey(progress)
+    : "no-import-progress";
+  const progressAnnouncement = progress
+    ? materialImportAnnouncementText(progress, progressIdentityPeers)
+    : "";
+  const progressCancelLabel =
+    progressOperationState?.integrityOperationKind != null
+      ? `Cancel ${integrityOperationLabel(progressOperationState.integrityOperationKind)}`
+      : foregroundImportAction === "repair_index" || progress?.operationKind === "repair"
+        ? "Cancel Repair"
+        : progress?.operationKind === "resumed_import"
+          ? "Cancel Resume"
+          : "Cancel Import";
   const pendingWorkspaceFlowVisible = pendingWorkspaceFlowBelongsToActiveTab;
   const visiblePendingOpenPlan = pendingWorkspaceFlowVisible ? pendingOpenPlan : null;
   const visiblePendingPreflightOpen = pendingWorkspaceFlowVisible ? pendingPreflightOpen : null;
+  const visiblePendingPlannedRepair = pendingWorkspaceFlowVisible
+    ? pendingPlannedRepair
+    : null;
   const pendingSelectedWorkspace =
     visiblePendingOpenPlan?.existingWorkspaces.find(
       (existing) => existing.workspacePath === visiblePendingOpenPlan.selectedWorkspacePath,
@@ -5534,6 +7407,32 @@ function App() {
     (existing) => !existing.isComplete,
   );
   const selectedBody = selectedMessage ? formatBodyForDisplay(selectedMessage.body) : "";
+  const selectedMessageWorkspaceId = selectedMessage?.workspaceId ?? workspace?.id ?? null;
+  const selectedMessageLocalTrashSummary = selectedMessageWorkspaceId
+    ? openPstSessions.find(
+        (session) => session.workspace.id === selectedMessageWorkspaceId,
+      )?.localTrashSummary ?? null
+    : null;
+  const selectedMessageLocalTrashAvailable = Boolean(
+    selectedMessage &&
+      selectedMessage.localTrashAvailable &&
+      isLocalTrashHealthy(selectedMessageLocalTrashSummary),
+  );
+  const localTrashUndoSummary = localTrashUndo
+    ? openPstSessions.find(
+        (session) => session.workspace.id === localTrashUndo.workspaceId,
+      )?.localTrashSummary ?? null
+    : null;
+  const canUndoLocalTrashMove = Boolean(
+    localTrashUndo &&
+      localTrashUndoSummary &&
+      isLocalTrashHealthy(localTrashUndoSummary) &&
+      isLocalTrashUndoCurrent(
+        localTrashUndo,
+        localTrashUndo.workspaceId,
+        localTrashUndoSummary.stateRevision,
+      ),
+  );
   const selectedBodyStatus = selectedMessage ? bodyStatusMessage(selectedMessage, selectedBody) : null;
   const selectedBodyIsRtfFallback = selectedMessage?.bodySource === "rtf_converted";
   const sourceEmlBody = sourceEmlView ? formatBodyForDisplay(sourceEmlView.bodyText) : "";
@@ -5545,8 +7444,6 @@ function App() {
     : [];
   const messageDiagnosticNotes = messageDiagnostics ? diagnosticNotes(messageDiagnostics) : [];
   const sourceEmlRawTerms = sourceEmlRawSearch.trim() ? [sourceEmlRawSearch.trim()] : [];
-  const remoteImagesAllowedForSelected =
-    selectedMessage != null && remoteImagesAllowedMessageId === selectedMessage.id;
   const htmlMissingCanReindex =
     selectedMessage != null &&
     !selectedBodyIsRtfFallback &&
@@ -5569,7 +7466,9 @@ function App() {
         ? pstDisplayName(appliedSelectedSession?.workspace ?? null)
         : null,
     folderLabel:
-      appliedSearch.folderId == null
+      appliedSearch.visibility === "trashed"
+        ? "Local Trash"
+        : appliedSearch.folderId == null
         ? "All Mail"
         : appliedSelectedFolder?.name ?? "Selected folder",
   });
@@ -5646,6 +7545,7 @@ function App() {
     activeFilterCount: activeAdvancedFilterCount,
     errorGeneration: searchError?.generation ?? null,
     currentGeneration: appliedSearchVersion.generation,
+    visibility: appliedSearch.visibility,
   });
   const conversationReindexRequired =
     appliedSearch.listMode === "conversations" &&
@@ -5667,6 +7567,7 @@ function App() {
     paneWidths.message,
     paneWidths.outlookMessage,
     appliedIsCrossPstSearch ? "cross-pst" : "single-pst",
+    appliedSearch.visibility,
   ].join(":");
   const conversationResultsMeasurementIdentity = [
     appearance,
@@ -5696,6 +7597,7 @@ function App() {
         <div>Drop PST, EML, or MSG files to open</div>
       </div>
     ) : null}
+    <RemoteSupportControl />
     <main className="app-shell">
       <header className="top-bar">
         <div className="brand-block">
@@ -5706,6 +7608,7 @@ function App() {
           <div className="search-row">
             <input
               type="search"
+              data-support-control="input"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder='Search, or use from:adam subject:calendar "exact phrase"'
@@ -5714,18 +7617,19 @@ function App() {
             />
             <button
               id={advancedSearchToggleId}
-              ref={advancedSearchToggleRef}
+              data-support-control="click"
               type="button"
               className={
                 advancedSearchOpen || activeAdvancedFilterCount > 0
                   ? "filter-toggle active"
                   : "filter-toggle"
               }
-              onClick={() => setAdvancedSearchOpen((open) => !open)}
+              onClick={(event) => togglePopover("advanced_search", event.currentTarget)}
               disabled={!workspace || isBusy}
               title="Show advanced search filters."
               aria-expanded={advancedSearchOpen}
               aria-controls={advancedSearchPanelId}
+              aria-haspopup="dialog"
               aria-label={
                 activeAdvancedFilterCount > 0
                   ? `Advanced search, ${activeAdvancedFilterCount} active filter${
@@ -5745,7 +7649,11 @@ function App() {
               <span>Scope</span>
               <select
                 value={searchScope}
-                onChange={(event) => setSearchScope(normalizeSearchScope(event.target.value))}
+                data-support-control="input"
+                onChange={(event) => {
+                  setSearchScope(normalizeSearchScope(event.target.value));
+                  setLocalTrashAllOpenWorkspaceId(null);
+                }}
                 disabled={!workspace || isBusy}
               >
                 <option value="current">Current PST</option>
@@ -5756,10 +7664,11 @@ function App() {
           {advancedSearchOpen ? (
             <div
               id={advancedSearchPanelId}
+              ref={advancedSearchPanelRef}
               className="advanced-search-panel"
-              role="group"
+              role="dialog"
+              aria-modal="false"
               aria-labelledby={advancedSearchToggleId}
-              onKeyDown={handleAdvancedSearchKeyDown}
             >
               <label>
                 <span>From</span>
@@ -5841,9 +7750,15 @@ function App() {
                 <select
                   value={searchFilters.folderScope}
                   onChange={(event) => updateFolderScope(event.target.value as FolderScopeFilter)}
-                  disabled={!workspace || isBusy || isCrossPstSearch}
+                  disabled={
+                    !workspace || isBusy || isCrossPstSearch || messageVisibility === "trashed"
+                  }
                   title={
-                    isCrossPstSearch ? "Cross-PST search uses All Mail in each open PST." : undefined
+                    messageVisibility === "trashed"
+                      ? "Local Trash is not scoped by PST folders."
+                      : isCrossPstSearch
+                        ? "Cross-PST search uses All Mail in each open PST."
+                        : undefined
                   }
                 >
                   <option value="current">Current folder</option>
@@ -5854,7 +7769,10 @@ function App() {
               <div className="advanced-search-actions">
                 <button
                   type="button"
-                  onClick={clearAllSearch}
+                  onClick={() => {
+                    clearAllSearch();
+                    closeActivePopover();
+                  }}
                   disabled={!workspace || isBusy || !canClearAppliedSearch}
                   aria-label="Clear all search filters and sorting"
                 >
@@ -5874,7 +7792,7 @@ function App() {
             onChange={(event) =>
               setWorkspaceLocationMode(event.target.value as WorkspaceLocationMode)
             }
-            disabled={isBusy}
+            disabled={isBusy || localTrashMutationPending}
             title={
               workspaceLocationMode === "next_to_pst"
                 ? "Next to PST stores the searchable cache beside the PST, useful for external drives."
@@ -5890,10 +7808,15 @@ function App() {
             type="button"
             className="primary-action"
             onClick={openPst}
-            disabled={isBusy || readpstStatus?.available !== true}
+            disabled={
+              isBusy ||
+              localTrashMutationPending ||
+              anyWorkspaceIntegrityOperationRunning ||
+              readpstStatus?.available !== true
+            }
             title={
               readpstStatus?.available === false
-                ? `Install readpst first: ${readpstStatus.setupCommand}`
+                ? readpstStatus.setupCommand
                 : "Choose a PST file to open."
             }
           >
@@ -5908,12 +7831,39 @@ function App() {
             Open Message
           </button>
           {recentPsts.length ? (
-            <details className="recent-menu">
-              <summary title="Open a recently selected PST.">Recent</summary>
-              <div className="recent-menu-panel">
+            <div className="recent-menu">
+              <button
+                type="button"
+                className="popover-trigger"
+                title="Open a recently selected PST."
+                onClick={(event) => togglePopover("recent", event.currentTarget)}
+                aria-expanded={openPopoverId === "recent"}
+                aria-controls={recentPopoverPanelId}
+                aria-haspopup="dialog"
+              >
+                Recent
+              </button>
+              {openPopoverId === "recent" ? (
+              <div
+                id={recentPopoverPanelId}
+                ref={recentPopoverPanelRef}
+                className="recent-menu-panel"
+                role="dialog"
+                aria-modal="false"
+                aria-label="Open Recent"
+              >
                 <div className="recent-menu-header">
                   <strong>Open Recent</strong>
-                  <button type="button" onClick={clearRecentPsts} disabled={isBusy}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      clearRecentPsts();
+                      closeActivePopover();
+                    }}
+                    disabled={
+                      isBusy || localTrashMutationPending || anyWorkspaceIntegrityOperationRunning
+                    }
+                  >
                     Clear
                   </button>
                 </div>
@@ -5922,8 +7872,13 @@ function App() {
                     <button
                       type="button"
                       key={recent.path}
-                      onClick={() => void openRecentPst(recent.path)}
-                      disabled={isBusy}
+                      onClick={() => {
+                        closeActivePopover();
+                        void openRecentPst(recent.path);
+                      }}
+                      disabled={
+                        isBusy || localTrashMutationPending || anyWorkspaceIntegrityOperationRunning
+                      }
                       title={pathParent(recent.path)}
                     >
                       <span>{pathFileName(recent.path)}</span>
@@ -5932,13 +7887,17 @@ function App() {
                   ))}
                 </div>
               </div>
-            </details>
+              ) : null}
+            </div>
           ) : null}
           <button
             type="button"
             className="help-action"
-            onClick={() => setAboutOpen(true)}
+            onClick={(event) => togglePopover("help", event.currentTarget)}
             title="About PST QuickView and safety notes."
+            aria-expanded={aboutOpen}
+            aria-controls={helpDialogId}
+            aria-haspopup="dialog"
           >
             Help
           </button>
@@ -5950,7 +7909,7 @@ function App() {
           <div>
             <strong>Restore {formatCount(savedSession.entries.length)} PST{savedSession.entries.length === 1 ? "" : "s"} from last session?</strong>
             <span>
-              Opens existing complete workspaces only. Missing external drives are skipped.
+              Opens saved local workspaces. Missing source volumes are reported without deleting local workspace data.
             </span>
             {restoreStatus ? <span>{restoreStatus}</span> : null}
           </div>
@@ -5959,11 +7918,15 @@ function App() {
               type="button"
               className="primary-action"
               onClick={() => void restorePreviousSession()}
-              disabled={isBusy}
+              disabled={isBusy || anyWorkspaceIntegrityOperationRunning}
             >
               Restore
             </button>
-            <button type="button" onClick={startFreshPreviousSession} disabled={isBusy}>
+            <button
+              type="button"
+              onClick={startFreshPreviousSession}
+              disabled={isBusy || anyWorkspaceIntegrityOperationRunning}
+            >
               Start Fresh
             </button>
           </div>
@@ -5972,7 +7935,7 @@ function App() {
 
       {readpstStatus?.available === false ? (
         <section className="notice-box" role="status">
-          Install libpst before opening a PST: <code>{readpstStatus.setupCommand}</code>
+          {readpstStatus.setupCommand}
           <button type="button" onClick={() => void checkReadpstStatus()} disabled={isBusy}>
             Check again
           </button>
@@ -5992,7 +7955,10 @@ function App() {
                       className="open-pst-tab-main"
                       onClick={() => void activateWorkspaceTab(session.workspace.id)}
                       title={session.workspace.pstPath}
-                      disabled={isBusy && !canSwitchTabsDuringOperation}
+                      disabled={
+                        localTrashMutationPending ||
+                        (isBusy && !canSwitchTabsDuringOperation)
+                      }
                     >
                       {pstDisplayName(session.workspace)} {formatCount(session.workspace.messageCount)}
                     </button>
@@ -6000,7 +7966,12 @@ function App() {
                       type="button"
                       className="open-pst-tab-close"
                       onClick={() => void closeWorkspaceTab(session.workspace.id)}
-                      disabled={isBusy || isImporting}
+                      disabled={
+                        isBusy ||
+                        isImporting ||
+                        localTrashMutationPending ||
+                        workspaceOperationStates[session.workspace.id]?.running === true
+                      }
                       title="Close this PST from the open set. This does not delete the workspace or original PST."
                     >
                       x
@@ -6015,12 +7986,32 @@ function App() {
             <span className="workspace-summary" title={workspaceSize?.workspacePath ?? workspace.workspacePath}>
               {workspaceSummaryText}
             </span>
-            <details className="workspace-menu">
-              <summary>Workspace</summary>
-              <div className="workspace-menu-panel">
+            <div className="workspace-menu">
+              <button
+                type="button"
+                className="popover-trigger"
+                onClick={(event) => togglePopover("workspace", event.currentTarget)}
+                aria-expanded={openPopoverId === "workspace"}
+                aria-controls={workspacePopoverPanelId}
+                aria-haspopup="dialog"
+              >
+                Workspace
+              </button>
+              {openPopoverId === "workspace" ? (
+              <div
+                id={workspacePopoverPanelId}
+                ref={workspacePopoverPanelRef}
+                className="workspace-menu-panel"
+                role="dialog"
+                aria-modal="false"
+                aria-label="Workspace actions"
+              >
                 <button
                   type="button"
-                  onClick={revealOriginalPst}
+                  onClick={() => {
+                    closeActivePopover();
+                    void revealOriginalPst();
+                  }}
                   disabled={!workspace}
                   title="Reveal the original PST file in Finder."
                 >
@@ -6028,7 +8019,10 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={revealWorkspace}
+                  onClick={() => {
+                    closeActivePopover();
+                    void revealWorkspace();
+                  }}
                   disabled={!workspace}
                   title="Reveal the current PST QuickView workspace/cache in Finder."
                 >
@@ -6036,48 +8030,103 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={revealBothFolders}
+                  onClick={() => {
+                    closeActivePopover();
+                    void revealBothFolders();
+                  }}
                   disabled={!workspace}
                   title="Open the original PST location and workspace location in Finder."
                 >
                   Open Both
                 </button>
-                <button type="button" onClick={revealImportLog} title="Reveal the current import log in Finder.">
-                  Import Log
-                </button>
                 <button
                   type="button"
-                  className="danger-action"
-                  onClick={deleteCurrentWorkspace}
-                  disabled={!workspace || isBusy || isImporting}
-                  title={
-                    isImporting
-                      ? "Cancel import before deleting this workspace."
-                      : "Delete the current PST QuickView workspace/cache. The original PST is not deleted."
-                  }
+                  onClick={() => {
+                    closeActivePopover();
+                    void revealImportLog();
+                  }}
+                  title="Reveal the current import log in Finder."
                 >
-                  Delete Workspace
+                  Import Log
                 </button>
+                <div className="workspace-destructive-actions" aria-label="Destructive workspace options">
+                  <span>Destructive options</span>
+                  <button
+                    type="button"
+                    className="danger-action"
+                    onClick={() => {
+                      closeActivePopover();
+                      void deleteCurrentWorkspace();
+                    }}
+                    disabled={!workspace || isBusy || isImporting || activeIntegrityOperationRunning}
+                    title={
+                      isImporting || activeIntegrityOperationRunning
+                        ? "Cancel the current workspace operation before deleting this workspace."
+                        : "Delete the current PST QuickView workspace/cache, including Local Trash state. The original PST is not deleted."
+                    }
+                  >
+                    Delete Workspace
+                  </button>
+                </div>
               </div>
-            </details>
-            <details className="layout-controls">
-              <summary>Layout</summary>
-              <div className="layout-control-grid">
+              ) : null}
+            </div>
+            <div className="layout-controls">
+              <button
+                type="button"
+                className="popover-trigger"
+                onClick={(event) => togglePopover("layout", event.currentTarget)}
+                data-support-control="click"
+                aria-expanded={openPopoverId === "layout"}
+                aria-controls={layoutPopoverPanelId}
+                aria-haspopup="dialog"
+              >
+                Layout
+              </button>
+              {openPopoverId === "layout" ? (
+              <div
+                id={layoutPopoverPanelId}
+                ref={layoutPopoverPanelRef}
+                className="layout-control-grid"
+                role="dialog"
+                aria-modal="false"
+                aria-label="Layout and folder presentation"
+              >
                 <label>
                   <span>View</span>
                   <select
                     value={listMode}
-                    onChange={(event) => setListMode(event.target.value as ListMode)}
+                    data-support-control="input"
+                    onChange={(event) => {
+                      if (
+                        messageVisibility === "trashed" &&
+                        event.target.value === "conversations"
+                      ) return;
+                      setListMode(event.target.value as ListMode);
+                      closeActivePopover();
+                    }}
+                    aria-describedby={
+                      messageVisibility === "trashed" ? "local-trash-messages-only" : undefined
+                    }
                   >
                     <option value="messages">Messages</option>
-                    <option value="conversations">Conversations</option>
+                    <option value="conversations" disabled={messageVisibility === "trashed"}>
+                      Conversations
+                    </option>
                   </select>
+                  {messageVisibility === "trashed" ? (
+                    <small id="local-trash-messages-only">Local Trash uses Messages view.</small>
+                  ) : null}
                 </label>
                 <label>
                   <span>Mode</span>
                   <select
                     value={layoutMode}
-                    onChange={(event) => setLayoutMode(event.target.value as LayoutMode)}
+                    data-support-control="input"
+                    onChange={(event) => {
+                      setLayoutMode(event.target.value as LayoutMode);
+                      closeActivePopover();
+                    }}
                   >
                     <option value="three_column">Three Column</option>
                     <option value="outlook">Outlook Style</option>
@@ -6087,14 +8136,41 @@ function App() {
                   <span>List</span>
                   <select
                     value={messageListDisplayMode}
-                    onChange={(event) =>
-                      setMessageListDisplayMode(event.target.value as MessageListDisplayMode)
-                    }
+                    data-support-control="input"
+                    onChange={(event) => {
+                      setMessageListDisplayMode(event.target.value as MessageListDisplayMode);
+                      closeActivePopover();
+                    }}
                   >
                     <option value="subject_first">Subject first</option>
                     <option value="sender_first">Sender first</option>
                   </select>
                 </label>
+                <fieldset className="folder-hierarchy-options">
+                  <legend>Folder hierarchy</legend>
+                  <button
+                    type="button"
+                    aria-pressed={folderHierarchyMode === "simplified"}
+                    data-support-control="click"
+                    onClick={() => {
+                      setFolderHierarchyMode("simplified");
+                      closeActivePopover();
+                    }}
+                  >
+                    Simplified hierarchy
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={folderHierarchyMode === "original"}
+                    data-support-control="click"
+                    onClick={() => {
+                      setFolderHierarchyMode("original");
+                      closeActivePopover();
+                    }}
+                  >
+                    Original PST hierarchy
+                  </button>
+                </fieldset>
                 <label>
                   <span>Folder</span>
                   <input
@@ -6125,28 +8201,110 @@ function App() {
                 <button
                   type="button"
                   className="secondary-layout-action"
-                  onClick={() => setFoldersHidden((current) => !current)}
+                  onClick={() => {
+                    setFoldersHidden((current) => !current);
+                    closeActivePopover();
+                  }}
                 >
                   {foldersHidden ? "Show Folders" : "Hide Folders"}
                 </button>
-                <button type="button" onClick={collapseAllFolders} disabled={!workspace || !folderTree.length}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    collapseAllFolders();
+                    closeActivePopover();
+                  }}
+                  disabled={!workspace || !folderTree.length}
+                >
                   Collapse All
                 </button>
-                <button type="button" onClick={expandAllFolders} disabled={!workspace || !folderTree.length}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    expandAllFolders();
+                    closeActivePopover();
+                  }}
+                  disabled={!workspace || !folderTree.length}
+                >
                   Expand All
                 </button>
-                <button type="button" onClick={resetPaneLayout} title="Reset folder and message list widths.">
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetPaneLayout();
+                    closeActivePopover();
+                  }}
+                  title="Reset folder and message list widths."
+                >
                   Reset
                 </button>
               </div>
-            </details>
+              ) : null}
+            </div>
             {workspaceSize ? (
-              <details className="workspace-details">
-                <summary>Details</summary>
-                <dl>
+              <div className="workspace-details">
+                <button
+                  type="button"
+                  className="popover-trigger"
+                  onClick={(event) => togglePopover("workspace_details", event.currentTarget)}
+                  aria-expanded={openPopoverId === "workspace_details"}
+                  aria-controls={workspaceDetailsPanelId}
+                  aria-haspopup="dialog"
+                >
+                  Details
+                </button>
+                {openPopoverId === "workspace_details" ? (
+                <div
+                  id={workspaceDetailsPanelId}
+                  ref={workspaceDetailsPanelRef}
+                  className="workspace-details-panel"
+                  role="dialog"
+                  aria-modal="false"
+                  aria-label="Workspace details"
+                >
+                  <dl>
                   <div>
                     <dt>Mode</dt>
                     <dd>{workspaceSize.workspaceLocationLabel}</dd>
+                  </div>
+                  <div>
+                    <dt>Import state</dt>
+                    <dd>{workspaceIntegrityStateLabel(workspace.integrityState)}</dd>
+                  </div>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{workspace.sourceAvailability}</dd>
+                  </div>
+                  <div>
+                    <dt>Conversations</dt>
+                    <dd>{workspace.conversationState.replace(/_/g, " ")}</dd>
+                  </div>
+                  <div>
+                    <dt>Last verification</dt>
+                    <dd>{workspace.hasLastVerification ? "Available" : "Not run"}</dd>
+                  </div>
+                  <div>
+                    <dt>Source PST size</dt>
+                    <dd>{formatBytes(workspace.pstSizeBytes)}</dd>
+                  </div>
+                  <div>
+                    <dt>Completed import duration</dt>
+                    <dd>{completedImportDurationText(
+                      workspace.completedImportDurationMs,
+                      workspace.integrityState === "complete",
+                    )}</dd>
+                  </div>
+                  <div>
+                    <dt>Active import elapsed</dt>
+                    <dd>{formatImportDuration(workspace.activeImportElapsedMs)}</dd>
+                  </div>
+                  <div>
+                    <dt>Current stage elapsed</dt>
+                    <dd>{formatImportDuration(workspace.currentStageElapsedMs)}</dd>
+                  </div>
+                  <div>
+                    <dt>Last import activity</dt>
+                    <dd>{formatMessageDate(workspace.lastActivityAt) || "Not recorded"}</dd>
                   </div>
                   <div>
                     <dt>Original PST</dt>
@@ -6176,11 +8334,383 @@ function App() {
                     <dt>Attachments</dt>
                     <dd>{formatBytes(workspaceSize.attachmentsBytes)}</dd>
                   </div>
-                </dl>
-              </details>
+                  <div>
+                    <dt>Local Trash available</dt>
+                    <dd>{isLocalTrashHealthy(activeLocalTrashSummary) ? "Yes" : "No"}</dd>
+                  </div>
+                  <div>
+                    <dt>Local Trash health</dt>
+                    <dd>{localTrashHealthLabel(activeLocalTrashSummary)}</dd>
+                  </div>
+                  <div>
+                    <dt>Canonical imported messages</dt>
+                    <dd>{formatCount(workspace.messageCount)}</dd>
+                  </div>
+                  <div>
+                    <dt>Visible active messages</dt>
+                    <dd>
+                      {formatCount(
+                        activeOpenPstSession
+                          ? workspaceActiveMessageCount(activeOpenPstSession)
+                          : workspace.messageCount,
+                      )}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Messages in Local Trash</dt>
+                    <dd>
+                      {isLocalTrashHealthy(activeLocalTrashSummary)
+                        ? formatCount(activeLocalTrashSummary!.trashedMessageCount)
+                        : "Unavailable"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Orphaned local state</dt>
+                    <dd>{formatCount(activeLocalTrashSummary?.orphanedStateCount ?? 0)}</dd>
+                  </div>
+                  <div>
+                    <dt>Local-state schema</dt>
+                    <dd>{activeLocalTrashSummary?.schemaVersion ?? "Not created"}</dd>
+                  </div>
+                  <div>
+                    <dt>Local-state overlay</dt>
+                    <dd>{activeLocalTrashSummary?.sidecarPresent ? "Present" : "Not created"}</dd>
+                  </div>
+                  <div>
+                    <dt>Local-state revision</dt>
+                    <dd>{activeLocalTrashSummary?.stateRevision ?? 0}</dd>
+                  </div>
+                  <div>
+                    <dt>Last Local Trash change</dt>
+                    <dd>
+                      {formatMessageDate(activeLocalTrashSummary?.lastChangedAt ?? "") ||
+                        "Not recorded"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Source/workspace fingerprint</dt>
+                    <dd>
+                      {activeLocalTrashSummary?.fingerprintMatch ? "Matches" : "Not verified"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Last local-state error code</dt>
+                    <dd>{activeLocalTrashSummary?.lastErrorCode ?? "None"}</dd>
+                  </div>
+                  </dl>
+                  {canResetLocalTrashState(activeLocalTrashSummary) ? (
+                    <div className="workspace-local-trash-reset">
+                      <p>{localTrashResetDisclosure}</p>
+                      <button
+                        type="button"
+                        className="danger-action"
+                        onClick={(event) => requestLocalTrashReset(event.currentTarget)}
+                        disabled={
+                          localTrashMutationPending ||
+                          isBusy ||
+                          isImporting ||
+                          activeIntegrityOperationRunning
+                        }
+                      >
+                        Reset Local Trash State
+                      </button>
+                    </div>
+                  ) : !isLocalTrashHealthy(activeLocalTrashSummary) ? (
+                    <div className="workspace-local-trash-reset" role="status">
+                      <p>
+                        Reset is unavailable because PST QuickView could not validate a safe,
+                        exact Local Trash overlay target. Normal message visibility remains
+                        fail-open.
+                      </p>
+                    </div>
+                  ) : null}
+                </div>
+                ) : null}
+              </div>
             ) : null}
           </div>
         </section>
+      ) : null}
+
+      {workspace ? (
+        <section
+          className={`workspace-integrity-banner workspace-integrity-${workspace.integrityClassification}`}
+          aria-busy={activeIntegrityOperationRunning}
+          aria-label="Import integrity"
+        >
+          <div className="workspace-integrity-summary">
+            <strong>
+              {workspace.resumeDetails?.pstBasename || pstDisplayName(workspace)} -{" "}
+              {workspace.integrityClassification === "complete"
+                ? "Import complete"
+                : workspace.integrityClassification === "unsupported"
+                  ? "Unsupported workspace state"
+                  : "Import incomplete"}
+            </strong>
+            {workspace.resumeDetails ? (
+              <span>{resumeProgressDescription(workspace.resumeDetails, formatCount)}</span>
+            ) : (
+              <span>State: {workspaceIntegrityStateLabel(workspace.integrityState)}</span>
+            )}
+            {sourceAvailabilityMessage ? <span>{sourceAvailabilityMessage}</span> : null}
+            {activeIntegrityOperationRunning && activeIntegrityOperationKind ? (
+              <span role="status" aria-live="polite" aria-atomic="true">
+                {integrityOperationRunningLabel(activeIntegrityOperationKind)}
+              </span>
+            ) : null}
+          </div>
+
+          {workspace.resumeDetails ? (
+            <dl className="workspace-resume-details">
+              <div>
+                <dt>Last completed stage</dt>
+                <dd>{workspaceIntegrityStateLabel(workspace.resumeDetails.lastCompletedStage)}</dd>
+              </div>
+              <div>
+                <dt>Interrupted stage</dt>
+                <dd>{workspaceIntegrityStateLabel(workspace.resumeDetails.interruptedStage)}</dd>
+              </div>
+              <div>
+                <dt>Discovered</dt>
+                <dd>{formatCount(workspace.resumeDetails.discoveredCandidates)}</dd>
+              </div>
+              <div>
+                <dt>Indexed</dt>
+                <dd>{formatCount(workspace.resumeDetails.canonicalIndexed)}</dd>
+              </div>
+              <div>
+                <dt>Remaining</dt>
+                <dd>
+                  {workspace.resumeDetails.remainingCandidates == null
+                    ? "Unknown"
+                    : formatCount(workspace.resumeDetails.remainingCandidates)}
+                </dd>
+              </div>
+              <div>
+                <dt>Last successful update</dt>
+                <dd>{formatMessageDate(workspace.resumeDetails.lastSuccessfulUpdate) || "Unknown"}</dd>
+              </div>
+              <div>
+                <dt>Elapsed</dt>
+                <dd>{formatElapsedDuration(workspace.resumeDetails.elapsedDurationMs)}</dd>
+              </div>
+              <div>
+                <dt>Interrupted stage elapsed</dt>
+                <dd>{formatImportDuration(workspace.resumeDetails.stageElapsedDurationMs)}</dd>
+              </div>
+              <div>
+                <dt>Last activity</dt>
+                <dd>{formatMessageDate(workspace.resumeDetails.lastActivityAt) || "Not recorded"}</dd>
+              </div>
+              <div>
+                <dt>Why incomplete</dt>
+                <dd>{workspace.resumeDetails.reason}</dd>
+              </div>
+            </dl>
+          ) : null}
+
+          <div className="workspace-integrity-actions" role="group" aria-label="Import integrity actions">
+            {integrityActions.includes("resume_indexing") ? (
+              <button
+                type="button"
+                onClick={() => void resumeWorkspaceIndexing(workspace.id)}
+                disabled={isBusy || isImporting || anyWorkspaceIntegrityOperationRunning}
+              >
+                {activeIntegrityOperationRunning && activeIntegrityOperationKind === "resume_indexing"
+                  ? integrityOperationRunningLabel("resume_indexing")
+                  : "Resume Indexing"}
+              </button>
+            ) : null}
+            {integrityActions.includes("verify") ? (
+              <button
+                type="button"
+                className={workspace.integrityClassification === "complete" ? "primary-action" : undefined}
+                onClick={(event) => void verifyWorkspaceImport(workspace.id, event.currentTarget)}
+                disabled={isBusy || isImporting || anyWorkspaceIntegrityOperationRunning}
+              >
+                {activeIntegrityOperationRunning && activeIntegrityOperationKind === "verify"
+                  ? integrityOperationRunningLabel("verify")
+                  : workspace.integrityClassification === "complete"
+                    ? "Verify Import"
+                    : "Verify"}
+              </button>
+            ) : null}
+            {integrityActions.includes("view_last_verification") ? (
+              <button
+                type="button"
+                onClick={(event) =>
+                  void viewLastWorkspaceVerification(workspace.id, event.currentTarget)
+                }
+                disabled={isBusy || isImporting || anyWorkspaceIntegrityOperationRunning}
+              >
+                {activeIntegrityOperationRunning &&
+                activeIntegrityOperationKind === "load_last_verification"
+                  ? integrityOperationRunningLabel("load_last_verification")
+                  : "View Last Verification"}
+              </button>
+            ) : null}
+            {integrityActions.includes("repair_index") ? (
+              <button
+                type="button"
+                aria-describedby={repairIndexDescriptionId}
+                onClick={(event) => requestRepairWorkspaceIndex(workspace.id, event.currentTarget)}
+                disabled={isBusy || isImporting || anyWorkspaceIntegrityOperationRunning}
+              >
+                {activeIntegrityOperationRunning && activeIntegrityOperationKind === "repair_index"
+                  ? integrityOperationRunningLabel("repair_index")
+                  : "Repair Index"}
+              </button>
+            ) : null}
+            {integrityActions.includes("rebuild_conversations") ? (
+              <button
+                type="button"
+                onClick={() => void rebuildWorkspaceConversations(workspace.id)}
+                disabled={isBusy || isImporting || anyWorkspaceIntegrityOperationRunning}
+              >
+                {activeIntegrityOperationRunning &&
+                activeIntegrityOperationKind === "rebuild_conversations"
+                  ? integrityOperationRunningLabel("rebuild_conversations")
+                  : "Rebuild Conversations"}
+              </button>
+            ) : null}
+            {activeIntegrityOperationRunning &&
+            activeIntegrityOperationKind &&
+            integrityOperationIsCancellable(activeIntegrityOperationKind) ? (
+              <button
+                type="button"
+                className="danger-action"
+                onClick={() => void cancelImport(activeIntegrityProgress)}
+                disabled={activeIntegrityProgress == null}
+              >
+                Cancel {integrityOperationLabel(activeIntegrityOperationKind)}
+              </button>
+            ) : null}
+          </div>
+          {workspace.integrityClassification === "incomplete" && workspace.canRepairIndex ? (
+            <p id={repairIndexDescriptionId} className="workspace-integrity-safety-note">
+              Repair Index reuses local extracted files. It does not rerun ReadPST, and the source PST remains read-only.
+            </p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {workspace && verificationReportOpen && activeVerificationReport ? (
+        <section
+          className="verification-report"
+          role="region"
+          aria-labelledby={verificationReportTitleId}
+          onKeyDown={(event) => {
+            if (event.key !== "Escape") return;
+            event.preventDefault();
+            closeVerificationReport(workspace.id);
+          }}
+        >
+          <header>
+            <div>
+              <h2 id={verificationReportTitleId} ref={verificationReportHeadingRef} tabIndex={-1}>
+                Import Verification Report
+              </h2>
+              <p role="status" aria-live="polite" aria-atomic="true">
+                {verificationHeadline(activeVerificationReport)}
+              </p>
+            </div>
+            <button type="button" onClick={() => closeVerificationReport(workspace.id)}>
+              Close
+            </button>
+          </header>
+          <dl className="verification-report-grid">
+            <div><dt>Level</dt><dd>{verificationLevelLabel(activeVerificationReport.verificationLevel)}</dd></div>
+            <div><dt>Result</dt><dd>{verificationResultLabel(activeVerificationReport.result)}</dd></div>
+            <div><dt>Workspace state</dt><dd>{workspaceIntegrityStateLabel(activeVerificationReport.workspaceState)}</dd></div>
+            <div><dt>Discovered candidates</dt><dd>{formatCount(activeVerificationReport.discoveredCandidates)}</dd></div>
+            <div><dt>Canonical messages</dt><dd>{formatCount(activeVerificationReport.canonicalMessages)}</dd></div>
+            <div><dt>Inserted messages</dt><dd>{formatCount(activeVerificationReport.insertedMessages)}</dd></div>
+            <div><dt>Skipped existing</dt><dd>{formatCount(activeVerificationReport.skippedExistingMessages)}</dd></div>
+            <div><dt>Parse failures</dt><dd>{formatCount(activeVerificationReport.parseFailures)}</dd></div>
+            <div><dt>Attachments</dt><dd>{formatCount(activeVerificationReport.attachments)}</dd></div>
+            <div><dt>Folders</dt><dd>{formatCount(activeVerificationReport.folders)}</dd></div>
+            <div><dt>FTS rows</dt><dd>{formatCount(activeVerificationReport.ftsRows)}</dd></div>
+            <div><dt>Conversations</dt><dd>{activeVerificationReport.conversationState.replace(/_/g, " ")}</dd></div>
+            <div><dt>Missing canonical records</dt><dd>{formatCount(activeVerificationReport.missingCanonicalRecords)}</dd></div>
+            <div><dt>Unexpected canonical records</dt><dd>{formatCount(activeVerificationReport.unexpectedCanonicalRecords)}</dd></div>
+            <div><dt>Possible duplicate groups</dt><dd>{formatCount(activeVerificationReport.possibleDuplicateGroups)}</dd></div>
+            <div><dt>Source integrity</dt><dd>{activeVerificationReport.sourceIntegrity.replace(/_/g, " ")}</dd></div>
+            <div><dt>Started</dt><dd>{formatMessageDate(activeVerificationReport.startedAt) || "Unknown"}</dd></div>
+            <div><dt>Completed</dt><dd>{formatMessageDate(activeVerificationReport.completedAt) || "Unknown"}</dd></div>
+            <div><dt>Elapsed</dt><dd>{formatElapsedDuration(activeVerificationReport.elapsedDurationMs)}</dd></div>
+            <div>
+              <dt>Completed import duration</dt>
+              <dd>{completedImportDurationText(
+                activeVerificationReport.completedImportDurationMs,
+                activeVerificationReport.workspaceState === "complete",
+              )}</dd>
+            </div>
+          </dl>
+          {possibleDuplicateSummary(activeVerificationReport.possibleDuplicateGroups) ? (
+            <p className="verification-warning">
+              {possibleDuplicateSummary(activeVerificationReport.possibleDuplicateGroups)} No messages were hidden, merged, suppressed, or deleted.
+            </p>
+          ) : null}
+          {activeVerificationReport.warnings.length ? (
+            <div className="verification-report-list">
+              <h3>Warnings</h3>
+              <ul>{activeVerificationReport.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+            </div>
+          ) : null}
+          {activeVerificationReport.recommendedActions.length ? (
+            <div className="verification-report-list">
+              <h3>Recommended actions</h3>
+              <ul>{activeVerificationReport.recommendedActions.map((action) => <li key={action}>{action}</li>)}</ul>
+            </div>
+          ) : null}
+          {activeVerificationReport.possibleDuplicateGroupDetails.length ? (
+            <details className="verification-record-details">
+              <summary>Opaque diagnostic details</summary>
+              <p>These identifiers and signals do not expose message content or record paths.</p>
+              {activeVerificationReport.possibleDuplicateGroupDetails.map((group) => (
+                <div key={group.opaqueId}>
+                  <strong>{group.opaqueId}</strong>
+                  <span>{group.signals.join(", ")}</span>
+                </div>
+              ))}
+            </details>
+          ) : null}
+        </section>
+      ) : null}
+
+      {(workspace && repairConfirmOpen) || visiblePendingPlannedRepair ? (
+        <div className="repair-confirm-backdrop">
+          <section
+            className="repair-confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={repairConfirmTitleId}
+            aria-describedby={repairConfirmDescriptionId}
+            ref={repairConfirmDialogRef}
+            onKeyDown={handleRepairConfirmationKeyDown}
+          >
+            <h2 id={repairConfirmTitleId}>Repair this workspace index?</h2>
+            <p id={repairConfirmDescriptionId}>
+              Repair Index builds a new temporary database from this workspace's existing extracted files and verifies it before replacement. It does not rerun ReadPST or modify the source PST or extraction output. The current index remains active unless the verified replacement succeeds.
+            </p>
+            <div className="repair-confirm-actions">
+              <button
+                type="button"
+                ref={repairConfirmCancelRef}
+                onClick={closeVisibleRepairConfirmation}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={confirmVisibleRepair}
+              >
+                Repair Index
+              </button>
+            </div>
+          </section>
+        </div>
       ) : null}
 
       {isSearchActive ? (
@@ -6236,35 +8766,207 @@ function App() {
       ) : null}
 
       {progress ? (
-        <section className="progress-strip">
-          <div className="progress-label">
-            <span>{progress.stage}</span>
-            <span>{progressPercent != null ? `${progressPercent}%` : progress.message}</span>
+        <section
+          className={`import-progress-panel${progressIsBackground ? " import-progress-background" : ""}${progress.status !== "active" ? ` import-progress-${progress.status}` : ""}`}
+          aria-labelledby={`import-progress-heading-${progress.operationId}`}
+          aria-busy={progress.status === "active"}
+        >
+          <span
+            className="visually-hidden"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            key={progressAnnouncementKey}
+          >
+            {progressAnnouncement}
+          </span>
+
+          <div className="import-progress-header">
+            <div className="import-progress-identity">
+              <h2 id={`import-progress-heading-${progress.operationId}`}>
+                {importHeadline(progress, progressIsBackground, progressIdentityPeers)}
+              </h2>
+              {progressIdentity ? (
+                <p>
+                  {progressIdentity.sourceSize} · {progressIdentity.storageMode} ·{" "}
+                  {progressIdentity.operation}
+                </p>
+              ) : null}
+            </div>
+            <div className="import-progress-actions">
+              {progressIsBackground && progressWorkspaceIsOpen ? (
+                <button
+                  type="button"
+                  onClick={() => void activateWorkspaceTab(progress.workspaceId)}
+                  disabled={restoringPlannedWorkspace}
+                >
+                  View Workspace
+                </button>
+              ) : null}
+              {progressCanCancel ? (
+                <button
+                  type="button"
+                  className="danger-action"
+                  onClick={() => void cancelImport(progress)}
+                >
+                  {progressCancelLabel}
+                </button>
+              ) : null}
+              <div className="import-progress-details">
+                <button
+                  type="button"
+                  className="popover-trigger"
+                  onClick={(event) => togglePopover("import_progress", event.currentTarget)}
+                  aria-expanded={openPopoverId === "import_progress"}
+                  aria-controls={importProgressDetailsPanelId}
+                  aria-haspopup="dialog"
+                >
+                  Details
+                </button>
+                {openPopoverId === "import_progress" ? (
+                <div
+                  id={importProgressDetailsPanelId}
+                  ref={importProgressDetailsPanelRef}
+                  className="import-progress-details-panel"
+                  role="dialog"
+                  aria-modal="false"
+                  aria-label="Import progress details"
+                >
+                  <dl>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{progressIdentity?.displayName ?? progress.sourceBasename}</dd>
+                  </div>
+                  <div>
+                    <dt>Exact source size</dt>
+                    <dd>{formatCount(progress.sourceSizeBytes)} bytes</dd>
+                  </div>
+                  <div>
+                    <dt>Workspace mode</dt>
+                    <dd>{progressIdentity?.storageMode ?? progress.workspaceStorageMode}</dd>
+                  </div>
+                  <div>
+                    <dt>Operation</dt>
+                    <dd>{progressIdentity?.operation ?? progress.operationKind}</dd>
+                  </div>
+                  <div>
+                    <dt>Active import elapsed</dt>
+                    <dd>{formatImportDuration(progressActiveElapsedMs)}</dd>
+                  </div>
+                  <div>
+                    <dt>Current operation elapsed</dt>
+                    <dd>{formatImportDuration(progressOperationElapsedMs)}</dd>
+                  </div>
+                  <div>
+                    <dt>Stage elapsed</dt>
+                    <dd>{formatImportDuration(progressStageElapsedMs)}</dd>
+                  </div>
+                  {progressAllCounters.map((row) => (
+                    <div key={row.key}>
+                      <dt>{row.label}</dt>
+                      <dd>
+                        {row.displayValue}
+                        {row.key === "outputBytesObserved" || row.key === "workspaceBytesWritten"
+                          ? ` (${formatCount(row.value)} bytes)`
+                          : ""}
+                      </dd>
+                    </div>
+                  ))}
+                  </dl>
+                </div>
+                ) : null}
+              </div>
+            </div>
           </div>
-          <div className="progress-track">
-            <div
-              className="progress-fill"
-              style={{ width: `${progressPercent ?? (isBusy ? 35 : 100)}%` }}
-            />
-          </div>
-          <div className="progress-detail-row">
-            <p>{progressCount ?? progress.message}</p>
-            {visibleWorkspaceOperation?.running ? (
-              <button
-                type="button"
-                className="danger-action"
-                onClick={() => void cancelImport()}
+
+          {progressIsBackground ? (
+            <p className="import-progress-current-stage">
+              <span aria-hidden="true">●</span>
+              <span>{importStageLabel(progress.stage)}</span>
+            </p>
+          ) : (
+            <ol className="import-stage-tracker" aria-label="Import stages">
+              {progressTracker.map((item) => (
+                <li key={item.stage} className={`import-stage-${item.state}`}>
+                  <span className="import-stage-marker" aria-hidden="true">
+                    {item.state === "completed"
+                      ? "✓"
+                      : item.state === "active"
+                        ? "●"
+                        : item.state === "interrupted"
+                          ? "!"
+                          : "○"}
+                  </span>
+                  <span aria-hidden="true">{item.label}</span>
+                  <span className="visually-hidden">{item.accessibleText}</span>
+                </li>
+              ))}
+            </ol>
+          )}
+
+          <div className="import-progress-body">
+            <p className="import-progress-explanation">
+              {progressTerminal?.detail ?? progressExplanation}
+            </p>
+            {progressHealth && progressHealth !== progressExplanation ? (
+              <p className="import-progress-health">{progressHealth}</p>
+            ) : null}
+
+            {progressSemantics?.kind === "determinate" && progressFillPercent != null ? (
+              <div
+                className="import-stage-progress-track"
+                role="progressbar"
+                aria-label={progressSemantics.ariaLabel}
+                aria-valuemin={progressSemantics.ariaValueMin}
+                aria-valuemax={progressSemantics.ariaValueMax}
+                aria-valuenow={progressSemantics.ariaValueNow}
               >
-                Cancel Import
-              </button>
+                <div
+                  className="import-stage-progress-fill"
+                  style={{ width: `${progressFillPercent}%` }}
+                />
+              </div>
+            ) : progressSemantics?.kind === "indeterminate" ? (
+              <div className="import-progress-indeterminate">
+                <span className="import-progress-spinner" aria-hidden="true" />
+                <span>{progressSemantics.ariaLabel}</span>
+              </div>
+            ) : null}
+
+            {progressUnit || progressStageCounters.length ? (
+              <div className="import-progress-counts">
+                {progressUnit ? <strong>{progressUnit}</strong> : null}
+                {progressStageCounters.map((row) => (
+                  <span key={row.key}>
+                    {row.label}: {row.displayValue}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+
+            {progress.warningCodes.length ? (
+              <ul className="import-progress-warnings">
+                {progress.warningCodes.map((warning) => (
+                  <li key={warning}>{importWarningText(warning)}</li>
+                ))}
+              </ul>
+            ) : null}
+
+            {progress.status === "active" ? (
+              <p className="import-progress-timing" aria-label="Import timing">
+                <span>Elapsed: {formatImportDuration(progressDisplayedElapsedMs)}</span>
+                <span>This stage: {formatImportDuration(progressStageElapsedMs)}</span>
+                {progressLastActivity ? <span>{progressLastActivity}</span> : null}
+                {progressEta?.text ? <span>{progressEta.text}</span> : null}
+              </p>
             ) : null}
           </div>
         </section>
       ) : null}
 
-      {workspace && activeWorkspaceOperationRunning ? (
+      {workspace && activeWorkspaceOperationRunning && !activeIntegrityOperationRunning ? (
         <section className="notice-box" role="status">
-          Cancel import before deleting this workspace.
+          Cancel the running workspace operation before deleting this workspace.
         </section>
       ) : null}
 
@@ -6353,12 +9055,109 @@ function App() {
         </section>
       ) : null}
 
+      {localTrashStatus || localTrashError || localTrashUndo ? (
+        <section
+          className={`local-trash-status ${localTrashError ? "local-trash-status-error" : ""}`}
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          <div>
+            <strong>{localTrashError ? "Local Trash action failed" : "Local Trash"}</strong>
+            <span>{localTrashError ?? localTrashStatus ?? "A message was moved."}</span>
+          </div>
+          <div className="local-trash-status-actions">
+            {localTrashUndo ? (
+              <button
+                type="button"
+                onClick={() => void undoMostRecentLocalTrashMove()}
+                disabled={
+                  !canUndoLocalTrashMove ||
+                  localTrashMutationPending ||
+                  isBusy ||
+                  isImporting ||
+                  activeIntegrityOperationRunning
+                }
+                title={
+                  canUndoLocalTrashMove
+                    ? "Restore the most recently moved message."
+                    : "Undo is no longer available because Local Trash state changed."
+                }
+              >
+                Undo
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => {
+                setLocalTrashStatus(null);
+                setLocalTrashError(null);
+                setLocalTrashUndo(null);
+                localTrashUndoMessageRef.current = null;
+              }}
+              disabled={localTrashMutationPending}
+            >
+              Dismiss
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      {localTrashResetConfirmOpen && workspace ? (
+        <div className="confirmation-backdrop">
+          <section
+            ref={localTrashResetDialogRef}
+            className="confirmation-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={localTrashResetTitleId}
+            aria-describedby={localTrashResetDescriptionId}
+            onKeyDown={handleLocalTrashResetKeyDown}
+          >
+            <h2 id={localTrashResetTitleId}>Reset unhealthy Local Trash state?</h2>
+            <div id={localTrashResetDescriptionId}>
+              <p>{localTrashResetDisclosure}</p>
+              <p>
+                This clears only this workspace&apos;s versioned local-state overlay and its Local
+                Trash organization. It removes no message content and does not reclaim storage.
+              </p>
+            </div>
+            <div className="confirmation-actions">
+              <button
+                ref={localTrashResetCancelRef}
+                type="button"
+                onClick={closeLocalTrashResetConfirmation}
+                disabled={localTrashMutationPending}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger-action"
+                onClick={() => void confirmLocalTrashReset()}
+                disabled={
+                  localTrashMutationPending ||
+                  isBusy ||
+                  isImporting ||
+                  activeIntegrityOperationRunning
+                }
+              >
+                Reset Local Trash State
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {deleteConfirmOpen && workspace ? (
         <section className="delete-confirm-box" role="dialog" aria-label="Confirm workspace delete">
           <div>
             <strong>Delete current workspace?</strong>
             <p>{workspace.workspacePath}</p>
-            <p>The original PST will not be deleted.</p>
+            <p>
+              The workspace cache, including its Local Trash sidecar and app-only organization,
+              will be removed. The original PST will not be deleted.
+            </p>
           </div>
           <div className="delete-confirm-actions">
             <button type="button" onClick={cancelDeleteCurrentWorkspace} disabled={isBusy}>
@@ -6386,7 +9185,7 @@ function App() {
               {deleteResult.alreadyMissing
                 ? "Workspace folder was already missing. Refreshed workspace list."
                 : deleteResolved
-                  ? "Deleted workspace. Original PST was not deleted."
+                  ? "Deleted workspace cache and its Local Trash state. Original PST was not deleted."
                   : "Failed to delete workspace."}
             </strong>
             {!deleteResolved ? (
@@ -6599,9 +9398,17 @@ function App() {
                     type="checkbox"
                     checked={includeSubfolders}
                     onChange={(event) => toggleIncludeSubfolders(event.target.checked)}
-                    disabled={!workspace}
+                    disabled={!workspace || messageVisibility === "trashed"}
                   />
-                  <span title="Include messages from child folders">Subfolders</span>
+                  <span
+                    title={
+                      messageVisibility === "trashed"
+                        ? "Local Trash is a reserved view and is not scoped by PST folders."
+                        : "Include messages from child folders"
+                    }
+                  >
+                    Subfolders
+                  </span>
                 </label>
                 <button type="button" onClick={collapseAllFolders} disabled={!workspace}>
                   Collapse
@@ -6611,36 +9418,81 @@ function App() {
                 </button>
               </div>
             </div>
-            <div className="folder-tree">
+            <div className="folder-tree" data-support-control="scroll">
               {workspace ? (
                 searchScope === "all_open" && openPstSessions.length > 0 ? (
                   <>
                     <button
                       type="button"
                       className={`folder-row all-mail-row ${
-                        allOpenFolderSelection.workspaceId == null ? "selected" : ""
+                        messageVisibility === "active" &&
+                        allOpenFolderSelection.workspaceId == null
+                          ? "selected"
+                          : ""
                       }`}
-                      onClick={() => setAllOpenFolderSelection({ workspaceId: null, folderId: null })}
+                      onClick={() => {
+                        showActiveMessages();
+                        setAllOpenFolderSelection({ workspaceId: null, folderId: null });
+                      }}
                       title="All indexed messages across open PSTs"
+                      aria-current={
+                        messageVisibility === "active" &&
+                        allOpenFolderSelection.workspaceId == null
+                          ? "true"
+                          : undefined
+                      }
                     >
                       <span className="folder-name">All Open PSTs</span>
                       <span className="folder-count">
                         {formatCount(
                           openPstSessions.reduce(
-                            (total, session) => total + session.workspace.messageCount,
+                            (total, session) => total + workspaceActiveMessageCount(session),
                             0,
                           ),
                         )}
                       </span>
                     </button>
-                    {openSessionFolderTrees.map(({ session, tree }) => {
+                    <button
+                      type="button"
+                      className={`folder-row local-trash-row ${
+                        messageVisibility === "trashed" &&
+                        localTrashAllOpenWorkspaceId == null
+                          ? "selected"
+                          : ""
+                      }`}
+                      onClick={() => showLocalTrash(null)}
+                      title={localTrashStorageDisclosure}
+                      aria-label={`Local Trash, app-only view across All Open PSTs, ${
+                        allOpenLocalTrashSummary.available
+                          ? `${formatCount(allOpenLocalTrashSummary.trashedMessageCount)} messages`
+                          : "count unavailable"
+                      }`}
+                      aria-current={
+                        messageVisibility === "trashed" &&
+                        localTrashAllOpenWorkspaceId == null
+                          ? "true"
+                          : undefined
+                      }
+                    >
+                      <span className="folder-name">Local Trash</span>
+                      <span className="folder-count">
+                        {allOpenLocalTrashSummary.available
+                          ? formatCount(allOpenLocalTrashSummary.trashedMessageCount)
+                          : "--"}
+                      </span>
+                    </button>
+                    {openSessionFolderTrees.map(({ session, hierarchy, tree }) => {
                       const workspaceId = session.workspace.id;
                       const rootCollapsed = collapsedFolderPaths.has(
                         workspaceRootCollapseKey(workspaceId),
                       );
                       const rootSelected =
+                        messageVisibility === "active" &&
                         allOpenFolderSelection.workspaceId === workspaceId &&
                         allOpenFolderSelection.folderId == null;
+                      const localTrashSelected =
+                        messageVisibility === "trashed" &&
+                        localTrashAllOpenWorkspaceId === workspaceId;
                       return (
                         <div className="workspace-folder-root" key={workspaceId}>
                           <div
@@ -6664,6 +9516,7 @@ function App() {
                               aria-label={`${rootCollapsed ? "Expand" : "Collapse"} ${pstDisplayName(
                                 session.workspace,
                               )}`}
+                              aria-expanded={!rootCollapsed}
                             >
                               {rootCollapsed ? ">" : "v"}
                             </button>
@@ -6672,10 +9525,11 @@ function App() {
                               className="folder-select-button"
                               onClick={() => selectAllOpenWorkspaceFolder(workspaceId, null)}
                               title={session.workspace.pstPath}
+                              aria-current={rootSelected ? "true" : undefined}
                             >
                               <span className="folder-name">{pstDisplayName(session.workspace)}</span>
                               <span className="folder-count">
-                                {formatCount(session.workspace.messageCount)}
+                                {formatCount(workspaceActiveMessageCount(session))}
                               </span>
                             </button>
                           </div>
@@ -6688,22 +9542,76 @@ function App() {
                                 }`}
                                 onClick={() => selectAllOpenWorkspaceFolder(workspaceId, null)}
                                 title={`All indexed messages in ${pstDisplayName(session.workspace)}`}
+                                aria-current={rootSelected ? "true" : undefined}
                               >
                                 <span className="folder-name">All Mail</span>
                                 <span className="folder-count">
-                                  {formatCount(session.workspace.messageCount)}
+                                  {formatCount(workspaceActiveMessageCount(session))}
                                 </span>
                               </button>
+                              <button
+                                type="button"
+                                className={`folder-row local-trash-row workspace-local-trash-row ${
+                                  localTrashSelected ? "selected" : ""
+                                }`}
+                                onClick={() => showLocalTrash(workspaceId)}
+                                title={localTrashStorageDisclosure}
+                                aria-label={`Local Trash, app-only view for ${pstDisplayName(
+                                  session.workspace,
+                                )}, ${
+                                  isLocalTrashHealthy(session.localTrashSummary)
+                                    ? `${formatCount(
+                                        session.localTrashSummary.trashedMessageCount,
+                                      )} messages`
+                                    : "count unavailable"
+                                }`}
+                                aria-current={localTrashSelected ? "true" : undefined}
+                              >
+                                <span className="folder-name">Local Trash</span>
+                                <span className="folder-count">
+                                  {isLocalTrashHealthy(session.localTrashSummary)
+                                    ? formatCount(session.localTrashSummary.trashedMessageCount)
+                                    : "--"}
+                                </span>
+                              </button>
+                              {hierarchy.status === "invalid" ? (
+                                <div className="folder-presentation-notice" role="status">
+                                  <strong>Folder hierarchy unavailable</strong>
+                                  <span>All Mail remains available for this PST.</span>
+                                </div>
+                              ) : null}
+                              {messageVisibility === "active" &&
+                              allOpenFolderSelection.workspaceId === workspaceId &&
+                              allOpenFolderPresentationSelection?.kind === "promoted_scope" ? (
+                                <div className="folder-presentation-notice" role="status">
+                                  <strong>Promoted technical root scope selected</strong>
+                                  <span>
+                                    Its canonical folder scope is preserved; no child was selected
+                                    automatically.
+                                  </span>
+                                </div>
+                              ) : null}
                               <FolderRows
                                 nodes={tree}
                                 workspaceId={workspaceId}
-                                selectedWorkspaceId={allOpenFolderSelection.workspaceId}
-                                selectedFolderId={allOpenFolderSelection.folderId}
+                                selectedWorkspaceId={
+                                  messageVisibility === "active"
+                                    ? allOpenFolderSelection.workspaceId
+                                    : null
+                                }
+                                selectedFolderId={
+                                  messageVisibility === "active"
+                                    ? allOpenFolderSelection.folderId
+                                    : null
+                                }
                                 includeSubfolders={includeSubfolders}
                                 collapsedFolderPaths={collapsedFolderPaths}
                                 onToggleCollapse={toggleFolderCollapsed}
                                 onSelect={(folder, selectedWorkspaceId) =>
-                                  selectAllOpenWorkspaceFolder(selectedWorkspaceId, folder.id)
+                                  selectAllOpenWorkspaceFolder(
+                                    selectedWorkspaceId,
+                                    folder.canonicalFolderId,
+                                  )
                                 }
                               />
                             </>
@@ -6716,22 +9624,81 @@ function App() {
                   <>
                     <button
                       type="button"
-                      className={`folder-row all-mail-row ${selectedFolderId == null ? "selected" : ""}`}
+                      className={`folder-row all-mail-row ${
+                        messageVisibility === "active" && selectedFolderId == null
+                          ? "selected"
+                          : ""
+                      }`}
                       onClick={() => selectCurrentWorkspaceFolder(null)}
                       title="All indexed messages in this PST"
+                      aria-current={
+                        messageVisibility === "active" && selectedFolderId == null
+                          ? "true"
+                          : undefined
+                      }
                     >
                       <span className="folder-name">All Mail</span>
-                      <span className="folder-count">{workspace.messageCount}</span>
+                      <span className="folder-count">
+                        {formatCount(
+                          activeOpenPstSession
+                            ? workspaceActiveMessageCount(activeOpenPstSession)
+                            : workspace.messageCount,
+                        )}
+                      </span>
                     </button>
+                    <button
+                      type="button"
+                      className={`folder-row local-trash-row ${
+                        messageVisibility === "trashed" ? "selected" : ""
+                      }`}
+                      onClick={() => showLocalTrash(workspace.id)}
+                      title={localTrashStorageDisclosure}
+                      aria-label={`Local Trash, app-only view, ${
+                        isLocalTrashHealthy(activeLocalTrashSummary)
+                          ? `${formatCount(activeLocalTrashSummary!.trashedMessageCount)} messages`
+                          : "count unavailable"
+                      }`}
+                      aria-current={messageVisibility === "trashed" ? "true" : undefined}
+                    >
+                      <span className="folder-name">Local Trash</span>
+                      <span className="folder-count">
+                        {isLocalTrashHealthy(activeLocalTrashSummary)
+                          ? formatCount(activeLocalTrashSummary!.trashedMessageCount)
+                          : "--"}
+                      </span>
+                    </button>
+                    {!isLocalTrashHealthy(activeLocalTrashSummary) ? (
+                      <div className="folder-presentation-notice" role="status">
+                        <strong>Local Trash unavailable</strong>
+                        <span>Normal views remain fail-open and show active messages.</span>
+                      </div>
+                    ) : null}
+                    {folderHierarchy.status === "invalid" ? (
+                      <div className="folder-presentation-notice" role="status">
+                        <strong>Folder hierarchy unavailable</strong>
+                        <span>All Mail remains available for this PST.</span>
+                      </div>
+                    ) : null}
+                    {currentFolderPresentationSelection.kind === "promoted_scope" ? (
+                      <div className="folder-presentation-notice" role="status">
+                        <strong>Promoted technical root scope selected</strong>
+                        <span>
+                          Its canonical folder scope is preserved; no child was selected
+                          automatically.
+                        </span>
+                      </div>
+                    ) : null}
                     <FolderRows
                       nodes={folderTree}
                       workspaceId={workspace.id}
-                      selectedWorkspaceId={workspace.id}
-                      selectedFolderId={selectedFolderId}
+                      selectedWorkspaceId={messageVisibility === "active" ? workspace.id : null}
+                      selectedFolderId={messageVisibility === "active" ? selectedFolderId : null}
                       includeSubfolders={includeSubfolders}
                       collapsedFolderPaths={collapsedFolderPaths}
                       onToggleCollapse={toggleFolderCollapsed}
-                      onSelect={(folder) => selectCurrentWorkspaceFolder(folder.id)}
+                      onSelect={(folder) =>
+                        selectCurrentWorkspaceFolder(folder.canonicalFolderId)
+                      }
                     />
                   </>
                 )
@@ -6739,6 +9706,65 @@ function App() {
                 <p className="empty-state">No PST opened.</p>
               )}
             </div>
+            {messageVisibility === "active" && folderDetailsFolder && folderDetailsWorkspace ? (
+              <section className="folder-details" aria-label="Folder Details">
+                <h3>Folder Details</h3>
+                <dl>
+                  <div>
+                    <dt>Displayed folder</dt>
+                    <dd>{folderDetailsFolder.name}</dd>
+                  </div>
+                  <div>
+                    <dt>Original PST path</dt>
+                    <dd>{folderDetailsFolder.path || "(PST root)"}</dd>
+                  </div>
+                  <div>
+                    <dt>Presentation</dt>
+                    <dd>
+                      {folderDetailsWrappersHidden
+                        ? folderDetailsPresentationSelection?.kind === "promoted_scope"
+                          ? "Selected technical wrapper hidden; canonical scope preserved"
+                          : "Proven technical ancestor hidden"
+                        : "No technical wrappers hidden for this folder"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>PST</dt>
+                    <dd>{pstDisplayName(folderDetailsWorkspace)}</dd>
+                  </div>
+                  <div>
+                    <dt>Workspace ID</dt>
+                    <dd title={folderDetailsWorkspace.id}>
+                      {folderDetailsWorkspace.id.slice(0, 12)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Canonical direct messages</dt>
+                    <dd>{formatCount(folderDetailsFolder.directMessageCount)}</dd>
+                  </div>
+                  <div>
+                    <dt>Canonical with descendants</dt>
+                    <dd>{formatCount(folderDetailsFolder.messageCount)}</dd>
+                  </div>
+                  <div>
+                    <dt>Active direct messages</dt>
+                    <dd>{formatCount(folderDetailsFolder.activeDirectMessageCount)}</dd>
+                  </div>
+                  <div>
+                    <dt>Active with descendants</dt>
+                    <dd>{formatCount(folderDetailsFolder.activeMessageCount)}</dd>
+                  </div>
+                  <div>
+                    <dt>Local Trash direct</dt>
+                    <dd>{formatCount(folderDetailsFolder.localTrashDirectMessageCount)}</dd>
+                  </div>
+                  <div>
+                    <dt>Local Trash with descendants</dt>
+                    <dd>{formatCount(folderDetailsFolder.localTrashMessageCount)}</dd>
+                  </div>
+                </dl>
+              </section>
+            ) : null}
           </aside>
         ) : null}
 
@@ -6849,6 +9875,30 @@ function App() {
               ) : null}
             </div>
           </div>
+          {appliedSearch.visibility === "trashed" ? (
+            <div
+              className={`local-trash-view-note ${
+                appliedLocalTrashAvailable ? "" : "local-trash-view-unavailable"
+              }`}
+              role="status"
+            >
+              <strong>Local Trash is app-only and reversible.</strong>
+              <span>{localTrashStorageDisclosure}</span>
+              {!appliedLocalTrashAvailable ? (
+                <span>
+                  Local Trash state is unavailable for part or all of this view. Normal views remain
+                  fail-open; no messages are treated as deleted.
+                </span>
+              ) : null}
+              <button
+                type="button"
+                onClick={showActiveMessages}
+                disabled={localTrashMutationPending}
+              >
+                Back to active messages
+              </button>
+            </div>
+          ) : null}
           <span
             className="visually-hidden"
             id={
@@ -6864,6 +9914,7 @@ function App() {
           <div
             className="message-list"
             ref={messageListRef}
+            data-support-control="scroll"
             aria-busy={isResultsBusy}
             aria-describedby={
               appliedSearch.listMode === "messages"
@@ -6891,7 +9942,7 @@ function App() {
                   formatDate={formatMessageDate}
                   hasMore={hasMoreConversations}
                   highlightTerms={highlightTerms}
-                  isBusy={isBusy}
+                  isBusy={isBusy || anyWorkspaceIntegrityOperationRunning}
                   isCrossPstSearch={appliedIsCrossPstSearch}
                   isLoadingMore={isLoadingMoreConversations}
                   isSearching={isSearching}
@@ -6981,8 +10032,11 @@ function App() {
           </div>
 
           {selectedMessage ? (
-            <div className="message-preview" ref={previewScrollRef}>
+            <div className="message-preview" ref={previewScrollRef} data-support-control="scroll">
               <h3>{selectedMessage.subject || "(No subject)"}</h3>
+              {selectedMessage.inLocalTrash ? (
+                <span className="local-trash-badge">In Local Trash</span>
+              ) : null}
               <dl className="headers">
                 <div>
                   <dt>From</dt>
@@ -7076,6 +10130,7 @@ function App() {
                     <button
                       type="button"
                       className={readerMode === "plain_text" ? "selected" : ""}
+                      data-support-control="click"
                       onClick={() => setReaderMode("plain_text")}
                     >
                       Plain Text
@@ -7083,6 +10138,7 @@ function App() {
                     <button
                       type="button"
                       className={readerMode === "sanitized_html" ? "selected" : ""}
+                      data-support-control="click"
                       onClick={() => setReaderMode("sanitized_html")}
                     >
                       Sanitized HTML
@@ -7091,7 +10147,32 @@ function App() {
                   <div className="reader-actions" role="toolbar" aria-label="Message actions">
                     <button
                       type="button"
-                      onClick={() => void openSourceEml(false)}
+                      onClick={() =>
+                        void changeSelectedMessageLocalTrash(!selectedMessage.inLocalTrash)
+                      }
+                      disabled={
+                        localTrashMutationPending ||
+                        isBusy ||
+                        isImporting ||
+                        activeIntegrityOperationRunning ||
+                        !selectedMessageLocalTrashAvailable
+                      }
+                      title={
+                        selectedMessageLocalTrashAvailable
+                          ? localTrashActionDisclosure
+                          : "Local Trash is unavailable. Normal views remain fail-open."
+                      }
+                      aria-describedby="local-trash-action-disclosure"
+                    >
+                      {localTrashMutationPending
+                        ? "Updating"
+                        : selectedMessage.inLocalTrash
+                          ? "Restore"
+                          : "Move to Local Trash"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void openSourceEml()}
                       disabled={isLoadingSourceEml}
                       title="Print, save HTML, save the original EML, or inspect raw source."
                     >
@@ -7106,6 +10187,19 @@ function App() {
                     </button>
                   </div>
                 </div>
+                <p className="local-trash-disclosure" id="local-trash-action-disclosure">
+                  {localTrashActionDisclosure} Local Trash removes no message content and does not
+                  reclaim workspace storage.
+                </p>
+                {!selectedMessageLocalTrashAvailable ? (
+                  <p className="body-status">
+                    Local Trash actions are unavailable
+                    {selectedMessage.localTrashErrorCode
+                      ? ` (${selectedMessage.localTrashErrorCode})`
+                      : ""}
+                    . This message remains visible in normal views.
+                  </p>
+                ) : null}
 
                 {readerMode === "plain_text" ? (
                   <>
@@ -7149,17 +10243,9 @@ function App() {
                     ) : htmlRender && !htmlRender.htmlAvailable ? (
                       <p className="body-status">No HTML body available.</p>
                     ) : null}
-                    {htmlRender?.remoteImagesBlocked && !remoteImagesAllowedForSelected ? (
+                    {htmlRender?.remoteImagesBlocked ? (
                       <div className="remote-image-notice">
-                        <span>Remote images blocked.</span>
-                        <button
-                          type="button"
-                          onClick={() => setRemoteImagesAllowedMessageId(selectedMessage.id)}
-                          aria-label={loadRemoteImagesActionLabel}
-                          title={loadRemoteImagesActionLabel}
-                        >
-                          {loadRemoteImagesActionLabel}
-                        </button>
+                        <span>{remoteImagesBlockedMessage}</span>
                       </div>
                     ) : null}
                     {htmlRender?.htmlAvailable && htmlRender.sanitizedHtml.trim() ? (
@@ -7183,6 +10269,7 @@ function App() {
                           }
                         }}
                         dangerouslySetInnerHTML={{ __html: htmlRender.sanitizedHtml }}
+                        data-support-untrusted="true"
                       />
                     ) : null}
                   </div>
@@ -7341,7 +10428,14 @@ function App() {
 
     {aboutOpen ? (
       <div className="about-backdrop">
-        <section className="about-modal" role="dialog" aria-modal="true" aria-label="About PST QuickView">
+        <section
+          id={helpDialogId}
+          ref={helpDialogRef}
+          className="about-modal"
+          role="dialog"
+          aria-modal="false"
+          aria-label="About PST QuickView"
+        >
           <header className="about-header">
             <div>
               <h2>About PST QuickView</h2>
@@ -7351,6 +10445,7 @@ function App() {
               Close
             </button>
           </header>
+          <RemoteSupportPanel />
           <dl className="about-details">
             <div>
               <dt>Version</dt>
@@ -7367,6 +10462,7 @@ function App() {
                   <span className="visually-hidden">Application appearance</span>
                   <select
                     value={appearance}
+                    data-support-control="input"
                     onChange={(event) => setAppearance(event.target.value as AppearanceMode)}
                   >
                     <option value="system">System</option>
@@ -7388,7 +10484,95 @@ function App() {
               <dt>Safety</dt>
               <dd>
                 Original PST, EML, and MSG files are never modified. Processing is local-only with
-                no telemetry or cloud service. Workspaces are local caches and can be deleted safely.
+                no telemetry or cloud service. Deleting a workspace removes only the confirmed local
+                cache; it does not delete an original source file.
+              </dd>
+            </div>
+            <div>
+              <dt>Local Trash</dt>
+              <dd>
+                Local Trash is reversible, app-only organization stored in a separate versioned
+                overlay inside the local workspace. It hides messages from normal PST QuickView
+                message, conversation, folder-count, and search views without changing the source
+                PST, canonical index, extracted EML files, or attachments. Restore or the
+                most-recent Move Undo makes a message active again. Local Trash removes no message
+                content and does not reclaim storage. If its overlay is absent, all messages are
+                active and the first Move initializes it. If the overlay is invalid, from a future
+                schema, or belongs to a different workspace fingerprint, PST QuickView fails open:
+                normal messages remain visible and Local Trash actions are unavailable.
+              </dd>
+            </div>
+            <div>
+              <dt>Folder hierarchy</dt>
+              <dd>
+                Simplified hierarchy is the default presentation and promotes only structurally
+                proven technical wrappers. Uncertain folders, including real folders with
+                Archive-like or Outlook-like names, remain visible. Original PST hierarchy is
+                available from Layout. Switching presentations preserves canonical folder IDs,
+                counts, selection, Include subfolders scope, and the original in-PST path shown in
+                Folder Details; it never rewrites the PST, workspace, or index. The preference is
+                stored locally and persists across workspace close and Start Fresh.
+              </dd>
+            </div>
+            <div>
+              <dt>Popover controls</dt>
+              <dd>
+                Advanced Search, Recent, Workspace, Layout, Details, and Help close when you press
+                Escape or click outside. Escape returns focus to the opening control. Tab remains
+                available for normal keyboard navigation, and opening one floating panel closes the
+                previous panel.
+              </dd>
+            </div>
+            <div>
+              <dt>Import verification</dt>
+              <dd>
+                Quick Verify checks this workspace's marker, extracted-record manifest, database,
+                search index, links, counters, and conversation state. A verified result means
+                internally verified against this workspace's extracted source records. It does not
+                prove parity with Exchange or Outlook, or prove that every historical message exists.
+              </dd>
+            </div>
+            <div>
+              <dt>Import progress</dt>
+              <dd>
+                Progress follows persisted stages from Preflight through internal verification.
+                Extraction is indeterminate because ReadPST does not provide a trustworthy total;
+                live stream/root observations and post-exit output aggregates are activity signals,
+                not an Outlook parity count. Candidate records are discovered inputs, while
+                canonical messages are durable indexed records.
+                Import elapsed time accumulates only active app sessions across resumes. Repair and
+                verification timing is kept separate from completed import history and can retain
+                active time across an interrupted same-kind retry. Stage time can retain prior
+                active sessions until a real stage transition.
+                For an older workspace without trusted timing history, only active time recorded
+                since the workspace entered Phase 3 is available.
+                During a resumed import or repair, processed, inserted, and existing-record counts
+                describe this pass; the canonical-message total remains the stable workspace count.
+                ETA appears only for stable determinate work. Imports continue to identify their PST
+                basename when another tab is selected.
+              </dd>
+            </div>
+            <div>
+              <dt>Resume and Repair</dt>
+              <dd>
+                Resume Indexing inserts missing canonical records from existing extraction output.
+                Repair Index builds and verifies a temporary database from those local files, then
+                replaces the active index only after success. Neither action writes to the source PST.
+              </dd>
+            </div>
+            <div>
+              <dt>Source availability</dt>
+              <dd>
+                A complete local workspace remains usable when its source volume is unavailable, but
+                verification cannot make a source-comparison claim until that PST is available.
+              </dd>
+            </div>
+            <div>
+              <dt>Possible duplicates</dt>
+              <dd>
+                Possible duplicate source-record warnings are informational. Records are not hidden,
+                merged, suppressed, or deleted automatically. Blank, no-subject, and empty-body
+                messages remain visible; suppression remains fail-open and zero.
               </dd>
             </div>
             <div>
@@ -7497,6 +10681,9 @@ function App() {
                     <dd>{appDiagnostics.conversationDataStatus}</dd>
                   </div>
                 </dl>
+                <p className="diagnostics-privacy-warning">
+                  Diagnostics can contain local file paths. Review them before sharing.
+                </p>
                 <div className="about-diagnostic-actions">
                   <button type="button" onClick={() => void copyAppDiagnostics()}>
                     Copy Diagnostics
@@ -7519,6 +10706,9 @@ function App() {
           <header className="source-eml-header">
             <div>
               <h2>Print / Export Message</h2>
+              {sourceEmlView.inLocalTrash ? (
+                <span className="local-trash-badge">In Local Trash</span>
+              ) : null}
               <p title={sourceEmlView.sourcePath}>
                 <strong>{sourceEmlView.sourceLabel}</strong> - {sourceEmlView.sourcePath}
               </p>
@@ -7767,17 +10957,9 @@ function App() {
           <section className="source-eml-body">
             {sourceEmlMode === "rendered" ? (
               <>
-                {sourceEmlView.remoteImagesBlocked && !sourceEmlRemoteAllowed ? (
+                {sourceEmlView.remoteImagesBlocked ? (
                   <div className="remote-image-notice">
-                    <span>Remote images are blocked.</span>
-                    <button
-                      type="button"
-                      onClick={() => void loadSourceEmlForCurrentContext(true)}
-                      aria-label={loadRemoteImagesActionLabel}
-                      title={loadRemoteImagesActionLabel}
-                    >
-                      {loadRemoteImagesActionLabel}
-                    </button>
+                    <span>{remoteImagesBlockedMessage}</span>
                   </div>
                 ) : null}
                 {sourceEmlView.sanitizedHtml.trim() ? (
@@ -7801,6 +10983,7 @@ function App() {
                       }
                     }}
                     dangerouslySetInnerHTML={{ __html: sourceEmlView.sanitizedHtml }}
+                    data-support-untrusted="true"
                   />
                 ) : (
                   <>

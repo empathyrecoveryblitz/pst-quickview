@@ -1,5 +1,5 @@
 import type { SearchScope } from "./searchScopePreference";
-import type { SearchFilters } from "./types";
+import type { MessageVisibility, SearchFilters } from "./types";
 
 export type SearchListMode = "messages" | "conversations";
 export type MessageSearchSort =
@@ -48,9 +48,14 @@ export type SearchSnapshotContext = {
   messageSort: MessageSearchSort;
   conversationSort: ConversationSearchSort;
   sessionGeneration: number;
+  /** Missing only for pre-Phase-6 callers and stored state; snapshots normalize it to active. */
+  visibility?: MessageVisibility;
 };
 
-export type AppliedSearchSnapshot = SearchDraft & SearchSnapshotContext;
+export type AppliedSearchSnapshot = SearchDraft &
+  Omit<SearchSnapshotContext, "visibility"> & {
+    visibility: MessageVisibility;
+  };
 
 export type AppliedSearchVersion = {
   snapshot: AppliedSearchSnapshot;
@@ -253,6 +258,7 @@ export type SearchEmptyStateInput = {
   activeFilterCount: number;
   errorGeneration: number | null;
   currentGeneration: number;
+  visibility?: MessageVisibility;
 };
 
 type PendingSearchSnapshot = {
@@ -298,6 +304,10 @@ export function emptySearchDraft(
     ...defaultSearchFilterDraft,
     folderScope,
   };
+}
+
+export function normalizeMessageVisibility(value: unknown): MessageVisibility {
+  return value === "trashed" ? "trashed" : "active";
 }
 
 function normalizeDraft(draft: SearchDraft): SearchDraft {
@@ -495,11 +505,14 @@ export function createAppliedSearchSnapshot(
   draft: SearchDraft,
   context: SearchSnapshotContext,
 ): AppliedSearchSnapshot {
+  const visibility = normalizeMessageVisibility(context.visibility);
   return normalizeRelevanceSort({
     ...normalizeDraft(draft),
     ...context,
     workspaceIds: uniqueWorkspaceIds(context.workspaceIds),
     conversationScopes: context.conversationScopes.map((scope) => ({ ...scope })),
+    listMode: visibility === "trashed" ? "messages" : context.listMode,
+    visibility,
   });
 }
 
@@ -529,6 +542,7 @@ export function clearAppliedSearchSnapshot(
     folderId: null,
     includeSubfolders: false,
     conversationScopes: [],
+    visibility: "active",
   });
 }
 
@@ -551,6 +565,34 @@ export function appliedSearchNonTextKey(snapshot: AppliedSearchSnapshot): string
     ...nonText
   } = snapshot;
   return JSON.stringify(nonText);
+}
+
+export function appliedSearchNavigationContextKey(
+  snapshot: AppliedSearchSnapshot,
+  mode: SearchListMode,
+): string {
+  const {
+    listMode: _listMode,
+    messageSort,
+    conversationSort,
+    ...sharedContext
+  } = snapshot;
+  return JSON.stringify({
+    ...sharedContext,
+    navigationMode: mode,
+    sort: mode === "messages" ? messageSort : conversationSort,
+  });
+}
+
+export function didAppliedSearchNavigationContextChange(
+  previous: AppliedSearchSnapshot,
+  next: AppliedSearchSnapshot,
+  mode: SearchListMode,
+): boolean {
+  return (
+    appliedSearchNavigationContextKey(previous, mode) !==
+    appliedSearchNavigationContextKey(next, mode)
+  );
 }
 
 export function hasAdvancedSearchValues(filters: SearchFilterDraft): boolean {
@@ -743,7 +785,9 @@ export function clearAllSearchDraft(snapshot: AppliedSearchSnapshot): ClearAllSe
 }
 
 export function classifySearchEmptyState(input: SearchEmptyStateInput): SearchEmptyState {
-  const itemLabel = input.listMode === "conversations" ? "conversations" : "messages";
+  const visibility = normalizeMessageVisibility(input.visibility);
+  const itemLabel =
+    visibility === "trashed" || input.listMode === "messages" ? "messages" : "conversations";
   if (!input.hasWorkspace) {
     return {
       kind: "no_workspace",
@@ -757,7 +801,12 @@ export function classifySearchEmptyState(input: SearchEmptyStateInput): SearchEm
   if (input.isLoading) {
     return {
       kind: "loading",
-      title: input.isSearchActive ? "Searching..." : `Loading ${itemLabel}...`,
+      title:
+        visibility === "trashed" && !input.isSearchActive
+          ? "Loading Local Trash..."
+          : input.isSearchActive
+            ? "Searching..."
+            : `Loading ${itemLabel}...`,
       detail: null,
     };
   }
@@ -767,7 +816,10 @@ export function classifySearchEmptyState(input: SearchEmptyStateInput): SearchEm
   ) {
     return {
       kind: "failed",
-      title: "Search could not be completed.",
+      title:
+        visibility === "trashed"
+          ? "Local Trash could not be loaded."
+          : "Search could not be completed.",
       detail: "Review the error details, then adjust the search and try again.",
     };
   }
@@ -779,8 +831,18 @@ export function classifySearchEmptyState(input: SearchEmptyStateInput): SearchEm
         : "";
     return {
       kind: "no_matches",
-      title: `No ${itemLabel} matched this search.`,
+      title:
+        visibility === "trashed"
+          ? "No messages matched this search in Local Trash."
+          : `No ${itemLabel} matched this search.`,
       detail: `Scope: ${scopeLabel}.${filterText} Remove a filter or use Clear All.`,
+    };
+  }
+  if (visibility === "trashed") {
+    return {
+      kind: "inactive_empty",
+      title: "Local Trash is empty.",
+      detail: "Messages moved here remain in PST QuickView's local workspace.",
     };
   }
   return {

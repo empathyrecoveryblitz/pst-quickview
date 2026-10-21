@@ -12,6 +12,11 @@ fi
 source "${DYLIB_VALIDATION_SCRIPT}"
 EXPECTED_VERSION="${PST_QUICKVIEW_EXPECTED_VERSION:-0.2.0-beta.3}"
 EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.0.3}"
+EXPECTED_PRODUCT_NAME="${PST_QUICKVIEW_EXPECTED_PRODUCT_NAME:-PST QuickView}"
+EXPECTED_IDENTIFIER="${PST_QUICKVIEW_EXPECTED_IDENTIFIER:-com.local.pstquickview}"
+PRODUCTION_IDENTIFIER="com.local.pstquickview"
+RUNTIME_PROFILE_CONTRACT="pst-quickview-runtime-profile-v1:alternate-identifier-scoped:no-production-fallback"
+RUNTIME_PROFILE_IDENTITY_CONTRACT_PREFIX="pst-quickview-runtime-identity-v1:"
 EXPECTED_PROJECT_LICENSE="GPL-3.0-or-later"
 EXPECTED_REPOSITORY="https://github.com/empathyrecoveryblitz/pst-quickview"
 EXPECTED_GPL3_SHA256="3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
@@ -23,7 +28,7 @@ EXPECTED_READPST_VERSION="0.6.76"
 EXPECTED_READPST_COMPANION_URL="${PST_QUICKVIEW_EXPECTED_READPST_COMPANION_URL:-${EXPECTED_REPOSITORY}/releases/download/v${EXPECTED_VERSION}/readpst-corresponding-source-${EXPECTED_READPST_VERSION}.tar.gz}"
 PUBLIC_RELEASE="${PUBLIC_RELEASE:-0}"
 READPST_CORRESPONDING_SOURCE_DIR="${READPST_CORRESPONDING_SOURCE_DIR:-}"
-DEFAULT_APP_PATH="${ROOT_DIR}/src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app"
+DEFAULT_APP_PATH="${ROOT_DIR}/src-tauri/target/universal-apple-darwin/release/bundle/macos/${EXPECTED_PRODUCT_NAME}.app"
 APP_PATH="${1:-${DEFAULT_APP_PATH}}"
 EXPECT_DMG="${EXPECT_DMG:-1}"
 FAILURES=0
@@ -85,6 +90,126 @@ check_dependencies() {
     pass "${label} uses only permitted macOS system dylibs/frameworks"
   else
     fail "${label} has prohibited or unreadable dynamic dependencies"
+  fi
+}
+
+check_no_private_build_paths() {
+  local binary="$1"
+  local arch="$2"
+  local label="$3"
+  if [[ ! -f "${binary}" ]]; then
+    fail "${label} is missing; private build-path scan cannot run"
+    return
+  fi
+
+  local scan_statuses
+  if strings -a -arch "${arch}" -- "${binary}" |
+    grep -E '(^|file://|[^[:alnum:]_./-])(/Users/[^/[:space:]]+|/home/[^/[:space:]]+|/Volumes/[^/[:space:]]+/|[A-Za-z]:\\Users\\)' \
+      >/dev/null
+  then
+    scan_statuses=("${PIPESTATUS[@]}")
+  else
+    scan_statuses=("${PIPESTATUS[@]}")
+  fi
+  if [[ "${scan_statuses[0]}" -ne 0 ]]; then
+    fail "${label} could not be inspected for private absolute build paths"
+  elif [[ "${scan_statuses[1]}" -eq 0 ]]; then
+    fail "${label} contains a private absolute build path"
+  elif [[ "${scan_statuses[1]}" -eq 1 ]]; then
+    pass "${label} contains no private absolute build paths"
+  else
+    fail "${label} private build-path scan failed closed"
+  fi
+}
+
+check_runtime_profile_contract() {
+  local binary="$1"
+  local arch="$2"
+  local expected_identifier="$3"
+  local label="$4"
+  if [[ ! -f "${binary}" ]]; then
+    fail "${label} is missing; runtime-profile scan cannot run"
+    return
+  fi
+
+  local expected_identity_contract
+  if ! expected_identity_contract="$(
+    python3 - "${RUNTIME_PROFILE_IDENTITY_CONTRACT_PREFIX}" \
+      "${expected_identifier}" <<'PY'
+import re
+import sys
+
+prefix, identifier = sys.argv[1:]
+# The Tauri Android-name build variables are an exact encoding for the reviewed
+# dot-separated alphanumeric identifier grammar. Fail closed on other bundle
+# identifier forms instead of accepting a potentially lossy static binding.
+if len(identifier) > 255 or not re.fullmatch(r"[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+", identifier):
+    raise SystemExit(1)
+segments = identifier.split(".")
+android_prefix = "_".join(segments[:-1])
+android_app_name = segments[-1]
+print(f"{prefix}{android_prefix}:{android_app_name}:identity-end")
+PY
+  )"
+  then
+    fail "${label} expected identifier cannot be encoded for runtime-profile verification"
+    return
+  fi
+
+  local scan_statuses
+  if strings -a -arch "${arch}" -- "${binary}" |
+    grep -F -- "${expected_identity_contract}" >/dev/null
+  then
+    scan_statuses=("${PIPESTATUS[@]}")
+  else
+    scan_statuses=("${PIPESTATUS[@]}")
+  fi
+  if [[ "${scan_statuses[0]}" -ne 0 ]]; then
+    fail "${label} could not be inspected for its compiled runtime identity"
+  elif [[ "${scan_statuses[1]}" -eq 0 ]]; then
+    pass "${label} compiled runtime identity matches the packaged identifier"
+  elif [[ "${scan_statuses[1]}" -eq 1 ]]; then
+    fail "${label} compiled runtime identity does not match the packaged identifier"
+  else
+    fail "${label} compiled runtime-identity scan failed closed"
+  fi
+
+  if [[ "${expected_identifier}" == "${PRODUCTION_IDENTIFIER}" ]]; then
+    pass "${label} uses the production compatibility profile contract"
+    return
+  fi
+
+  if strings -a -arch "${arch}" -- "${binary}" |
+    grep -F -- "${RUNTIME_PROFILE_CONTRACT}" >/dev/null
+  then
+    scan_statuses=("${PIPESTATUS[@]}")
+  else
+    scan_statuses=("${PIPESTATUS[@]}")
+  fi
+  if [[ "${scan_statuses[0]}" -ne 0 ]]; then
+    fail "${label} could not be inspected for its runtime-profile contract"
+  elif [[ "${scan_statuses[1]}" -eq 0 ]]; then
+    pass "${label} embeds the identifier-scoped runtime-profile contract"
+  else
+    fail "${label} does not embed the identifier-scoped runtime-profile contract"
+  fi
+
+  if strings -a -arch "${arch}" -- "${binary}" |
+    grep -F -- 'Library/Application Support/PST QuickView' \
+      >/dev/null
+  then
+    scan_statuses=("${PIPESTATUS[@]}")
+  else
+    scan_statuses=("${PIPESTATUS[@]}")
+  fi
+  if [[ "${scan_statuses[0]}" -ne 0 ]]; then
+    fail "${label} could not be inspected for a production-profile destination"
+  elif [[ "${scan_statuses[1]}" -eq 0 ]]; then
+    fail "${label} contains a usable production-profile destination"
+  elif [[ "${scan_statuses[1]}" -eq 1 ]]; then
+    pass "${label} contains no usable production-profile destination"
+  else
+    fail "${label} production-profile destination scan failed closed"
   fi
 }
 
@@ -167,7 +292,7 @@ check_readpst_corresponding_source() {
   fi
 }
 
-for tool in plutil lipo otool file grep find python3 shasum cmp xcrun; do
+for tool in plutil lipo otool file grep find python3 shasum cmp strings xcrun; do
   require_command "${tool}"
 done
 if ! xcrun --find vtool >/dev/null 2>&1; then
@@ -178,10 +303,28 @@ PACKAGE_JSON="${ROOT_DIR}/package.json"
 PACKAGE_LOCK="${ROOT_DIR}/package-lock.json"
 CARGO_TOML="${ROOT_DIR}/src-tauri/Cargo.toml"
 CARGO_LOCK="${ROOT_DIR}/src-tauri/Cargo.lock"
+INHERITED_TAURI_CONFIG="${TAURI_CONFIG-}"
 TAURI_CONFIG="${ROOT_DIR}/src-tauri/tauri.conf.json"
-CAPABILITY="${ROOT_DIR}/src-tauri/capabilities/default.json"
+CAPABILITIES_DIR="${ROOT_DIR}/src-tauri/capabilities"
+BUILD_SCRIPT="${ROOT_DIR}/src-tauri/build.rs"
+TAURI_BUILD_WRAPPER="${ROOT_DIR}/scripts/tauri.sh"
 APP_SOURCE="${ROOT_DIR}/src/App.tsx"
 RUST_SOURCE="${ROOT_DIR}/src-tauri/src/lib.rs"
+RUNTIME_PROFILE_SOURCE="${ROOT_DIR}/src-tauri/src/runtime_profile.rs"
+SUPPORT_RUST_SOURCE="${ROOT_DIR}/src-tauri/src/support_session.rs"
+SUPPORT_PANEL_SOURCE="${ROOT_DIR}/src/RemoteSupportPanel.tsx"
+SUPPORT_CONTROL_SOURCE="${ROOT_DIR}/src/RemoteSupportControl.tsx"
+SUPPORT_SESSION_SOURCE="${ROOT_DIR}/public/support/session.js"
+SUPPORT_PROTOCOL_SOURCE="${ROOT_DIR}/public/support/protocol.js"
+SUPPORT_PEER_SOURCE="${ROOT_DIR}/public/support/peer.js"
+SUPPORT_VIEW_SOURCE="${ROOT_DIR}/src/supportView.ts"
+SUPPORT_SESSION_DOCUMENT="${ROOT_DIR}/public/support/session.html"
+
+if [[ -n "${INHERITED_TAURI_CONFIG}" ]]; then
+  fail "TAURI_CONFIG build override is set; packaged Tauri authority cannot be tied to the reviewed config"
+else
+  pass "TAURI_CONFIG build override is not set during release verification"
+fi
 
 for public_file in \
   LICENSE COPYRIGHT.md README.md SECURITY.md CONTRIBUTING.md CODE_OF_CONDUCT.md \
@@ -335,11 +478,12 @@ if [[ -f "${PLIST}" ]]; then
   PLIST_MINIMUM="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${PLIST}" 2>/dev/null || true)"
   check_target_value "${PLIST_MINIMUM}" "${EXPECTED_INFO_PLIST_TARGET}" \
     "Info.plist LSMinimumSystemVersion"
-  if python3 - "${PLIST}" "${EXPECTED_VERSION}" "${EXPECTED_BUNDLE_VERSION}" <<'PY'
+  if python3 - "${PLIST}" "${EXPECTED_VERSION}" "${EXPECTED_BUNDLE_VERSION}" \
+    "${EXPECTED_PRODUCT_NAME}" "${EXPECTED_IDENTIFIER}" <<'PY'
 import plistlib
 import sys
 
-path, expected_version, expected_bundle_version = sys.argv[1:]
+path, expected_version, expected_bundle_version, expected_product_name, expected_identifier = sys.argv[1:]
 with open(path, "rb") as handle:
     plist = plistlib.load(handle)
 
@@ -347,8 +491,10 @@ if plist.get("CFBundleShortVersionString") != expected_version:
     raise SystemExit("CFBundleShortVersionString mismatch")
 if plist.get("CFBundleVersion") != expected_bundle_version:
     raise SystemExit("CFBundleVersion mismatch")
-if plist.get("CFBundleName") != "PST QuickView":
+if plist.get("CFBundleName") != expected_product_name:
     raise SystemExit("CFBundleName mismatch")
+if plist.get("CFBundleIdentifier") != expected_identifier:
+    raise SystemExit("CFBundleIdentifier mismatch")
 
 expected = {
     "eml": ("public.email-message", "RFC 822 Email Message"),
@@ -407,6 +553,14 @@ fi
 PACKAGED_READPST="${APP_PATH}/Contents/MacOS/readpst"
 check_arches "${APP_BINARY}" universal "main app executable"
 check_arches "${PACKAGED_READPST}" universal "packaged readpst"
+for packaged_arch in x86_64 arm64; do
+  check_no_private_build_paths "${APP_BINARY}" "${packaged_arch}" \
+    "main app ${packaged_arch} slice"
+  check_runtime_profile_contract "${APP_BINARY}" "${packaged_arch}" \
+    "${EXPECTED_IDENTIFIER}" "main app ${packaged_arch} slice"
+  check_no_private_build_paths "${PACKAGED_READPST}" "${packaged_arch}" \
+    "packaged ReadPST ${packaged_arch} slice"
+done
 check_dependencies "${APP_BINARY}" "main app executable"
 check_dependencies "${PACKAGED_READPST}" "packaged readpst"
 
@@ -481,34 +635,434 @@ else
   fail "packaged ReadPST -V failed or reported an unexpected version"
 fi
 
-if python3 - "${CAPABILITY}" <<'PY'
+if python3 - "${CAPABILITIES_DIR}" "${TAURI_CONFIG}" "${BUILD_SCRIPT}" "${RUST_SOURCE}" "${APP_SOURCE}" <<'PY'
 import json
+import hashlib
+import re
 import sys
+from pathlib import Path
 
-with open(sys.argv[1], encoding="utf-8") as handle:
-    capability = json.load(handle)
-windows = set(capability.get("windows", []))
-permissions = set(capability.get("permissions", []))
-required_windows = {"main", "message-preview-*"}
-required_permissions = {
-    "core:default",
-    "core:webview:allow-create-webview-window",
-    "core:window:allow-show",
-    "core:window:allow-unminimize",
-    "core:window:allow-set-focus",
+capabilities_dir = Path(sys.argv[1])
+tauri_config_path = Path(sys.argv[2])
+build_script_path = Path(sys.argv[3])
+rust_source_path = Path(sys.argv[4])
+app_source_path = Path(sys.argv[5])
+
+if tauri_config_path.is_symlink() or not tauri_config_path.is_file():
+    raise SystemExit("production Tauri config must be a regular, non-symlink file")
+production_config_overrides = {
+    "Tauri.toml",
+    "Tauri.macos.toml",
+    "tauri.conf.json5",
+    "tauri.macos.conf.json",
+    "tauri.macos.conf.json5",
+}
+present_overrides = sorted(
+    name for name in production_config_overrides if (tauri_config_path.parent / name).exists()
+)
+if present_overrides:
+    raise SystemExit(f"production Tauri config override is present: {present_overrides}")
+
+if capabilities_dir.is_symlink() or not capabilities_dir.is_dir():
+    raise SystemExit("capabilities root must be a regular, non-symlink directory")
+
+expected_entries = {
+    ("main.json", "file"),
+    ("message-preview.json", "file"),
+    ("support-session.json", "file"),
+}
+actual_entries = set()
+for path in capabilities_dir.rglob("*"):
+    relative = path.relative_to(capabilities_dir).as_posix()
+    if path.is_symlink():
+        kind = "symlink"
+    elif path.is_dir():
+        kind = "directory"
+    elif path.is_file():
+        kind = "file"
+    else:
+        kind = "other"
+    actual_entries.add((relative, kind))
+if actual_entries != expected_entries:
+    raise SystemExit(
+        f"capability entries are not the exact reviewed set: {sorted(actual_entries)}"
+    )
+
+capabilities = {}
+for filename, _ in sorted(expected_entries):
+    path = capabilities_dir / filename
+    with path.open(encoding="utf-8") as handle:
+        capability = json.load(handle)
+    capabilities[capability.get("identifier")] = capability
+
+if set(capabilities) != {"main", "message-preview", "support-session"}:
+    raise SystemExit(f"capability identifiers are unexpected: {sorted(capabilities)}")
+
+main = capabilities["main"]
+preview = capabilities["message-preview"]
+support = capabilities["support-session"]
+expected_capability_keys = {
+    "$schema",
+    "description",
+    "identifier",
+    "permissions",
+    "windows",
+}
+if main.get("windows") != ["main"]:
+    raise SystemExit("main capability must target exactly the main window")
+if preview.get("windows") != ["message-preview-*"]:
+    raise SystemExit("preview capability must target exactly message-preview-* windows")
+if support.get("windows") != ["support-session-*"] or support.get("local") is not True:
+    raise SystemExit("support capability must target exactly local support-session-* windows")
+for identifier, capability in capabilities.items():
+    reviewed_keys = expected_capability_keys | ({"local"} if identifier == "support-session" else set())
+    if set(capability) != reviewed_keys:
+        raise SystemExit(
+            f"{identifier} capability fields are not the exact reviewed set: "
+            f"{sorted(capability)}"
+        )
+    permissions = capability.get("permissions")
+    if not isinstance(permissions, list):
+        raise SystemExit(f"{identifier} capability permissions are not a list")
+    if not all(isinstance(permission, str) for permission in permissions):
+        raise SystemExit(f"{identifier} capability contains a scoped permission object")
+    if len(permissions) != len(set(permissions)):
+        raise SystemExit(f"{identifier} capability contains duplicate permissions")
+    if any("*" in permission for permission in permissions):
+        raise SystemExit(f"{identifier} capability contains a wildcard permission")
+    if any(permission == "core:default" or "shell" in permission or "fs:" in permission
+           for permission in permissions):
+        raise SystemExit(f"{identifier} capability contains broad default, shell, or filesystem authority")
+
+main_core_permissions = {
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+}
+preview_core_permissions = {
     "core:window:allow-set-title",
 }
-if windows != required_windows:
-    raise SystemExit(f"window scope is not narrow: {sorted(windows)}")
-if not required_permissions.issubset(permissions):
-    raise SystemExit("required preview-window permissions are missing")
-if any("shell" in permission or "fs:" in permission for permission in permissions):
-    raise SystemExit("unexpected broad shell/filesystem capability")
+
+build_source = build_script_path.read_text(encoding="utf-8")
+permission_generator_start = build_source.find("fn write_app_permissions")
+if permission_generator_start < 0:
+    raise SystemExit("build.rs application permission generator was not found")
+permission_generator_source = build_source[permission_generator_start:]
+expected_permission_generator_sha256 = (
+    "75fea422fd830395adb5e7564a49e012a3fd07726a0b089a737593f116f66211"
+)
+actual_permission_generator_sha256 = hashlib.sha256(
+    permission_generator_source.encode()
+).hexdigest()
+if actual_permission_generator_sha256 != expected_permission_generator_sha256:
+    raise SystemExit(
+        "application permission generation or registration drifted from the reviewed "
+        "one-to-one implementation"
+    )
+command_match = re.search(
+    r"const APP_COMMANDS:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
+    build_source,
+    re.DOTALL,
+)
+if command_match is None:
+    raise SystemExit("build.rs does not declare the generated application-command ACL")
+app_commands = re.findall(r'"([a-z][a-z0-9_]*)"', command_match.group(1))
+if not app_commands or len(app_commands) != len(set(app_commands)):
+    raise SystemExit("generated application-command ACL is empty or contains duplicates")
+
+rust_source = rust_source_path.read_text(encoding="utf-8")
+if (
+    rust_source.count("tauri::generate_context!") != 1
+    or re.search(
+        r"\blet\s+context\s*=\s*tauri::generate_context!\(\)\s*;",
+        rust_source,
+    ) is None
+    or "RuntimeProfileIdentity::from_config(context.config())" not in rust_source
+    or re.search(r"\.build\(\s*context\s*\)", rust_source) is None
+):
+    raise SystemExit(
+        "application must validate and build exactly once with the reviewed merged Tauri context"
+    )
+handler_match = re.search(
+    r"\.invoke_handler\(tauri::generate_handler!\[(.*?)\]\)",
+    rust_source,
+    re.DOTALL,
+)
+if handler_match is None:
+    raise SystemExit("registered Tauri command handler list was not found")
+command_paths = handler_match.group(1).split(",")
+if command_paths[-1].strip() == "":
+    command_paths.pop()
+registered_commands = []
+for command_path in command_paths:
+    match = re.fullmatch(r"(?:[a-z][a-z0-9_]*::)*([a-z][a-z0-9_]*)", command_path.strip())
+    if match is None:
+        raise SystemExit("registered application command is not an exact Rust command path")
+    registered_commands.append(match.group(1))
+if set(app_commands) != set(registered_commands) or len(app_commands) != len(registered_commands):
+    missing = sorted(set(registered_commands) - set(app_commands))
+    extra = sorted(set(app_commands) - set(registered_commands))
+    raise SystemExit(f"application-command ACL drifted; missing={missing}, extra={extra}")
+
+if "env::var_os(\"OUT_DIR\")" not in build_source:
+    raise SystemExit("generated application permissions must be written under Cargo OUT_DIR")
+if "AppManifest::new().permissions_path_pattern(" not in build_source:
+    raise SystemExit("generated application permissions are not registered with Tauri")
+if "tauri_build::try_build(" not in build_source or "tauri_build::build()" in build_source:
+    raise SystemExit("Tauri build must fail closed while registering the application ACL")
+if "permissions/autogenerated" in build_source:
+    raise SystemExit("generated application permissions must not modify the source tree")
+
+def app_permission(command):
+    return "allow-" + command.replace("_", "-")
+
+app_source = app_source_path.read_text(encoding="utf-8")
+invoke_pattern = r'''\binvoke(?:<[^>]+>)?\s*\(\s*(["'])([a-z][a-z0-9_]*)\1'''
+
+def frontend_invocations(source):
+    commands = [match[1] for match in re.findall(invoke_pattern, source)]
+    count = len(re.findall(r"\binvoke(?:<[^>]+>)?\s*\(", source))
+    if len(commands) != count:
+        raise SystemExit("frontend contains a dynamic or unclassified Tauri invoke call")
+    return commands
+
+support_panel_path = app_source_path.with_name("RemoteSupportPanel.tsx")
+support_control_path = app_source_path.with_name("RemoteSupportControl.tsx")
+support_session_path = app_source_path.parent.parent / "public" / "support" / "session.js"
+support_rust_path = rust_source_path.with_name("support_session.rs")
+for path in (support_panel_path, support_control_path, support_session_path, support_rust_path):
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit("support boundary source must be a regular, non-symlink file")
+support_panel_source = support_panel_path.read_text(encoding="utf-8")
+support_control_source = support_control_path.read_text(encoding="utf-8")
+support_session_source = support_session_path.read_text(encoding="utf-8")
+support_rust_source = support_rust_path.read_text(encoding="utf-8")
+wrapper_start = support_session_source.find("const invoke = (command, args) => {")
+wrapper_end = support_session_source.find("\nasync function stop(", wrapper_start)
+if wrapper_start < 0 or wrapper_end < 0:
+    raise SystemExit("support session invoke wrapper was not found")
+wrapper = support_session_source[wrapper_start:wrapper_end]
+if hashlib.sha256(wrapper.strip().encode()).hexdigest() != (
+    "217a03400c2ddf58c35bed262b4b68080e594794efb1036a6c4a790ff147ad16"
+):
+    raise SystemExit("support session invocation wrapper drifted from reviewed delegation")
+support_frontend_commands = frontend_invocations(support_session_source.replace(wrapper, "", 1))
+frontend_commands = [command for source in (app_source, support_panel_source, support_control_source)
+                     for command in frontend_invocations(source)]
+all_frontend_commands = set(frontend_commands) | set(support_frontend_commands)
+if not all_frontend_commands.issubset(set(app_commands)):
+    unknown = sorted(all_frontend_commands - set(app_commands))
+    raise SystemExit(f"frontend invokes commands absent from the generated ACL: {unknown}")
+
+main_support_commands = {
+    "start_support_session", "support_session_status", "publish_support_frame", "stop_support_session",
+}
+support_commands = {
+    "bootstrap_support_session", "poll_support_frame", "support_submit_action", "stop_support_session",
+}
+if set(frontend_invocations(support_panel_source) + frontend_invocations(support_control_source)) != main_support_commands:
+    raise SystemExit("main support controls invoke an unexpected command set")
+if set(support_frontend_commands) != support_commands:
+    raise SystemExit("support session invokes an unexpected command set")
+if set(app_commands) - all_frontend_commands != {"export_original_eml", "reveal_exported_file"}:
+    raise SystemExit("registered unused commands drifted from the reviewed set")
+
+preview_commands = {
+    "get_preview_window_target",
+    "get_source_eml_view",
+    "get_standalone_message_view",
+    "save_source_eml_as",
+    "save_standalone_source_message_as",
+    "save_printable_html_as",
+    "reveal_saved_html",
+    "reveal_saved_eml",
+    "export_attachment",
+    "open_attachment",
+    "export_standalone_message_attachment",
+    "open_standalone_message_attachment",
+    "reveal_exported_file_for_workspace",
+    "reveal_standalone_exported_file",
+}
+preview_source_match = re.search(
+    r"function MessagePreviewBootstrap\b(.*?)\nfunction App\(\)",
+    app_source,
+    re.DOTALL,
+)
+if preview_source_match is None:
+    raise SystemExit("message preview source boundary was not found")
+preview_invocations = set(frontend_invocations(preview_source_match.group(1)))
+if preview_invocations != preview_commands:
+    missing = sorted(preview_invocations - preview_commands)
+    extra = sorted(preview_commands - preview_invocations)
+    raise SystemExit(f"message preview command ACL drifted; missing={missing}, extra={extra}")
+
+preview_only_commands = {"get_preview_window_target"}
+expected_main_permissions = main_core_permissions | {
+    app_permission(command)
+    for command in frontend_commands
+    if command not in preview_only_commands
+}
+expected_preview_permissions = preview_core_permissions | {
+    app_permission(command) for command in preview_commands
+}
+if set(main["permissions"]) != expected_main_permissions:
+    raise SystemExit("main capability is not the exact reviewed permission set")
+if set(preview["permissions"]) != expected_preview_permissions:
+    raise SystemExit("message preview capability is not the exact reviewed permission set")
+if set(support["permissions"]) != {app_permission(command) for command in support_commands}:
+    raise SystemExit("support capability is not the exact reviewed permission set")
+for command in support_commands:
+    if (app_permission(command) in main["permissions"]) != (command == "stop_support_session"):
+        raise SystemExit("main window inherits support-only broker authority")
+    if app_permission(command) in preview["permissions"]:
+        raise SystemExit("preview inherits support broker authority")
+for command in main_support_commands:
+    if app_permission(command) in preview["permissions"]:
+        raise SystemExit("preview inherits main support authority")
+if not set(preview["permissions"]).isdisjoint(main_core_permissions):
+    raise SystemExit("preview capability inherits main-window core authority")
+if "core:webview:allow-create-webview-window" in preview["permissions"]:
+    raise SystemExit("preview windows must not create webviews")
+if "core:webview:allow-create-webview-window" in main["permissions"]:
+    raise SystemExit("main window must not create arbitrary webviews")
+if "allow-get-preview-window-target" in main["permissions"]:
+    raise SystemExit("main window must not resolve preview-only target state")
+if "allow-open-message-preview-window" in preview["permissions"]:
+    raise SystemExit("preview windows must not create other preview windows")
+if "allow-open-message-preview-window" not in main["permissions"]:
+    raise SystemExit("main window is missing the constrained preview command")
+if re.search(r"new\s+WebviewWindow|WebviewWindow\.getByLabel", app_source):
+    raise SystemExit("frontend retains generic WebView creation or lookup authority")
+for required_source in (
+    "WebviewWindowBuilder::new(",
+    "WebviewUrl::App(PathBuf::from(PREVIEW_WINDOW_ROUTE))",
+    'const PREVIEW_WINDOW_ROUTE: &str = "index.html?messagePreview=1"',
+    'if window.label() != "main"',
+    "const MAX_PREVIEW_WINDOWS: usize = 32",
+):
+    if required_source not in rust_source:
+        raise SystemExit(f"constrained preview implementation is missing: {required_source}")
+if "standaloneMessagePath=" in app_source or "previewWorkspaceId=" in app_source:
+    raise SystemExit("frontend preview route contains a message path or workspace identity")
+
+support_csp_start = support_rust_source.find("fn support_csp(")
+support_csp_end = support_rust_source.find("\nfn take_session(", support_csp_start)
+resource_start = support_rust_source.find(".on_web_resource_request(move |request, response| {")
+resource_end = support_rust_source.find("\n        .build();", resource_start)
+if min(support_csp_start, support_csp_end, resource_start, resource_end) < 0:
+    raise SystemExit("scoped support CSP implementation was not found")
+support_csp_source = support_rust_source[support_csp_start:support_csp_end]
+resource_source = support_rust_source[resource_start:resource_end]
+for required in (
+    "if !allowed_origin(origin)",
+    'directive.split_whitespace().next() != Some("connect-src")',
+    'directives.push(format!("connect-src ipc: http://ipc.localhost {origin}"))',
+):
+    if required not in support_csp_source:
+        raise SystemExit("support CSP is not the exact reviewed origin-scoped connect exception")
+guard = resource_source.find("if !local_document(&url, &resource_id)")
+update = resource_source.find("support_csp(existing, &origin)")
+if guard < 0 or update < 0 or guard >= update:
+    raise SystemExit("support CSP exception is not gated to the local session document")
+for required in (
+    'const DOCUMENT: &str = "/support/session.html"',
+    'strip_suffix(".run.pinggy-free.link")',
+    '.on_navigation(move |url| local_document(url, &navigation_id))',
+    'NewWindowResponse::Deny',
+):
+    if required not in support_rust_source:
+        raise SystemExit("support navigation or origin scope drifted from reviewed bounds")
+if re.search(r"WebviewUrl::External|unsafe-eval|script-src \*", support_rust_source.split("\n#[cfg(test)]")[0]):
+    raise SystemExit("support window requests unreviewed navigation or active content")
+
+with tauri_config_path.open(encoding="utf-8") as handle:
+    tauri_config = json.load(handle)
+security = tauri_config.get("app", {}).get("security", {})
+if set(security) != {"csp"}:
+    raise SystemExit(
+        f"production Tauri security fields are not the exact reviewed set: {sorted(security)}"
+    )
+csp = security.get("csp")
+if not isinstance(csp, str):
+    raise SystemExit("production CSP is missing")
+
+directives = {}
+for raw_directive in csp.split(";"):
+    fields = raw_directive.split()
+    if not fields:
+        continue
+    name, values = fields[0], fields[1:]
+    if name in directives:
+        raise SystemExit(f"production CSP repeats {name}")
+    directives[name] = values
+
+expected_csp = {
+    "default-src": ["'none'"],
+    "script-src": ["'self'"],
+    "style-src": ["'self'", "'unsafe-inline'"],
+    "img-src": ["'self'", "data:"],
+    "font-src": ["'none'"],
+    "connect-src": ["ipc:", "http://ipc.localhost"],
+    "object-src": ["'none'"],
+    "base-uri": ["'none'"],
+    "form-action": ["'none'"],
+    "frame-src": ["'none'"],
+    "frame-ancestors": ["'none'"],
+    "child-src": ["'none'"],
+    "worker-src": ["'none'"],
+    "media-src": ["'none'"],
+    "manifest-src": ["'none'"],
+}
+if directives != expected_csp:
+    raise SystemExit(f"production CSP is not the exact reviewed policy: {directives}")
+
+lower_csp = csp.lower().replace("http://ipc.localhost", "")
+for forbidden in ("*", "'unsafe-eval'", "http:", "https:", "ws:", "wss:",
+                  "127.0.0.1:1420", "localhost:1420", "@vite/client"):
+    if forbidden in lower_csp:
+        raise SystemExit(f"production CSP contains forbidden source or development origin: {forbidden}")
 PY
 then
-  pass "Tauri capability scope is limited to main and message preview windows"
+  pass "Tauri CSP, application ACL, and disjoint window capabilities match the reviewed source policy"
 else
-  fail "Tauri capability verification failed"
+  fail "Tauri security-boundary verification failed"
+fi
+
+if python3 "${ROOT_DIR}/scripts/verify-packaged-csp.py" \
+  "${TAURI_CONFIG}" "${APP_BINARY}"
+then
+  pass "packaged executable embeds the reviewed production CSP"
+else
+  fail "packaged executable CSP verification failed"
+fi
+
+STALE_SECURITY_SOURCES=()
+for security_source in \
+  "${TAURI_CONFIG}" \
+  "${BUILD_SCRIPT}" \
+  "${TAURI_BUILD_WRAPPER}" \
+  "${CAPABILITIES_DIR}/main.json" \
+  "${CAPABILITIES_DIR}/message-preview.json" \
+  "${CAPABILITIES_DIR}/support-session.json" \
+  "${RUST_SOURCE}" \
+  "${RUNTIME_PROFILE_SOURCE}" \
+  "${SUPPORT_RUST_SOURCE}" \
+  "${SUPPORT_PANEL_SOURCE}" \
+  "${SUPPORT_CONTROL_SOURCE}" \
+  "${SUPPORT_SESSION_SOURCE}" \
+  "${SUPPORT_PROTOCOL_SOURCE}" \
+  "${SUPPORT_PEER_SOURCE}" \
+  "${SUPPORT_VIEW_SOURCE}" \
+  "${SUPPORT_SESSION_DOCUMENT}" \
+  "${APP_SOURCE}"
+do
+  if [[ "${security_source}" -nt "${APP_BINARY}" ]]; then
+    STALE_SECURITY_SOURCES+=("${security_source#"${ROOT_DIR}/"}")
+  fi
+done
+if [[ "${#STALE_SECURITY_SOURCES[@]}" -eq 0 ]]; then
+  pass "packaged executable is not older than reviewed security-boundary sources"
+else
+  fail "packaged executable predates reviewed security-boundary sources: ${STALE_SECURITY_SOURCES[*]}"
 fi
 
 if [[ -d "${APP_PATH}/Contents" ]]; then
@@ -518,12 +1072,20 @@ if [[ -d "${APP_PATH}/Contents" ]]; then
   else
     pass "packaged app contains no localhost or Vite development-server references"
   fi
-  if [[ -d "${ROOT_DIR}/dist" ]] && grep -R -a -E \
-    '/Users/notroot|/Volumes/T7|PST_QUICKVIEW_(TREVOR|FURMAN)_MSG_FIXTURE' \
-    "${ROOT_DIR}/dist" >/dev/null 2>&1; then
-    fail "packaged frontend assets contain a private path or deprecated private fixture identifier"
+  if grep -R -a -E \
+    '(^|file://|[^[:alnum:]_./-])(/Users/[^/[:space:]]+|/home/[^/[:space:]]+|/Volumes/[^/[:space:]]+/|[A-Za-z]:\\Users\\)|PST_QUICKVIEW_(TREVOR|FURMAN)_MSG_FIXTURE' \
+    "${APP_PATH}/Contents" >/dev/null 2>&1
+  then
+    PACKAGED_PRIVACY_SCAN_STATUS=0
   else
-    pass "packaged frontend assets contain no configured private paths or fixture identifiers"
+    PACKAGED_PRIVACY_SCAN_STATUS=$?
+  fi
+  if [[ "${PACKAGED_PRIVACY_SCAN_STATUS}" -eq 0 ]]; then
+    fail "packaged app contains a private path or deprecated private fixture identifier"
+  elif [[ "${PACKAGED_PRIVACY_SCAN_STATUS}" -eq 1 ]]; then
+    pass "packaged app contains no private paths or deprecated private fixture identifiers"
+  else
+    fail "packaged app privacy scan failed closed"
   fi
   if [[ -f "${APP_BINARY}" ]] &&
     grep -a -F "${EXPECTED_VERSION}" "${APP_BINARY}" >/dev/null 2>&1; then

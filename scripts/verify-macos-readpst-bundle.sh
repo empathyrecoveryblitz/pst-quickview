@@ -9,23 +9,20 @@ if [[ ! -r "${DYLIB_VALIDATION_SCRIPT}" ]]; then
 fi
 # shellcheck source=macos-dylib-validation.sh
 source "${DYLIB_VALIDATION_SCRIPT}"
-UNIVERSAL_APP="${ROOT_DIR}/src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app"
-NATIVE_APP="${ROOT_DIR}/src-tauri/target/release/bundle/macos/PST QuickView.app"
 EXPECTED_VERSION="0.6.76"
 EXPECTED_X86_64_TARGET="10.13"
 EXPECTED_ARM64_TARGET="11.0"
 
-if [[ -n "${1:-}" ]]; then
-  APP_PATH="$1"
-elif [[ -d "${UNIVERSAL_APP}" ]]; then
-  APP_PATH="${UNIVERSAL_APP}"
-else
-  APP_PATH="${NATIVE_APP}"
-fi
+APP_PATH=""
+case "${1:-}" in
+  ""|--source-only) ;;
+  --*)
+    echo "Unknown verification option: $1" >&2
+    exit 2
+    ;;
+  *) APP_PATH="$1" ;;
+esac
 
-MACOS_DIR="${APP_PATH}/Contents/MacOS"
-APP_BINARY="${MACOS_DIR}/pst-quickview"
-READPST_BINARY="${MACOS_DIR}/readpst"
 SOURCE_BINARIES_DIR="${ROOT_DIR}/src-tauri/binaries"
 SOURCE_X86_64="${SOURCE_BINARIES_DIR}/readpst-x86_64-apple-darwin"
 SOURCE_ARM64="${SOURCE_BINARIES_DIR}/readpst-aarch64-apple-darwin"
@@ -162,6 +159,15 @@ done
 run_version_if_supported "${SOURCE_X86_64}" "source Intel ReadPST"
 run_version_if_supported "${SOURCE_ARM64}" "source Apple Silicon ReadPST"
 run_version_if_supported "${SOURCE_UNIVERSAL}" "source universal ReadPST"
+
+if [[ -z "${APP_PATH}" ]]; then
+  echo "Source ReadPST verification passed. Packaged verification requires an explicit app path."
+  exit 0
+fi
+
+MACOS_DIR="${APP_PATH}/Contents/MacOS"
+APP_BINARY="${MACOS_DIR}/pst-quickview"
+READPST_BINARY="${MACOS_DIR}/readpst"
 
 if [[ ! -d "${APP_PATH}" ]]; then
   echo "App bundle not found: ${APP_PATH}" >&2

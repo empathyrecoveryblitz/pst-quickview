@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "support-session",
+  "description": "Ephemeral approved application-only support broker; no files, dialogs, workspace commands, navigation, events, or desktop authority.",
+  "windows": ["support-session-*"],
+  "local": true,
+  "permissions": [
+    "allow-bootstrap-support-session",
+    "allow-poll-support-frame",
+    "allow-support-submit-action",
+    "allow-stop-support-session"
+  ]
+}

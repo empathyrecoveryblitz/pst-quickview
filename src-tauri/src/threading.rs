@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 pub const SUBJECT_FALLBACK_WINDOW_SECONDS: i64 = 14 * 24 * 60 * 60;
+pub const THREAD_ASSIGNMENT_PROGRESS_BATCH_SIZE: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct ThreadInput {
@@ -24,6 +26,111 @@ pub struct ThreadAssignment {
     pub conversation_seed: String,
     pub method: String,
     pub warning: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadAssignmentPhase {
+    IndexingMessageIds,
+    LinkingDuplicateMessageIds,
+    LinkingHeaders,
+    GroupingSubjects,
+    MatchingSubjects,
+    BuildingComponents,
+    BuildingAssignments,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadAssignmentProgress {
+    pub phase: ThreadAssignmentPhase,
+    pub processed: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadAssignmentControl {
+    Continue,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadAssignmentCancelled {
+    pub phase: ThreadAssignmentPhase,
+    pub processed: usize,
+    pub total: usize,
+}
+
+impl fmt::Display for ThreadAssignmentCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "thread assignment cancelled during {:?} at {}/{}",
+            self.phase, self.processed, self.total
+        )
+    }
+}
+
+impl std::error::Error for ThreadAssignmentCancelled {}
+
+struct ThreadProgressReporter<'a, F>
+where
+    F: FnMut(ThreadAssignmentProgress) -> ThreadAssignmentControl,
+{
+    callback: &'a mut F,
+    phase: ThreadAssignmentPhase,
+    work_since_report: usize,
+}
+
+impl<'a, F> ThreadProgressReporter<'a, F>
+where
+    F: FnMut(ThreadAssignmentProgress) -> ThreadAssignmentControl,
+{
+    fn new(callback: &'a mut F) -> Self {
+        Self {
+            callback,
+            phase: ThreadAssignmentPhase::IndexingMessageIds,
+            work_since_report: 0,
+        }
+    }
+
+    fn begin(
+        &mut self,
+        phase: ThreadAssignmentPhase,
+        total: usize,
+    ) -> Result<(), ThreadAssignmentCancelled> {
+        self.phase = phase;
+        self.work_since_report = 0;
+        self.report(0, total)
+    }
+
+    fn pulse(&mut self, processed: usize, total: usize) -> Result<(), ThreadAssignmentCancelled> {
+        self.work_since_report = self.work_since_report.saturating_add(1);
+        if self.work_since_report < THREAD_ASSIGNMENT_PROGRESS_BATCH_SIZE {
+            return Ok(());
+        }
+        self.work_since_report = 0;
+        self.report(processed.min(total), total)
+    }
+
+    fn finish(&mut self, total: usize) -> Result<(), ThreadAssignmentCancelled> {
+        self.work_since_report = 0;
+        self.report(total, total)
+    }
+
+    fn report(&mut self, processed: usize, total: usize) -> Result<(), ThreadAssignmentCancelled> {
+        let progress = ThreadAssignmentProgress {
+            phase: self.phase,
+            processed,
+            total,
+        };
+        match (self.callback)(progress) {
+            ThreadAssignmentControl::Continue => Ok(()),
+            ThreadAssignmentControl::Cancel => Err(ThreadAssignmentCancelled {
+                phase: progress.phase,
+                processed: progress.processed,
+                total: progress.total,
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -167,26 +274,42 @@ pub fn extract_email_addresses(value: &str) -> HashSet<String> {
         .collect()
 }
 
+#[cfg(test)]
 pub fn assign_threads(inputs: &[ThreadInput]) -> Vec<ThreadAssignment> {
+    match assign_threads_with_progress(inputs, |_| ThreadAssignmentControl::Continue) {
+        Ok(assignments) => assignments,
+        Err(_) => unreachable!("the compatibility callback never requests cancellation"),
+    }
+}
+
+pub fn assign_threads_with_progress<F>(
+    inputs: &[ThreadInput],
+    mut callback: F,
+) -> Result<Vec<ThreadAssignment>, ThreadAssignmentCancelled>
+where
+    F: FnMut(ThreadAssignmentProgress) -> ThreadAssignmentControl,
+{
     if inputs.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
+    let total_inputs = inputs.len();
+    let mut progress = ThreadProgressReporter::new(&mut callback);
     let mut dsu = DisjointSet::new(inputs.len());
-    let id_to_index = inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| (input.id, index))
-        .collect::<HashMap<_, _>>();
+    let mut id_to_index = HashMap::with_capacity(inputs.len());
     let mut message_id_indexes = HashMap::<String, Vec<usize>>::new();
+    progress.begin(ThreadAssignmentPhase::IndexingMessageIds, total_inputs)?;
     for (index, input) in inputs.iter().enumerate() {
+        id_to_index.insert(input.id, index);
         if let Some(message_id) = &input.message_id {
             message_id_indexes
                 .entry(message_id.clone())
                 .or_default()
                 .push(index);
         }
+        progress.pulse(index + 1, total_inputs)?;
     }
+    progress.finish(total_inputs)?;
 
     let mut parent_indexes = vec![None; inputs.len()];
     let mut methods = vec!["standalone".to_string(); inputs.len()];
@@ -195,6 +318,15 @@ pub fn assign_threads(inputs: &[ThreadInput]) -> Vec<ThreadAssignment> {
         .map(|input| input.warning.clone())
         .collect::<Vec<_>>();
 
+    let duplicate_total = message_id_indexes
+        .values()
+        .map(|indexes| indexes.len().saturating_sub(1))
+        .sum::<usize>();
+    let mut duplicates_processed = 0_usize;
+    progress.begin(
+        ThreadAssignmentPhase::LinkingDuplicateMessageIds,
+        duplicate_total,
+    )?;
     for indexes in message_id_indexes.values() {
         if indexes.len() < 2 {
             continue;
@@ -206,9 +338,13 @@ pub fn assign_threads(inputs: &[ThreadInput]) -> Vec<ThreadAssignment> {
                 &mut warnings[duplicate],
                 "Duplicate Message-ID matched another indexed message.",
             );
+            duplicates_processed = duplicates_processed.saturating_add(1);
+            progress.pulse(duplicates_processed, duplicate_total)?;
         }
     }
+    progress.finish(duplicate_total)?;
 
+    progress.begin(ThreadAssignmentPhase::LinkingHeaders, total_inputs)?;
     for (index, input) in inputs.iter().enumerate() {
         if let Some(in_reply_to) = &input.in_reply_to {
             if let Some(parent_index) = first_other_index(&message_id_indexes, in_reply_to, index) {
@@ -230,6 +366,7 @@ pub fn assign_threads(inputs: &[ThreadInput]) -> Vec<ThreadAssignment> {
                 dsu.union(index, reference_index);
                 matched_references.push(reference_index);
             }
+            progress.pulse(index, total_inputs)?;
         }
         if parent_indexes[index].is_none() {
             if let Some(parent_index) = matched_references.last().copied() {
@@ -249,26 +386,40 @@ pub fn assign_threads(inputs: &[ThreadInput]) -> Vec<ThreadAssignment> {
                 "Self-referential threading header was ignored.",
             );
         }
+        progress.pulse(index + 1, total_inputs)?;
     }
+    progress.finish(total_inputs)?;
 
-    apply_subject_fallback(inputs, &mut dsu, &mut parent_indexes, &mut methods);
+    apply_subject_fallback_with_progress(
+        inputs,
+        &mut dsu,
+        &mut parent_indexes,
+        &mut methods,
+        &mut progress,
+    )?;
 
     let mut components = HashMap::<usize, Vec<usize>>::new();
+    progress.begin(ThreadAssignmentPhase::BuildingComponents, total_inputs)?;
     for index in 0..inputs.len() {
         let root = dsu.find(index);
         components.entry(root).or_default().push(index);
+        progress.pulse(index + 1, total_inputs)?;
     }
+    progress.finish(total_inputs)?;
 
     let mut assignments = Vec::with_capacity(inputs.len());
+    let mut assignments_processed = 0_usize;
+    progress.begin(ThreadAssignmentPhase::BuildingAssignments, total_inputs)?;
     for members in components.values() {
-        let mut root_candidates = members
-            .iter()
-            .copied()
-            .filter(|member| {
-                parent_indexes[*member].is_none()
-                    || parent_indexes[*member].is_some_and(|parent| !members.contains(&parent))
-            })
-            .collect::<Vec<_>>();
+        let mut root_candidates = Vec::new();
+        for member in members.iter().copied() {
+            if parent_indexes[member].is_none()
+                || parent_indexes[member].is_some_and(|parent| !members.contains(&parent))
+            {
+                root_candidates.push(member);
+            }
+            progress.pulse(assignments_processed, total_inputs)?;
+        }
         let circular = root_candidates.is_empty();
         if circular {
             root_candidates.extend(members.iter().copied());
@@ -276,10 +427,17 @@ pub fn assign_threads(inputs: &[ThreadInput]) -> Vec<ThreadAssignment> {
         root_candidates
             .sort_by(|left, right| compare_thread_order(&inputs[*left], &inputs[*right]));
         let root_index = root_candidates[0];
-        let seed = members
-            .iter()
-            .filter_map(|index| inputs[*index].message_id.as_ref())
-            .min()
+        let mut minimum_message_id = None;
+        for index in members {
+            if let Some(message_id) = inputs[*index].message_id.as_ref() {
+                minimum_message_id = match minimum_message_id {
+                    Some(current) if current <= message_id => Some(current),
+                    _ => Some(message_id),
+                };
+            }
+            progress.pulse(assignments_processed, total_inputs)?;
+        }
+        let seed = minimum_message_id
             .map(|message_id| format!("header:{message_id}"))
             .unwrap_or_else(|| format!("path:{}", inputs[root_index].eml_path));
 
@@ -304,21 +462,29 @@ pub fn assign_threads(inputs: &[ThreadInput]) -> Vec<ThreadAssignment> {
                 method: methods[*index].clone(),
                 warning: warnings[*index].clone(),
             });
+            assignments_processed = assignments_processed.saturating_add(1);
+            progress.pulse(assignments_processed, total_inputs)?;
         }
     }
+    progress.finish(total_inputs)?;
 
     assignments.sort_by_key(|assignment| assignment.id);
     debug_assert_eq!(assignments.len(), id_to_index.len());
-    assignments
+    Ok(assignments)
 }
 
-fn apply_subject_fallback(
+fn apply_subject_fallback_with_progress<F>(
     inputs: &[ThreadInput],
     dsu: &mut DisjointSet,
     parent_indexes: &mut [Option<usize>],
     methods: &mut [String],
-) {
+    progress: &mut ThreadProgressReporter<'_, F>,
+) -> Result<(), ThreadAssignmentCancelled>
+where
+    F: FnMut(ThreadAssignmentProgress) -> ThreadAssignmentControl,
+{
     let mut groups = HashMap::<String, Vec<usize>>::new();
+    progress.begin(ThreadAssignmentPhase::GroupingSubjects, inputs.len())?;
     for (index, input) in inputs.iter().enumerate() {
         if input.in_reply_to.is_some()
             || !input.references.is_empty()
@@ -326,23 +492,41 @@ fn apply_subject_fallback(
             || input.timestamp.is_none()
             || input.sender_emails.is_empty()
         {
+            progress.pulse(index + 1, inputs.len())?;
             continue;
         }
         groups
             .entry(input.normalized_subject.to_ascii_lowercase())
             .or_default()
             .push(index);
+        progress.pulse(index + 1, inputs.len())?;
     }
+    progress.finish(inputs.len())?;
 
+    let matching_total = groups.values().map(Vec::len).sum::<usize>();
+    let mut matching_processed = 0_usize;
+    progress.begin(ThreadAssignmentPhase::MatchingSubjects, matching_total)?;
     for indexes in groups.values_mut() {
         indexes.sort_by(|left, right| compare_thread_order(&inputs[*left], &inputs[*right]));
         for position in 0..indexes.len() {
             let current = indexes[position];
-            if dsu.find(current) != current || component_size(dsu, inputs.len(), current) > 1 {
+            if dsu.find(current) != current
+                || component_size_with_progress(
+                    dsu,
+                    inputs.len(),
+                    current,
+                    matching_processed,
+                    matching_total,
+                    progress,
+                )? > 1
+            {
+                matching_processed = matching_processed.saturating_add(1);
+                progress.pulse(matching_processed, matching_total)?;
                 continue;
             }
             for previous_position in (0..position).rev() {
                 let previous = indexes[previous_position];
+                progress.pulse(matching_processed, matching_total)?;
                 let Some(current_time) = inputs[current].timestamp else {
                     break;
                 };
@@ -359,15 +543,34 @@ fn apply_subject_fallback(
                     break;
                 }
             }
+            matching_processed = matching_processed.saturating_add(1);
+            progress.pulse(matching_processed, matching_total)?;
         }
     }
+    progress.finish(matching_total)?;
+    Ok(())
 }
 
-fn component_size(dsu: &mut DisjointSet, length: usize, index: usize) -> usize {
+fn component_size_with_progress<F>(
+    dsu: &mut DisjointSet,
+    length: usize,
+    index: usize,
+    processed: usize,
+    total: usize,
+    progress: &mut ThreadProgressReporter<'_, F>,
+) -> Result<usize, ThreadAssignmentCancelled>
+where
+    F: FnMut(ThreadAssignmentProgress) -> ThreadAssignmentControl,
+{
     let root = dsu.find(index);
-    (0..length)
-        .filter(|candidate| dsu.find(*candidate) == root)
-        .count()
+    let mut size = 0_usize;
+    for candidate in 0..length {
+        if dsu.find(candidate) == root {
+            size = size.saturating_add(1);
+        }
+        progress.pulse(processed, total)?;
+    }
+    Ok(size)
 }
 
 fn conservative_participant_overlap(left: &ThreadInput, right: &ThreadInput) -> bool {
@@ -503,5 +706,123 @@ mod tests {
             assignments[0].conversation_seed,
             assignments[2].conversation_seed
         );
+    }
+
+    #[test]
+    fn progress_api_preserves_exact_deterministic_assignments() {
+        let root = input(1, "Topic", "a@example.com", "b@example.com", 10);
+        let mut header_reply = input(2, "Re: Topic", "b@example.com", "a@example.com", 20);
+        header_reply.in_reply_to = root.message_id.clone();
+        let fallback_reply = input(3, "Fwd: Topic", "a@example.com", "b@example.com", 30);
+        let inputs = vec![root, header_reply, fallback_reply];
+
+        let legacy = assign_threads(&inputs);
+        let observed = assign_threads_with_progress(&inputs, |_| ThreadAssignmentControl::Continue)
+            .expect("non-cancelling progress callback should complete");
+        assert_eq!(observed, legacy);
+    }
+
+    #[test]
+    fn progress_callbacks_are_aggregate_monotonic_per_phase_and_batched() {
+        let inputs = (0..600)
+            .map(|index| {
+                input(
+                    i64::from(index) + 1,
+                    "",
+                    "sender@example.com",
+                    "recipient@example.com",
+                    i64::from(index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        let assignments = assign_threads_with_progress(&inputs, |progress| {
+            events.push(progress);
+            ThreadAssignmentControl::Continue
+        })
+        .unwrap();
+
+        assert_eq!(assignments.len(), inputs.len());
+        assert!(events.len() < inputs.len() / 4);
+        assert_eq!(
+            events.first().map(|event| event.phase),
+            Some(ThreadAssignmentPhase::IndexingMessageIds)
+        );
+        assert_eq!(
+            events.last(),
+            Some(&ThreadAssignmentProgress {
+                phase: ThreadAssignmentPhase::BuildingAssignments,
+                processed: inputs.len(),
+                total: inputs.len(),
+            })
+        );
+        for event in &events {
+            assert!(event.processed <= event.total);
+        }
+        for pair in events.windows(2) {
+            if pair[0].phase == pair[1].phase {
+                assert!(pair[0].processed <= pair[1].processed);
+                assert_eq!(pair[0].total, pair[1].total);
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_is_checked_at_the_configured_batch_boundary() {
+        let inputs = (0..600)
+            .map(|index| {
+                input(
+                    i64::from(index) + 1,
+                    "",
+                    "sender@example.com",
+                    "recipient@example.com",
+                    i64::from(index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let error = assign_threads_with_progress(&inputs, |progress| {
+            if progress.phase == ThreadAssignmentPhase::IndexingMessageIds
+                && progress.processed >= THREAD_ASSIGNMENT_PROGRESS_BATCH_SIZE
+            {
+                ThreadAssignmentControl::Cancel
+            } else {
+                ThreadAssignmentControl::Continue
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.phase, ThreadAssignmentPhase::IndexingMessageIds);
+        assert_eq!(error.processed, THREAD_ASSIGNMENT_PROGRESS_BATCH_SIZE);
+        assert_eq!(error.total, inputs.len());
+    }
+
+    #[test]
+    fn cancellation_is_checked_inside_expensive_subject_component_scans() {
+        let inputs = (0..300)
+            .map(|index| {
+                input(
+                    i64::from(index) + 1,
+                    "Synthetic topic",
+                    "sender@example.com",
+                    "recipient@example.com",
+                    i64::from(index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut matching_callbacks = 0_usize;
+        let error = assign_threads_with_progress(&inputs, |progress| {
+            if progress.phase == ThreadAssignmentPhase::MatchingSubjects {
+                matching_callbacks = matching_callbacks.saturating_add(1);
+                if matching_callbacks == 2 {
+                    return ThreadAssignmentControl::Cancel;
+                }
+            }
+            ThreadAssignmentControl::Continue
+        })
+        .unwrap_err();
+
+        assert_eq!(error.phase, ThreadAssignmentPhase::MatchingSubjects);
+        assert_eq!(error.processed, 0);
+        assert_eq!(error.total, inputs.len());
     }
 }

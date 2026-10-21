@@ -84,6 +84,29 @@ pub(crate) struct SearchFilters {
     date_to: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessageVisibility {
+    Active,
+    Trashed,
+}
+
+impl MessageVisibility {
+    pub(crate) fn from_arg(value: Option<String>) -> Result<Self, SearchValidationError> {
+        match value.as_deref().unwrap_or("active") {
+            "active" => Ok(Self::Active),
+            "trashed" => Ok(Self::Trashed),
+            _ => Err(SearchValidationError::InvalidVisibility),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Trashed => "trashed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SearchValidationError {
     QueryTooLong,
@@ -96,6 +119,7 @@ pub(crate) enum SearchValidationError {
     RelevanceRequiresText,
     RelevanceRequiresSingleWorkspace,
     RelevanceUnsupportedForConversations,
+    InvalidVisibility,
 }
 
 impl std::fmt::Display for SearchValidationError {
@@ -140,6 +164,7 @@ impl std::fmt::Display for SearchValidationError {
                 formatter,
                 "Relevance sorting is not available for Conversations."
             ),
+            Self::InvalidVisibility => write!(formatter, "Message visibility is invalid."),
         }
     }
 }
@@ -359,13 +384,27 @@ impl MessageSearchCriteria {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn cursor_fingerprint(
         &self,
         folder_id: Option<i64>,
         include_subfolders: bool,
     ) -> [u8; 16] {
+        self.cursor_fingerprint_for_visibility(
+            folder_id,
+            include_subfolders,
+            MessageVisibility::Active,
+        )
+    }
+
+    pub(crate) fn cursor_fingerprint_for_visibility(
+        &self,
+        folder_id: Option<i64>,
+        include_subfolders: bool,
+        visibility: MessageVisibility,
+    ) -> [u8; 16] {
         let mut hasher = Sha256::new();
-        hasher.update(b"pst-quickview-message-criteria-v1");
+        hasher.update(b"pst-quickview-message-criteria-v2");
         hash_search_tokens(&mut hasher, b"any", &self.fts_terms);
         hash_search_tokens(&mut hasher, b"from", &self.from_terms);
         hash_search_tokens(&mut hasher, b"recipients", &self.recipient_terms);
@@ -387,6 +426,7 @@ impl MessageSearchCriteria {
             None => hasher.update([0]),
         }
         hasher.update([u8::from(include_subfolders)]);
+        hasher.update(visibility.as_str().as_bytes());
         let digest = hasher.finalize();
         let mut fingerprint = [0u8; 16];
         fingerprint.copy_from_slice(&digest[..16]);
@@ -2322,5 +2362,34 @@ mod tests {
         assert!(parsed.highlight_ranges.iter().all(
             |range| range.start < range.end && range.end <= parsed.text.encode_utf16().count()
         ));
+    }
+
+    #[test]
+    fn visibility_is_typed_and_authenticated_in_cursor_criteria() {
+        assert_eq!(
+            MessageVisibility::from_arg(None).unwrap(),
+            MessageVisibility::Active
+        );
+        assert_eq!(
+            MessageVisibility::from_arg(Some("active".to_string())).unwrap(),
+            MessageVisibility::Active
+        );
+        assert_eq!(
+            MessageVisibility::from_arg(Some("trashed".to_string())).unwrap(),
+            MessageVisibility::Trashed
+        );
+        assert_eq!(
+            MessageVisibility::from_arg(Some("future".to_string())).unwrap_err(),
+            SearchValidationError::InvalidVisibility
+        );
+
+        let criteria = MessageSearchCriteria::from_inputs(Some("synthetic".to_string()), None)
+            .expect("synthetic search should parse");
+        let active =
+            criteria.cursor_fingerprint_for_visibility(Some(7), true, MessageVisibility::Active);
+        let trashed =
+            criteria.cursor_fingerprint_for_visibility(Some(7), true, MessageVisibility::Trashed);
+        assert_ne!(active, trashed);
+        assert_eq!(active, criteria.cursor_fingerprint(Some(7), true));
     }
 }

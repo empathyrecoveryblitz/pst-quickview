@@ -4,6 +4,9 @@ import assert from "node:assert/strict";
 import {
   allMailVirtualFolder,
   defaultWorkspaceFolderSelection,
+  isLocalTrashFolderSelection,
+  localTrashVirtualFolder,
+  localTrashWorkspaceFolderSelection,
   normalizeStoredFolderSelection,
   resolveWorkspaceFolderSelection,
 } from "../src/sessionRestore.ts";
@@ -76,6 +79,45 @@ test("legacy saved sessions without scoped selection default to All Mail", () =>
     normalizeStoredFolderSelection("workspace-a", { folderId: 7 }),
     defaultWorkspaceFolderSelection("workspace-a"),
   );
+});
+
+test("Local Trash restores as a reserved virtual view outside numeric folder IDs", () => {
+  const stored = localTrashWorkspaceFolderSelection("workspace-a", false);
+  assert.equal(stored.folderId, null);
+  assert.equal(stored.virtualFolder, localTrashVirtualFolder);
+  assert.equal(typeof stored.virtualFolder, "string");
+  assert.equal(isLocalTrashFolderSelection(stored), true);
+
+  assert.deepEqual(
+    normalizeStoredFolderSelection("workspace-a", stored),
+    stored,
+  );
+  assert.deepEqual(
+    resolveWorkspaceFolderSelection("workspace-a", folders, stored),
+    stored,
+  );
+});
+
+test("Local Trash cannot collide with canonical folders or cross workspaces", () => {
+  const canonical = normalizeStoredFolderSelection("workspace-a", {
+    workspaceId: "workspace-a",
+    folderId: 7,
+    virtualFolder: localTrashVirtualFolder,
+    includeSubfolders: true,
+  });
+  assert.deepEqual(canonical, {
+    workspaceId: "workspace-a",
+    folderId: 7,
+    virtualFolder: null,
+    includeSubfolders: true,
+  });
+
+  const crossWorkspace = resolveWorkspaceFolderSelection(
+    "workspace-b",
+    folders,
+    localTrashWorkspaceFolderSelection("workspace-a"),
+  );
+  assert.deepEqual(crossWorkspace, defaultWorkspaceFolderSelection("workspace-b"));
 });
 
 test("conversation participant display favors names and stays compact", () => {

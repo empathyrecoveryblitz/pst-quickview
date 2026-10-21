@@ -597,6 +597,7 @@ export function MessageResultsList({
                 aria-current={isSelectedRow ? "true" : undefined}
                 className={`message-row ${isSelectedRow ? "selected" : ""}`}
                 data-message-result-key={key}
+                data-support-control="click"
                 data-result-navigation-key={key}
                 onClick={() => void onOpenMessage(message.id, rowWorkspaceId)}
                 onDoubleClick={() => void onOpenPreview(message, rowWorkspaceId)}
@@ -670,6 +671,7 @@ export function MessageResultsList({
           <button
             disabled={isSearching || isLoadingMore}
             onClick={onLoadMore}
+            data-support-control="click"
             type="button"
           >
             {isLoadingMore

@@ -1,0 +1,68 @@
+name: App-only support development gate
+
+on:
+  push:
+    branches: [codex/remote-support-development]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mac-development:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.88.0"
+          components: rustfmt, clippy
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - run: npm ci
+      - run: npm audit --omit=dev
+      - run: npm audit
+      - run: npm run test:frontend
+      - run: npm run build
+      - name: Native formatting
+        run: |
+          if cargo fmt --check; then exit 0; fi
+          cargo fmt
+          git diff --no-ext-diff -- '*.rs'
+          exit 1
+        working-directory: src-tauri
+      - name: Native check
+        run: cargo check --locked
+        working-directory: src-tauri
+      - name: Native Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: src-tauri
+      - name: Native tests
+        run: cargo test --locked
+        working-directory: src-tauri
+      - run: scripts/agent-check.sh
+      - run: PST_QUICKVIEW_SECURITY_STRESS=1 scripts/security-regression-gate.sh
+      - run: bash scripts/test-macos-dylib-validation.sh
+      - run: bash scripts/verify-macos-readpst-bundle.sh --source-only
+      - run: scripts/audit-public-repo.sh
+      - name: Build universal app only, without signing
+        run: npm run tauri -- build --target universal-apple-darwin --bundles app --no-sign --ci
+      - name: Inspect the exact current app; no stale-build fallback
+        run: EXPECT_DMG=0 bash scripts/verify-macos-release.sh "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app"
+      - name: Archive app while preserving Mac executable modes and bundle structure
+        run: ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app" "$RUNNER_TEMP/PST-QuickView-support-development.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pst-quickview-support-development-unsigned
+          path: ${{ runner.temp }}/PST-QuickView-support-development.zip
+          if-no-files-found: error
+          retention-days: 3

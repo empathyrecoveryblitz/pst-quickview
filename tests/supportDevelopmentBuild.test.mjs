@@ -1,0 +1,19 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const workflow = readFileSync(new URL('../.github/workflows/support-development.yml', import.meta.url), 'utf8');
+test('development workflow is Mac app-only, unsigned, and has no release or tag authority', () => {
+  assert.match(workflow, /runs-on: macos-15/);
+  assert.match(workflow, /branches: \[codex\/remote-support-development\]/);
+  assert.match(workflow, /contents: read/);
+  assert.match(workflow, /persist-credentials: false/);
+  assert.match(workflow, /--target universal-apple-darwin --bundles app --no-sign --ci/);
+  assert.match(workflow, /EXPECT_DMG=0 bash scripts\/verify-macos-release.sh/);
+  assert.match(workflow, /ditto -c -k --sequesterRsrc --keepParent/);
+  assert.doesNotMatch(workflow, /\.dmg|notarytool|altool|codesign |contents: write|gh release|git push|npm version/);
+  const verification = workflow.indexOf('EXPECT_DMG=0');
+  const artifact = workflow.indexOf('uses: actions/upload-artifact');
+  assert.ok(verification > 0 && artifact > verification);
+  assert.doesNotMatch(workflow, /continue-on-error|if: always\(\)/);
+  assert.match(workflow, /if cargo fmt --check; then exit 0; fi\s+cargo fmt\s+git diff --no-ext-diff -- '\*\.rs'\s+exit 1/);
+});

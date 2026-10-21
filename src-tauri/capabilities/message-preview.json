@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "message-preview",
+  "description": "Least privilege for local standalone and workspace message preview windows.",
+  "windows": ["message-preview-*"],
+  "permissions": [
+    "core:window:allow-set-title",
+    "allow-get-preview-window-target",
+    "allow-get-source-eml-view",
+    "allow-get-standalone-message-view",
+    "allow-save-source-eml-as",
+    "allow-save-standalone-source-message-as",
+    "allow-save-printable-html-as",
+    "allow-reveal-saved-html",
+    "allow-reveal-saved-eml",
+    "allow-export-attachment",
+    "allow-open-attachment",
+    "allow-export-standalone-message-attachment",
+    "allow-open-standalone-message-attachment",
+    "allow-reveal-exported-file-for-workspace",
+    "allow-reveal-standalone-exported-file"
+  ]
+}

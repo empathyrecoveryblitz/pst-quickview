@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PST QuickView support</title><link rel="stylesheet" href="/support/support.css"></head>
+<body>
+<main>
+  <h1>PST QuickView support</h1>
+  <p>View the approved PST QuickView window and use its shared controls. Visible message text may appear during this session.</p>
+  <p class="note">Temporary connection setup uses Pinggy. Pinggy and the Cloudflare/Google route-discovery services can see connection metadata. Shared app content uses the verified direct encrypted connection.</p>
+  <section id="invitation-panel" hidden>
+    <label for="invitation">Paste this complete invitation into Remote Support in the other computer’s PST QuickView app.</label>
+    <input id="invitation" type="text" readonly autocomplete="off" spellcheck="false">
+    <button id="copy">Copy invitation</button>
+    <p class="note">Keep the invitation private. The person receiving support approves the session in the app.</p>
+  </section>
+  <label><input id="consent" type="checkbox">I am ready to view and operate the approved app window.</label>
+  <button id="approve" disabled>Start support</button><button id="stop">Stop support</button>
+  <p id="status" role="status" aria-live="polite">Checking the invitation…</p>
+  <p id="expiry"></p>
+  <section aria-label="Shared app window"><canvas id="view" width="980" height="680" tabindex="0" aria-label="Shared PST QuickView window"></canvas></section>
+  <section id="controls" hidden>
+    <label for="target">Shared control</label><select id="target" aria-label="Shared control"></select>
+    <button id="activate" disabled>Activate selected control</button>
+    <label for="input">Text for selected input</label><input id="input" type="text" autocomplete="off" maxlength="2000">
+    <button id="send-input" disabled>Send text to selected input</button>
+    <button id="scroll-up" disabled>Scroll up</button><button id="scroll-down" disabled>Scroll down</button>
+    <p class="note">Only controls shared by the app can be operated. Each click, text change, and scroll is sent when you request it.</p>
+  </section>
+  <p class="note">Support ends when either side stops, closes its support window, disconnects, or the invitation expires. Desktop and system dialogs are outside this view.</p>
+</main>
+<script type="module" src="/support/controller.js"></script>
+</body></html>
