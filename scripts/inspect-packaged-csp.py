@@ -334,7 +334,7 @@ def inspect_slice(binary, architecture, literals, adjacency_catalog):
                 "recognizedPrefix": _prefix(binary, start, architecture),
                 **({"adjacency": {"before": _adjacency(binary, start, True, adjacency_catalog),
                                   "after": _adjacency(binary, start + len(literal), False, adjacency_catalog)}}
-                   if label in ("support_fallback", "support_connect_template") else {}),
+                   if label in ("production", "support_fallback", "support_connect_template") else {}),
             } for start in locations[:MAX_LOCATIONS]],
         }
     spellings = Counter()

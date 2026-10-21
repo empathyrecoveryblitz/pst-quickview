@@ -111,6 +111,50 @@ test("adjacent complete source literals are fingerprinted longest-first without 
   assert.equal(output.includes(after), false);
 });
 
+test("production policy neighbors are source-fingerprinted without approving an unknown packed prefix", () => {
+  const neighbor = "SYNTHETIC_PRODUCTION_PACKED_NEIGHBOR";
+  const changed = baseline.replace(`${production}\0`, `${neighbor}${production}\0`);
+  const { report, output, status } = inspect(changed, {
+    operation: "main",
+    adjacencySources: { "other.rs": `const NEIGHBOR: &str = "${neighbor}";` },
+  });
+  const slice = report.slices[0];
+  const location = slice.sourceLiteralObservations.production.locations[0];
+  assert.equal(status, 1);
+  assert.equal(slice.existingVerifier.passed, false);
+  assert.equal(slice.existingVerifier.failureCategory, "policy_prefix");
+  assert.equal(location.before, "printable");
+  assert.equal(location.after, "nul");
+  assert.equal(location.recognizedPrefix, "none");
+  assert.equal(location.adjacency.before.classification, "source_literal_match");
+  assert.deepEqual(location.adjacency.before.matches[0], {
+    sha256: sha256(neighbor), byteLength: neighbor.length, kinds: ["rust_string"],
+  });
+  assert.equal(location.adjacency.before.contextByteLength, 32);
+  assert.equal(location.adjacency.before.contextSha256, sha256(neighbor.slice(-32)));
+  assert.equal(output.includes(neighbor), false);
+  assert.equal(output.includes("other.rs"), false);
+  assert.equal(output.includes(production), false);
+});
+
+test("unclassified production policy neighbors expose only bounded hashes and retain extension rejection", () => {
+  const before = "SYNTHETIC_UNCLASSIFIED_PRODUCTION_BEFORE~".repeat(3);
+  const after = "~SYNTHETIC_UNCLASSIFIED_PRODUCTION_AFTER".repeat(3);
+  const changed = baseline.replace(`${production}\0`, `${before}${production}${after}\0`);
+  const { report, output } = inspect(changed);
+  const adjacency = report.sourceLiteralObservations.production.locations[0].adjacency;
+  for (const side of Object.values(adjacency)) {
+    assert.equal(side.classification, "unclassified");
+    assert.deepEqual(side.matches, []);
+    assert.equal(side.contextByteLength, 32);
+  }
+  assert.equal(adjacency.before.contextSha256, sha256(before.slice(-32)));
+  assert.equal(adjacency.after.contextSha256, sha256(after.slice(0, 32)));
+  assert.equal(report.existingVerifier.passed, false);
+  assert.equal(output.includes("SYNTHETIC_UNCLASSIFIED_PRODUCTION"), false);
+  assert.equal(inspect(baseline.replace(`${production}\0`, `${production}; script-src https:\0`)).report.existingVerifier.passed, false);
+});
+
 test("changed or arbitrary adjacency stays unclassified with only bounded context fingerprints", () => {
   const before = "SYNTHETIC_UNCLASSIFIED~".repeat(3);
   const after = "~SYNTHETIC_UNCLASSIFIED".repeat(3);

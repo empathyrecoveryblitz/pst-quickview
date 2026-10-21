@@ -83,3 +83,11 @@ jobs:
             ${{ runner.temp }}/PST-QuickView.app.tar.gz
           if-no-files-found: error
           retention-days: 3
+      - name: Retain current executable for failed security-gate diagnosis only
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: support-security-diagnostic-not-for-distribution
+          path: src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app/Contents/MacOS/pst-quickview
+          if-no-files-found: ignore
+          retention-days: 1

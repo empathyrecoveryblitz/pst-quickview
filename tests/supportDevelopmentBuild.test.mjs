@@ -37,3 +37,12 @@ test('development workflow is Mac app-only, unsigned, and has no release or tag 
   assert.match(workflow, /\|\| diagnostic_status=\$\?/);
   assert.match(workflow, /if \(\(package_status != 0 \|\| diagnostic_status != 0\)\); then exit 1; fi/);
 });
+
+test('failed security gates retain only the current executable as clearly labelled diagnostics', () => {
+  const diagnostic = workflow.slice(workflow.indexOf('- name: Retain current executable'));
+  assert.match(diagnostic, /if: \$\{\{ failure\(\) \}\}/);
+  assert.match(diagnostic, /name: support-security-diagnostic-not-for-distribution/);
+  assert.match(diagnostic, /path: src-tauri\/target\/universal-apple-darwin\/release\/bundle\/macos\/PST QuickView\.app\/Contents\/MacOS\/pst-quickview/);
+  assert.match(diagnostic, /retention-days: 1/);
+  assert.doesNotMatch(diagnostic, /\.app\.tar\.gz|\.zip|operator\.json|signing\.key/);
+});
