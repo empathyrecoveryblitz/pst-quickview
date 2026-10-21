@@ -56,6 +56,7 @@ mod search_stress;
 mod sqlite_security;
 mod support_session;
 mod threading;
+mod update_bundle;
 mod updater;
 
 use calendar_msg::CalendarItemDetails;
@@ -20580,6 +20581,58 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("temporary test directory should be created");
         directory
+    }
+
+    #[test]
+    fn update_preflight_preserves_embedded_sources_accepted_by_existing_validators() {
+        let root = temporary_test_directory("synthetic-update-source-preservation");
+        let bundle = root.join("Synthetic.app");
+        let executable = bundle.join("Contents/MacOS/synthetic");
+        let resources = bundle.join("Contents/Resources");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(&executable, b"synthetic executable").unwrap();
+        let sources = [
+            resources.join("synthetic.pst"),
+            resources.join("synthetic.eml"),
+            resources.join("synthetic.msg"),
+        ];
+        fs::write(&sources[0], b"!BDNsynthetic").unwrap();
+        fs::write(
+            &sources[1],
+            b"Content-Type: text/plain\r\n\r\nSynthetic\r\n",
+        )
+        .unwrap();
+        fs::write(&sources[2], b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1synthetic").unwrap();
+        assert!(canonical_pst_path(&sources[0]).is_ok());
+        for source in &sources[1..] {
+            assert!(
+                canonical_standalone_message_path(source.to_string_lossy().into_owned()).is_ok()
+            );
+        }
+        let workspace = resources.join(NEXT_TO_PST_WORKSPACE_DIR).join("synthetic");
+        fs::create_dir_all(&workspace).unwrap();
+        let marker = workspace.join(WORKSPACE_MARKER_FILE);
+        let index = workspace.join("index.sqlite");
+        fs::write(&marker, b"synthetic marker").unwrap();
+        fs::write(&index, b"synthetic canonical index").unwrap();
+        let protected = sources
+            .iter()
+            .cloned()
+            .chain([marker, index])
+            .collect::<Vec<_>>();
+        let identity = |path: &PathBuf| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                sha256_file(path).unwrap(),
+                metadata.len(),
+                metadata.modified().unwrap(),
+            )
+        };
+        let before = protected.iter().map(identity).collect::<Vec<_>>();
+        assert!(crate::update_bundle::preflight(&executable).is_err());
+        assert_eq!(before, protected.iter().map(identity).collect::<Vec<_>>());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn synthetic_runtime_profile(root: &Path) -> RuntimeProfile {

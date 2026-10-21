@@ -326,10 +326,14 @@ test('registration finishing after Stop gets a second bounded removal and never 
 const plain = value => JSON.parse(JSON.stringify(value));
 const deferred = () => { let resolve; const promise = new Promise(value => { resolve = value; }); return { promise, resolve }; };
 async function until(predicate) {
-  for (let index = 0; index < 500; index++) {
+  // Real WebCrypto uses an asynchronous worker pool. Counting immediate turns
+  // can exhaust the budget in milliseconds under the full parallel test run.
+  // Use a bounded monotonic deadline without changing any production timer.
+  const deadline = performance.now() + 5000;
+  do {
     if (await predicate()) return;
-    await new Promise(resolve => setImmediate(resolve));
-  }
+    await new Promise(resolve => setTimeout(resolve, 1));
+  } while (performance.now() < deadline);
   assert.fail('Synthetic session did not reach the expected categorical state');
 }
 class UpdateQueueStorage {

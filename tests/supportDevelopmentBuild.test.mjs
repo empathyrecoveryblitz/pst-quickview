@@ -21,6 +21,8 @@ test('development workflow is Mac app-only, unsigned, and has no release or tag 
   assert.match(workflow, /cargo test --locked --manifest-path scripts\/support-update-verifier\/Cargo.toml/);
   assert.match(workflow, /cargo clippy --locked --manifest-path scripts\/support-update-verifier\/Cargo.toml --all-targets -- -D warnings/);
   assert.match(workflow, /EXPECT_DMG=0 bash scripts\/verify-macos-release.sh/);
+  assert.match(workflow, /rustc --edition=2021 scripts\/verify-update-bundle.rs/);
+  assert.match(workflow, /pst-update-bundle-check.*PST QuickView\.app\/Contents\/MacOS\/pst-quickview/);
   assert.match(workflow, /ditto -c -k --sequesterRsrc --keepParent/);
   assert.match(workflow, /COPYFILE_DISABLE=1 tar -czf/);
   assert.doesNotMatch(workflow, /\.dmg|notarytool|altool|codesign |contents: write|gh release|git push|npm version/);

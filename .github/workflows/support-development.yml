@@ -63,6 +63,8 @@ jobs:
         run: npm run tauri -- build --target universal-apple-darwin --bundles app --no-sign --ci
       - name: Inspect the exact current app; no stale-build fallback
         run: |
+          rustc --edition=2021 scripts/verify-update-bundle.rs -o "$RUNNER_TEMP/pst-update-bundle-check"
+          "$RUNNER_TEMP/pst-update-bundle-check" "$GITHUB_WORKSPACE/src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app/Contents/MacOS/pst-quickview"
           package_status=0
           EXPECT_DMG=0 bash scripts/verify-macos-release.sh "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app" || package_status=$?
           diagnostic_status=0

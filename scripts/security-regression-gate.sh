@@ -43,6 +43,7 @@ run_frontend_security_tests() {
     tests/supportClockSkew.test.mjs \
     tests/supportRuntimeNotices.test.mjs \
     tests/supportDevelopmentBuild.test.mjs \
+    tests/supportUpdateBundle.test.mjs \
     tests/supportView.test.mjs \
     tests/searchCancellation.test.mjs \
     tests/searchHighlight.test.mjs \

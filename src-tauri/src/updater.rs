@@ -1030,6 +1030,11 @@ pub(crate) async fn approve_verified_update(
             if state.revocation_epoch.load(Ordering::SeqCst) != generation { return Err(fail()); }
             if resume { prepare_handoff(&app, &pending, generation)?; wait_for_handoff(app.clone(), generation).await?; }
             else { crate::support_session::stop_for_update_failure(&app, None); }
+            // The installer replaces this fixed bundle, so user mail/workspaces
+            // accidentally stored inside it must block replacement altogether.
+            let install_executable = tauri::process::current_binary(&app.env()).map_err(|_| fail())?;
+            crate::update_bundle::preflight(&install_executable).map_err(|_| FAILED.to_string())?;
+            if resume && state.revocation_epoch.load(Ordering::SeqCst) != generation { return Err(fail()); }
             // Installation re-verifies the same immutable bytes and announced signed version.
             pending.update.install(&pending.bytes).map_err(|_| FAILED.to_string())?;
             if resume {

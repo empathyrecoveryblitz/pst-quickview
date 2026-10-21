@@ -34,6 +34,7 @@ test("security gate covers each hardened boundary without private fixtures", () 
     "supportClockSkew.test.mjs",
     "supportRuntimeNotices.test.mjs",
     "supportDevelopmentBuild.test.mjs",
+    "supportUpdateBundle.test.mjs",
     "supportView.test.mjs",
     "searchCancellation.test.mjs",
     "searchHighlight.test.mjs",
