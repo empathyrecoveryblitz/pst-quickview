@@ -262,9 +262,9 @@ fn allowed_queue_origin(value: &str) -> bool {
                 && label.len() <= 63
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-                && label.bytes().all(|byte| {
-                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                })
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         })
 }
 
@@ -573,8 +573,7 @@ fn support_csp_for_service(
     origin: &str,
     pinned_origin: Option<&str>,
 ) -> Option<String> {
-    if !(allowed_origin(origin)
-        || (allowed_queue_origin(origin) && pinned_origin == Some(origin)))
+    if !(allowed_origin(origin) || (allowed_queue_origin(origin) && pinned_origin == Some(origin)))
     {
         return None;
     }
@@ -979,10 +978,15 @@ mod tests {
         let valid = queue_service();
         assert!(parse_service_config(&valid.to_string()).is_ok());
         for origin in [
-            "", "http://synthetic.synthetic.workers.dev", "https://synthetic.workers.dev",
-            "https://nested.synthetic.synthetic.workers.dev", "https://synthetic.synthetic.workers.dev/",
-            "https://synthetic.synthetic.workers.dev:443", "https://user@synthetic.synthetic.workers.dev",
-            "https://synthetic.synthetic.workers.dev.invalid", "https://synthetic.synthetic.workers.dev; connect-src *",
+            "",
+            "http://synthetic.synthetic.workers.dev",
+            "https://synthetic.workers.dev",
+            "https://nested.synthetic.synthetic.workers.dev",
+            "https://synthetic.synthetic.workers.dev/",
+            "https://synthetic.synthetic.workers.dev:443",
+            "https://user@synthetic.synthetic.workers.dev",
+            "https://synthetic.synthetic.workers.dev.invalid",
+            "https://synthetic.synthetic.workers.dev; connect-src *",
         ] {
             let mut invalid = valid.clone();
             invalid["origin"] = origin.into();
@@ -997,12 +1001,16 @@ mod tests {
         invalid["operatorPublicKey"] = "".into();
         assert!(parse_service_config(&invalid.to_string()).is_err());
         invalid = valid.clone();
-        invalid["operatorPublicKey"] = format!("{}=", valid["operatorPublicKey"].as_str().unwrap()).into();
+        invalid["operatorPublicKey"] =
+            format!("{}=", valid["operatorPublicKey"].as_str().unwrap()).into();
         assert!(parse_service_config(&invalid.to_string()).is_err());
         invalid = valid;
         invalid["unexpected"] = true.into();
         assert!(parse_service_config(&invalid.to_string()).is_err());
-        assert!(parse_service_config(r#"{"v":3,"origin":"","operatorPublicKey":"","operatorLabel":"PST QuickView support"}"#).is_err());
+        assert!(parse_service_config(
+            r#"{"v":3,"origin":"","operatorPublicKey":"","operatorLabel":"PST QuickView support"}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -1010,10 +1018,17 @@ mod tests {
         let baseline = "default-src 'none'; script-src 'self' 'nonce-generated'; connect-src ipc: http://ipc.localhost; object-src 'none'";
         let origin = "https://synthetic.synthetic.workers.dev";
         assert!(support_csp_for_service(baseline, origin, None).is_none());
-        assert!(support_csp_for_service(baseline, origin, Some("https://other.synthetic.workers.dev")).is_none());
+        assert!(support_csp_for_service(
+            baseline,
+            origin,
+            Some("https://other.synthetic.workers.dev")
+        )
+        .is_none());
         let csp = support_csp_for_service(baseline, origin, Some(origin)).unwrap();
         assert!(csp.contains("script-src 'self' 'nonce-generated'"));
-        assert!(csp.contains("connect-src ipc: http://ipc.localhost https://synthetic.synthetic.workers.dev"));
+        assert!(csp.contains(
+            "connect-src ipc: http://ipc.localhost https://synthetic.synthetic.workers.dev"
+        ));
         assert!(!csp.contains("*.workers.dev"));
     }
 
@@ -1047,7 +1062,10 @@ mod tests {
 
     #[test]
     fn queue_revocation_event_is_fixed_local_code_without_session_data() {
-        assert_eq!(REVOKE_EVENT, "window.dispatchEvent(new Event('pqv-support-revoked'))");
+        assert_eq!(
+            REVOKE_EVENT,
+            "window.dispatchEvent(new Event('pqv-support-revoked'))"
+        );
         assert!(!REVOKE_EVENT.contains("fetch"));
         assert!(!REVOKE_EVENT.contains("token"));
     }
