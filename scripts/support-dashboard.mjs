@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { publicIPv4 } from '../public/support/protocol.js';
-import { createClaim, verifyClaim, validateServiceConfig } from '../public/support/queue-protocol.js';
+import { createClaim, verifyClaim, validateServiceConfig, validateRequest, validateUpdateHandoff, canonicalUpdateHandoff, resumedGuestProof, resumedClaimProof, verifyUpdateProof } from '../public/support/queue-protocol.js';
 
 const DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const ID = /^[a-f0-9]{32}$/;
@@ -71,9 +71,9 @@ function queueRows(value, now) {
   if (!exact(value, ['requests']) || !Array.isArray(value.requests) || value.requests.length > 64) throw new Error('service_unavailable');
   const ids = new Set();
   return value.requests.map(row => {
-    if (!exact(row, ['v', 'id', 'guestPublicKey', 'expires', 'status']) || row.v !== 3 || !ID.test(row.id)
-      || ids.has(row.id) || !validPublicKey(row.guestPublicKey) || !['waiting', 'claimed'].includes(row.status)
-      || !Number.isSafeInteger(row.expires) || row.expires > now + 30 * 60 * 1000) throw new Error('service_unavailable');
+    validateRequest(row);
+    if (ids.has(row.id) || !['waiting', 'claimed', 'updating', 'resuming'].includes(row.status)
+      || row.expires > now + 30 * 60 * 1000) throw new Error('service_unavailable');
     ids.add(row.id); return { ...row };
   }).filter(row => row.expires > now);
 }
@@ -96,10 +96,32 @@ export async function createOperatorDashboard({ service: rawService, adminToken,
   }), maximum);
   const stopRecord = async record => {
     if (!record) return;
-    try { await fetchJson(`/v3/requests/${record.id}/stop`, record.token, 'POST', {}); } catch { /* The remote lease expires independently. */ }
+    try {
+      if (record.phase === 'updating' && record.handoff) await fetchJson(`/v3/admin/requests/${record.id}/handoff/stop`, adminToken, 'POST', { nonce: record.handoff.nonce });
+      else await fetchJson(`/v3/requests/${record.id}/stop`, record.token, 'POST', {});
+    } catch {
+      // The customer can begin its handoff just before local Stop. Discover only
+      // that exact old SID's pending nonce; never revoke a later fresh claim.
+      try {
+        const row = (await queue()).find(row => row.id === record.id && ['updating', 'resuming'].includes(row.status));
+        if (row && matchesHandoff(record, row.handoff)) await fetchJson(`/v3/admin/requests/${record.id}/handoff/stop`, adminToken, 'POST', { nonce: row.handoff.nonce });
+      } catch { /* The remote lease expires independently. */ }
+    }
   };
-  const clearActive = async (expected = active) => { if (active !== expected) return; const old = active; active = null; await stopRecord(old); };
+  const clearActive = async (expected = active) => {
+    if (active !== expected) return;
+    const old = active; active = null;
+    if (old?.grant) old.grant.resumeAuth = '';
+    if (old) old.grant = undefined;
+    await stopRecord(old);
+  };
   const queue = async () => queueRows(await fetchJson('/v3/admin/queue', adminToken), now());
+  const matchesHandoff = (record, handoff) => handoff.parentId === record.id && handoff.parentSid === record.sid && handoff.originalExpires === record.expires;
+  const sameHandoff = (left, right) => canonicalUpdateHandoff(left) === canonicalUpdateHandoff(right);
+  const acceptsRow = (record, row) => row && row.expires === record.expires && (row.status === 'claimed'
+    ? record.phase !== 'updating' && row.guestPublicKey === record.guestPublicKey
+    : ['updating', 'resuming'].includes(row.status) && matchesHandoff(record, row.handoff)
+      && (!record.grant || sameHandoff(record.grant.handoff, row.handoff)));
   const reply = (response, code, body, type = 'application/json; charset=utf-8') => {
     if (response.destroyed) return;
     response.writeHead(code, {
@@ -139,41 +161,79 @@ export async function createOperatorDashboard({ service: rawService, adminToken,
     if (!validOrigin || !authenticated(request)) { reply(response, 403, { error: 'unavailable' }); return; }
     const beganActive = active;
     try {
+      if (active?.grant && (now() >= active.grant.handoff.resumeDeadline || now() - active.lastSeen >= 30000)) await clearActive(active);
       if (request.method === 'GET' && url.pathname === '/api/service') { reply(response, 200, { service }); return; }
       if (request.method === 'GET' && url.pathname === '/api/queue') {
         const requests = await queue();
-        if (active && active === beganActive && (!requests.some(row => row.id === active.id && row.status === 'claimed') || active.expires <= now())) await clearActive(beganActive);
+        if (active && active === beganActive && (!requests.some(row => row.id === active.id && acceptsRow(active, row)) || active.expires <= now())) await clearActive(beganActive);
         reply(response, 200, { requests, activeId: active?.id ?? null }); return;
       }
-      if (request.method === 'POST' && url.pathname === '/api/claim') {
+      if (request.method === 'POST' && url.pathname === '/api/handoff') {
         const input = await bodyJson(request);
-        if (!exact(input, ['id', 'helperPublicKey']) || !ID.test(input.id) || !validPublicKey(input.helperPublicKey)) { reply(response, 400, { error: 'invalid_request' }); return; }
-        if (active || claiming) { reply(response, 409, { error: 'one_active_session' }); return; }
+        if (!exact(input, ['id', 'handoff', 'resumeAuth']) || !ID.test(input.id) || !TOKEN.test(input.resumeAuth)) { reply(response, 400, { error: 'invalid_request' }); return; }
+        const handoff = validateUpdateHandoff(input.handoff), record = active;
+        if (!record || record !== beganActive || record.id !== input.id || record.phase === 'updating' || record.grant || !matchesHandoff(record, handoff)) { reply(response, 409, { error: 'request_unavailable' }); return; }
+        const row = (await queue()).find(row => row.id === input.id);
+        if (active !== record || !row || row.status !== 'updating' || !sameHandoff(row.handoff, handoff)) { reply(response, 409, { error: 'request_unavailable' }); return; }
+        active = { ...record, phase: 'updating', handoff, grant: { handoff, resumeAuth: input.resumeAuth }, lastSeen: now() };
+        reply(response, 200, { accepted: true }); return;
+      }
+      if (request.method === 'POST' && ['/api/claim', '/api/resume'].includes(url.pathname)) {
+        const input = await bodyJson(request);
+        const resuming = url.pathname === '/api/resume', old = active;
+        if (!exact(input, resuming ? ['id', 'helperPublicKey', 'resumeAuth'] : ['id', 'helperPublicKey']) || !ID.test(input.id) || !validPublicKey(input.helperPublicKey)
+          || (resuming && !TOKEN.test(input.resumeAuth))) { reply(response, 400, { error: 'invalid_request' }); return; }
+        if (claiming || (resuming ? !old?.grant || old.id !== input.id || old.phase !== 'updating' : !!active)) { reply(response, 409, { error: 'one_active_session' }); return; }
+        if (resuming && !verifyUpdateProof(old.grant.resumeAuth, input.resumeAuth)) { reply(response, 409, { error: 'request_unavailable' }); return; }
         claiming = true; pendingId = input.id; cancelledClaim = false;
         try {
-          const row = (await queue()).find(row => row.id === input.id && row.status === 'waiting');
+          const row = (await queue()).find(row => row.id === input.id && row.status === (resuming ? 'resuming' : 'waiting'));
           if (!row) { reply(response, 409, { error: 'request_unavailable' }); return; }
+          if (resuming) {
+            if (active !== old || !old.grant || !sameHandoff(old.grant.handoff, row.handoff)
+              || row.guestPublicKey === old.guestPublicKey || input.helperPublicKey === old.helperPublicKey
+              || !verifyUpdateProof(await resumedGuestProof(old.grant.resumeAuth, old.grant.handoff, row.guestPublicKey, row.guestTokenSha256), row.resumeGuestProof)) throw new Error('resume_unverified');
+          }
           const route = await readJson(await fetchImpl('https://am.i.mullvad.net/json', { redirect: 'error', cache: 'no-store', signal: AbortSignal.timeout(6000) }), 8192);
           if (route.mullvad_exit_ip !== true || !publicIPv4(route.ip)) throw new Error('vpn_not_verified');
           const claim = await createClaim(row, input.helperPublicKey, route.ip, operatorSigningKey);
+          if (resuming) {
+            if (active !== old || cancelledClaim || !old.grant) { reply(response, 409, { error: 'request_unavailable' }); return; }
+            claim.resumeProof = await resumedClaimProof(old.grant.resumeAuth, old.grant.handoff, claim);
+          }
           const result = await fetchJson(`/v3/admin/requests/${input.id}/claim`, adminToken, 'POST', claim, 8192);
           if (!exact(result, ['token', 'claim']) || !TOKEN.test(result.token)) throw new Error('service_unavailable');
           const verified = await verifyClaim(result.claim, service);
           if (JSON.stringify(verified) !== JSON.stringify(claim)) throw new Error('service_unavailable');
           if (closing || cancelledClaim || response.destroyed) { await stopRecord({ id: row.id, token: result.token }); reply(response, 409, { error: 'request_unavailable' }); return; }
-          active = { id: row.id, token: result.token, expires: claim.payload.expires };
+          active = { id: row.id, token: result.token, expires: claim.payload.expires, sid: claim.payload.sid, guestPublicKey: row.guestPublicKey,
+            helperPublicKey: claim.payload.helperPublicKey, phase: 'claimed', ...(resuming ? { grant: old.grant, lastSeen: now() } : {}) };
+          if (resuming) old.grant = undefined;
           reply(response, 200, result); return;
         } finally { claiming = false; pendingId = null; cancelledClaim = false; }
       }
-      if (request.method === 'POST' && ['/api/heartbeat', '/api/stop'].includes(url.pathname)) {
+      if (request.method === 'POST' && ['/api/heartbeat', '/api/stop', '/api/resumed'].includes(url.pathname)) {
         const input = await bodyJson(request);
         if (!exact(input, ['id']) || !ID.test(input.id)) { reply(response, 400, { error: 'invalid_request' }); return; }
-        if (url.pathname === '/api/stop' && pendingId === input.id) { cancelledClaim = true; reply(response, 200, { stopped: true }); return; }
+        if (url.pathname === '/api/stop' && pendingId === input.id) { cancelledClaim = true; await clearActive(); reply(response, 200, { stopped: true }); return; }
         if (!active || active.id !== input.id) { reply(response, 409, { error: 'request_unavailable' }); return; }
         if (url.pathname === '/api/stop') { await clearActive(); reply(response, 200, { stopped: true }); return; }
+        if (url.pathname === '/api/resumed') {
+          if (active.phase !== 'claimed' || !active.grant) { reply(response, 409, { error: 'request_unavailable' }); return; }
+          active.grant.resumeAuth = ''; active.grant = undefined; reply(response, 200, { accepted: true }); return;
+        }
         if (active.expires <= now()) throw new Error('session_expired');
         const record = active;
-        await fetchJson(`/v3/requests/${record.id}/heartbeat`, record.token, 'POST', {});
+        const row = (await queue()).find(row => row.id === record.id);
+        if (!acceptsRow(record, row)) throw new Error('resume_unverified');
+        try {
+          if (row.status === 'updating') await fetchJson(`/v3/requests/${record.id}/handoff/heartbeat`, record.token, 'POST', { nonce: row.handoff.nonce });
+          else if (row.status === 'claimed') await fetchJson(`/v3/requests/${record.id}/heartbeat`, record.token, 'POST', {});
+        } catch (error) {
+          const latest = (await queue()).find(row => row.id === record.id);
+          if (!record.grant || latest?.status !== 'resuming' || !acceptsRow(record, latest)) throw error;
+        }
+        if (record.grant) record.lastSeen = now();
         if (active !== record) { reply(response, 409, { error: 'request_unavailable' }); return; }
         reply(response, 200, { active: true }); return;
       }
@@ -185,6 +245,11 @@ export async function createOperatorDashboard({ service: rawService, adminToken,
     }
   });
   server.requestTimeout = 8000; server.headersTimeout = 8000; server.keepAliveTimeout = 1000;
+  const grantWatchdog = setInterval(() => {
+    const record = active;
+    if (record?.grant && (now() >= record.grant.handoff.resumeDeadline || now() - record.lastSeen >= 30000)) void clearActive(record);
+  }, 1000);
+  grantWatchdog.unref();
   server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   origin = `http://127.0.0.1:${server.address().port}`;
@@ -192,7 +257,7 @@ export async function createOperatorDashboard({ service: rawService, adminToken,
     origin, capability,
     async close() {
       if (closing) return;
-      closing = true; cancelledClaim = true; await clearActive();
+      closing = true; cancelledClaim = true; clearInterval(grantWatchdog); await clearActive();
       await new Promise(resolve => { server.close(resolve); for (const socket of sockets) socket.destroy(); });
       onStop();
     },

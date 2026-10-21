@@ -30,7 +30,10 @@ SUPPORT_FALLBACK_CSP = (
 SUPPORT_CONNECT_PREFIX = b"connect-src ipc: http://ipc.localhost "
 SUPPORT_FALLBACK_BEFORE = b"Content-Security-Policy"
 SUPPORT_FALLBACK_AFTER = b"Cache-Control"
-SUPPORT_CONNECT_BEFORE = {"x86_64": b"\x00", "arm64": b"tauri"}
+# Exact observed linker layouts: the arm64 fragment was previously coalesced
+# after the source literal "tauri" and is now also emitted after a NUL boundary.
+# No arbitrary printable prefix is accepted.
+SUPPORT_CONNECT_BEFORE = {"x86_64": (b"\x00",), "arm64": (b"tauri", b"\x00")}
 SUPPORT_CONNECT_AFTER = b"; "
 CONNECT_TOKEN_PATTERN = re.compile(rb"connect-src", re.IGNORECASE)
 CSP_HEADER = b"Content-Security-Policy"
@@ -143,7 +146,7 @@ def verify_slice(
 
     inventory_ranges = list(policy_ranges)
     for literal, before, after in (
-        (SUPPORT_FALLBACK_CSP, SUPPORT_FALLBACK_BEFORE, SUPPORT_FALLBACK_AFTER),
+        (SUPPORT_FALLBACK_CSP, (SUPPORT_FALLBACK_BEFORE,), SUPPORT_FALLBACK_AFTER),
         (SUPPORT_CONNECT_PREFIX, SUPPORT_CONNECT_BEFORE[arch], SUPPORT_CONNECT_AFTER),
     ):
         if binary.count(literal) != 1:
@@ -152,7 +155,7 @@ def verify_slice(
             )
         start = binary.index(literal)
         end = start + len(literal)
-        if not binary.endswith(before, 0, start) or not binary.startswith(after, end):
+        if not any(binary.endswith(prefix, 0, start) for prefix in before) or not binary.startswith(after, end):
             raise VerificationError(
                 f"packaged {arch} executable changes reviewed support literal adjacency"
             )

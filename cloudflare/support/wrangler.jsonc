@@ -8,8 +8,15 @@
   "send_metrics": false,
   "logpush": false,
   "observability": { "enabled": false, "logs": { "enabled": false, "invocation_logs": false } },
+  "assets": {
+    "directory": "./update-assets",
+    "binding": "ASSETS",
+    "run_worker_first": ["/v3/*"],
+    "html_handling": "none",
+    "not_found_handling": "none"
+  },
   "vars": {
-    "SERVICE_ORIGIN": "https://pst-quickview-support.developerbilling001.workers.dev",
+    "SERVICE_ORIGIN": "https://pst-quickview-support.pstquickview.workers.dev",
     "OPERATOR_PUBLIC_KEY": "BPKMEzAJ-It88NPDGmSboV9lVIkFPW7w8P4WaF_yZc4IITHpcK8uU3HXsKEMTQh8dWMAuTnshagVc3XxA-5DmLs",
     "OPERATOR_LABEL": "PST QuickView support"
   },

@@ -1,0 +1,9 @@
+/updates/development.json
+  Cache-Control: no-store
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+
+/updates/artifacts/*
+  Cache-Control: public, max-age=31536000, immutable, no-transform
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer

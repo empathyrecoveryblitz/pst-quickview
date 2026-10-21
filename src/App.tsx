@@ -15,6 +15,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { RemoteSupportPanel } from "./RemoteSupportPanel";
 import { RemoteSupportControl } from "./RemoteSupportControl";
+import { DevelopmentUpdatePanel } from "./DevelopmentUpdatePanel";
 import type {
   AppDiagnostics,
   Attachment,
@@ -10453,6 +10454,7 @@ function App() {
             </button>
           </header>
           <RemoteSupportPanel onApproved={finishSupportApproval} />
+          <DevelopmentUpdatePanel />
           <dl className="about-details">
             <div>
               <dt>Version</dt>

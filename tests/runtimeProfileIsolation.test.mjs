@@ -175,12 +175,12 @@ test("next-to-PST and Local Trash remain workspace-local", () => {
   assert.doesNotMatch(localTrash, /Application Support|app_data_dir|app_log_dir/);
 });
 
-test("runtime-profile fix preserves beta.3 version and source contracts", () => {
-  assert.equal(packageJson.version, "0.2.0-beta.3");
-  assert.equal(tauriConfig.version, "0.2.0-beta.3");
+test("runtime-profile isolation preserves the approved development version and source contracts", () => {
+  assert.equal(packageJson.version, "0.2.0-beta.3.support.1");
+  assert.equal(tauriConfig.version, "0.2.0-beta.3.support.1");
   assert.equal(tauriConfig.identifier, "com.local.pstquickview");
   assert.equal(tauriConfig.productName, "PST QuickView");
-  assert.match(cargoToml, /^version = "0\.2\.0-beta\.3"$/m);
+  assert.match(cargoToml, /^version = "0\.2\.0-beta\.3\.support\.1"$/m);
   assert.doesNotMatch(profileImplementation, /["'][^"']*\.(?:pst|eml|msg)["']/);
   assert.doesNotMatch(profileImplementation, /fs::(?:remove_file|remove_dir|rename)\s*\(/);
 });

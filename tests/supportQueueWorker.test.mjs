@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import worker, { SupportQueue, QUEUE_LIMITS } from '../cloudflare/support/worker.mjs';
 import { createRequest, createEphemeralKeyPair, createClaim, deriveClaimConfig, encodeQueueBytes } from '../public/support/queue-protocol.js';
 import { createCipher } from '../public/support/protocol.js';
+import * as updates from '../public/support/queue-protocol.js';
 
 class FakeStorage {
   constructor() { this.data = new Map(); this.alarmAt = null; }
@@ -49,7 +50,7 @@ async function setup(options = {}) {
     const helperConfig = await deriveClaimConfig(claim.payload, claim.signature, helper.privateKey, 'controller', response.body.token, service.origin);
     return { helper, claim, token: response.body.token, guestCipher: await createCipher(guestConfig), helperCipher: await createCipher(helperConfig) };
   };
-  return { service, env, operator, storage, queue, send, register, claim, advance: value => { now += value; } };
+  return { service, env, operator, storage, queue, send, register, claim, now: () => now, advance: value => { now += value; } };
 }
 
 test('unconfigured Worker fails closed and configured routing uses one named Durable Object', async () => {
@@ -254,4 +255,146 @@ test('a held heartbeat body cannot block authenticated Stop for that same role',
     assert.equal(f.queue.receiving.control, 1);
   } finally { try { stream.close(); } catch {} await pending; }
   assert.equal(f.queue.readerKeys.size, 0);
+});
+
+test('update handoff freezes old setup then rotates both roles and admits only a fresh claim', async () => {
+  const f = await setup(), guest = await f.register(), selected = await f.claim(guest), path = `/v3/requests/${guest.request.id}`;
+  const base = { v: 1, parentId: guest.request.id, parentSid: selected.claim.payload.sid, nonce: '1'.repeat(32), targetVersion: '0.2.0-beta.4',
+    artifactSha256: '2'.repeat(64), nativeSessionId: '3'.repeat(32), originalExpires: guest.request.expires, resumeDeadline: Date.now() + 60000 };
+  assert.equal((await f.send(path + '/send', { method: 'POST', token: guest.request.token, body: await selected.guestCipher.seal('approved', null) })).status, 200);
+  const armed = await f.send(path + '/handoff', { method: 'POST', token: guest.request.token, body: base });
+  assert.equal(armed.status, 200); assert.match(armed.body.resumeTicket, /^[a-f0-9]{64}$/);
+  assert.equal(armed.body.handoff.resumeTicketSha256, await updates.queueTokenSha256(armed.body.resumeTicket));
+  assert.equal((await f.storage.list({ prefix: 'message:' })).size, 0);
+  assert.equal((await f.send(path + '/stop', { method: 'POST', token: selected.token, body: {} })).status, 409);
+  assert.equal((await f.send(path + '/poll?after=0', { token: selected.token })).status, 409);
+  assert.equal((await f.send(path + '/handoff/heartbeat', { method: 'POST', token: selected.token, body: { nonce: base.nonce } })).status, 200);
+  const next = await updates.createResumedRequest(armed.body.handoff), secret = '4'.repeat(64);
+  const guestTokenSha256 = await updates.queueTokenSha256(next.request.token);
+  const proof = await updates.resumedGuestProof(secret, armed.body.handoff, next.request.guestPublicKey, guestTokenSha256);
+  const resume = { v: 1, nonce: base.nonce, targetVersion: base.targetVersion, artifactSha256: base.artifactSha256,
+    guestPublicKey: next.request.guestPublicKey, token: next.request.token, proof };
+  assert.equal((await f.send(path + '/resume', { method: 'POST', token: armed.body.resumeTicket, body: resume })).status, 200);
+  assert.equal((await f.send(path + '/resume', { method: 'POST', token: armed.body.resumeTicket, body: resume })).status, 409);
+  for (const token of [guest.request.token, selected.token]) assert.equal((await f.send(path + '/stop', { method: 'POST', token, body: {} })).status, 401);
+  const row = (await f.send('/v3/admin/queue', { token: f.env.ADMIN_TOKEN })).body.requests[0];
+  assert.equal(row.status, 'resuming'); assert.equal(row.resumeGuestProof, proof); assert.equal(row.guestTokenSha256, guestTokenSha256);
+  assert.equal(JSON.stringify([...f.storage.data]).includes(secret), false); assert.equal(JSON.stringify([...f.storage.data]).includes(armed.body.resumeTicket), false);
+  const helper = await createEphemeralKeyPair(), claim = await createClaim(next.request, helper.publicKey, '8.8.8.8', f.operator.privateKey);
+  const adminPath = `/v3/admin/requests/${guest.request.id}`;
+  assert.equal((await f.send(adminPath + '/claim', { method: 'POST', token: f.env.ADMIN_TOKEN, body: claim })).status, 400);
+  const body = { ...claim, resumeProof: await updates.resumedClaimProof(secret, armed.body.handoff, claim) };
+  const claimed = await f.send(adminPath + '/claim', { method: 'POST', token: f.env.ADMIN_TOKEN, body });
+  assert.equal(claimed.status, 200); assert.notEqual(claimed.body.token, selected.token);
+  assert.equal((await f.send(adminPath + '/handoff/stop', { method: 'POST', token: f.env.ADMIN_TOKEN, body: { nonce: base.nonce } })).status, 409);
+  assert.equal((await f.send(path + '/handoff/stop', { method: 'POST', token: armed.body.resumeTicket, body: { nonce: base.nonce } })).status, 401);
+  assert.equal((await f.send(path, { token: next.request.token })).body.claim.resumeProof, body.resumeProof);
+  assert.equal((await f.send(path + '/stop', { method: 'POST', token: claimed.body.token, body: {} })).status, 200);
+  assert.equal((await f.send('/v3/requests', { method: 'POST', body: next.request })).status, 409);
+});
+
+async function armedFixture(options = {}) {
+  const f = await setup(options), guest = await f.register(), selected = await f.claim(guest), path = `/v3/requests/${guest.request.id}`;
+  const base = { v: 1, parentId: guest.request.id, parentSid: selected.claim.payload.sid, nonce: '1'.repeat(32), targetVersion: '0.2.0-beta.4',
+    artifactSha256: '2'.repeat(64), nativeSessionId: '3'.repeat(32), originalExpires: guest.request.expires, resumeDeadline: f.now() + 90000 };
+  const armed = await f.send(path + '/handoff', { method: 'POST', token: guest.request.token, body: base });
+  assert.equal(armed.status, 200);
+  const next = await updates.createResumedRequest(armed.body.handoff), secret = '4'.repeat(64);
+  const resume = { v: 1, nonce: base.nonce, targetVersion: base.targetVersion, artifactSha256: base.artifactSha256,
+    guestPublicKey: next.request.guestPublicKey, token: next.request.token,
+    proof: await updates.resumedGuestProof(secret, armed.body.handoff, next.request.guestPublicKey, await updates.queueTokenSha256(next.request.token)) };
+  return { ...f, guest, selected, path, base, armed: armed.body, next, resume, secret };
+}
+
+test('handoff requires the claimed guest and exact bounded non-content metadata', async () => {
+  const f = await setup(), guest = await f.register(), selected = await f.claim(guest), path = `/v3/requests/${guest.request.id}`;
+  const base = { v: 1, parentId: guest.request.id, parentSid: selected.claim.payload.sid, nonce: '1'.repeat(32), targetVersion: '0.2.0-beta.4',
+    artifactSha256: '2'.repeat(64), nativeSessionId: '3'.repeat(32), originalExpires: guest.request.expires, resumeDeadline: Date.now() + 60000 };
+  assert.equal((await f.send(path + '/handoff', { method: 'POST', token: selected.token, body: base })).status, 403);
+  for (const changed of [{ ...base, parentId: 'f'.repeat(32) }, { ...base, parentSid: 'f'.repeat(32) },
+    { ...base, originalExpires: base.originalExpires - 1 }, { ...base, resumeDeadline: Date.now() + 91000 },
+    { ...base, resumeDeadline: base.originalExpires + 1 }, { ...base, resumeAuth: 'SYNTHETIC_FORBIDDEN_SECRET' },
+    { ...base, message: 'SYNTHETIC_FORBIDDEN_CONTENT' }, { ...base, targetVersion: '01.2.3' }]) {
+    assert.equal((await f.send(path + '/handoff', { method: 'POST', token: guest.request.token, body: changed })).status, 400);
+  }
+  assert.equal(JSON.stringify([...f.storage.data]).includes('SYNTHETIC_FORBIDDEN'), false);
+  assert.equal((await f.send(path + '/handoff', { method: 'POST', token: guest.request.token, body: base })).status, 200);
+  assert.equal((await f.send(path + '/handoff', { method: 'POST', token: guest.request.token, body: base })).status, 409);
+  assert.equal((await f.send(`/v3/admin/requests/${guest.request.id}/claim`, { method: 'POST', token: f.env.ADMIN_TOKEN, body: selected.claim })).status, 409);
+});
+
+test('resume rejects ticket splicing, changed grant fields and recycled keys or credentials', async () => {
+  const f = await armedFixture();
+  for (const token of [f.guest.request.token, f.selected.token, f.env.ADMIN_TOKEN, 'f'.repeat(64)]) {
+    assert.equal((await f.send(f.path + '/resume', { method: 'POST', token, body: f.resume })).status, 401);
+  }
+  const point = new Uint8Array(65); point[0] = 4;
+  for (const changed of [{ ...f.resume, nonce: 'f'.repeat(32) }, { ...f.resume, targetVersion: '0.2.0-beta.5' },
+    { ...f.resume, artifactSha256: 'f'.repeat(64) }, { ...f.resume, guestPublicKey: f.guest.request.guestPublicKey },
+    { ...f.resume, guestPublicKey: f.selected.helper.publicKey }, { ...f.resume, guestPublicKey: encodeQueueBytes(point) },
+    { ...f.resume, token: f.guest.request.token }, { ...f.resume, token: f.selected.token }, { ...f.resume, token: f.armed.resumeTicket },
+    { ...f.resume, proof: 'x' }, { ...f.resume, resumeAuth: f.secret }]) {
+    assert.equal((await f.send(f.path + '/resume', { method: 'POST', token: f.armed.resumeTicket, body: changed })).status, 400);
+  }
+  const second = await f.register();
+  assert.equal((await f.send(`/v3/requests/${second.request.id}/resume`, { method: 'POST', token: f.armed.resumeTicket, body: f.resume })).status, 401);
+  const results = await Promise.all([f.resume, { ...f.resume, token: 'e'.repeat(64) }].map(body => f.send(f.path + '/resume', { method: 'POST', token: f.armed.resumeTicket, body })));
+  assert.deepEqual(results.map(result => result.status).sort(), [200, 409]);
+});
+
+test('intentional pending Stop revokes the grant with no resurrection or old-peer authority', async () => {
+  for (const stopRole of ['guest', 'controller', 'ticket', 'admin']) {
+    const f = await armedFixture();
+    if (stopRole === 'ticket' || stopRole === 'admin') assert.equal((await f.send(f.path + '/resume', { method: 'POST', token: f.armed.resumeTicket, body: f.resume })).status, 200);
+    const token = { guest: f.guest.request.token, controller: f.selected.token, ticket: f.armed.resumeTicket, admin: f.env.ADMIN_TOKEN }[stopRole];
+    const path = stopRole === 'admin' ? `/v3/admin/requests/${f.guest.request.id}/handoff/stop` : f.path + '/handoff/stop';
+    assert.equal((await f.send(path, { method: 'POST', token, body: { nonce: 'f'.repeat(32) } })).status, 400);
+    assert.equal((await f.send(path, { method: 'POST', token, body: { nonce: f.base.nonce } })).status, 200);
+    assert.equal((await f.send(f.path + '/resume', { method: 'POST', token: f.armed.resumeTicket, body: f.resume })).status, 404);
+    assert.equal((await f.send('/v3/requests', { method: 'POST', body: f.next.request })).status, 409);
+    assert.equal((await f.storage.list({ prefix: 'request:' })).size, 0);
+    assert.equal((await f.storage.list({ prefix: 'message:' })).size, 0);
+  }
+});
+
+test('restart grace never extends the original expiry or the continuing controller lease', async () => {
+  const f = await armedFixture();
+  for (let index = 0; index < 4; index++) {
+    f.advance(20000);
+    assert.equal((await f.send(f.path + '/handoff/heartbeat', { method: 'POST', token: f.selected.token, body: { nonce: f.base.nonce } })).status, 200);
+  }
+  f.advance(10001); await f.queue.alarm();
+  assert.equal((await f.send(f.path + '/resume', { method: 'POST', token: f.armed.resumeTicket, body: f.resume })).status, 404);
+  const missingController = await armedFixture(); missingController.advance(30001); await missingController.queue.alarm();
+  assert.equal((await missingController.send(missingController.path, { token: missingController.guest.request.token })).status, 404);
+});
+
+test('a held restart upload cannot block controller lease or ticket Stop and is rechecked after revocation', async () => {
+  const f = await armedFixture({ bodyTimeoutMs: 500 }); let stream, settled = false;
+  const body = new ReadableStream({ start(controller) { stream = controller; } });
+  const pending = f.queue.fetch(new Request(f.service.origin + f.path + '/resume', { method: 'POST', headers: {
+    Origin: 'tauri://localhost', Authorization: `Bearer ${f.armed.resumeTicket}`, 'Content-Type': 'application/json',
+  }, body, duplex: 'half' })).then(response => { settled = true; return response; });
+  try {
+    for (let attempt = 0; f.queue.receiving.setup < 1 && attempt < 100; attempt++) await new Promise(resolve => setTimeout(resolve, 1));
+    assert.equal(f.queue.receiving.setup, 1);
+    assert.equal((await f.send(f.path + '/handoff/heartbeat', { method: 'POST', token: f.selected.token, body: { nonce: f.base.nonce } })).status, 200);
+    assert.equal((await f.send(f.path + '/handoff/stop', { method: 'POST', token: f.armed.resumeTicket, body: { nonce: f.base.nonce } })).status, 200);
+    assert.equal(settled, false);
+    stream.enqueue(new TextEncoder().encode(JSON.stringify(f.resume))); stream.close();
+    assert.equal((await pending).status, 404);
+  } finally { try { stream.close(); } catch {} await pending; }
+  assert.equal(f.queue.readerKeys.size, 0); assert.equal(f.queue.inFlight, 0);
+});
+
+test('continuation cannot reuse old helper authority or bypass per-role request bounds', async () => {
+  const f = await armedFixture();
+  assert.equal((await f.send(f.path + '/resume', { method: 'POST', token: f.armed.resumeTicket, body: f.resume })).status, 200);
+  const adminPath = `/v3/admin/requests/${f.guest.request.id}/claim`;
+  const oldHelperClaim = await createClaim(f.next.request, f.selected.helper.publicKey, '8.8.8.8', f.operator.privateKey);
+  assert.equal((await f.send(adminPath, { method: 'POST', token: f.env.ADMIN_TOKEN, body: { ...oldHelperClaim, resumeProof: 'f'.repeat(64) } })).status, 400);
+  const g = await armedFixture(), key = `request:${g.guest.request.id}`, record = await g.storage.get(key);
+  record.calls.controller = 6000; await g.storage.put(key, record);
+  assert.equal((await g.send(g.path + '/handoff/heartbeat', { method: 'POST', token: g.selected.token, body: { nonce: g.base.nonce } })).status, 429);
+  assert.equal((await g.send(g.path + '/handoff/stop', { method: 'POST', token: g.armed.resumeTicket, body: { nonce: g.base.nonce } })).status, 200);
 });

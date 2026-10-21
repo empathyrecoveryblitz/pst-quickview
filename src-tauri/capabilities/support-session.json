@@ -8,6 +8,9 @@
     "allow-bootstrap-support-session",
     "allow-poll-support-frame",
     "allow-support-submit-action",
-    "allow-stop-support-session"
+    "allow-stop-support-session",
+    "allow-poll-support-update-handoff",
+    "allow-complete-support-update-handoff",
+    "allow-support-confirm-update-resume"
   ]
 }

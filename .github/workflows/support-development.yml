@@ -25,7 +25,7 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.90.0"
           components: rustfmt, clippy
           targets: x86_64-apple-darwin,aarch64-apple-darwin
       - run: npm ci
@@ -33,6 +33,11 @@ jobs:
       - run: npm audit
       - run: npm run test:frontend
       - run: npm run build
+      - name: Independent update archive verifier gates
+        run: |
+          cargo fmt --manifest-path scripts/support-update-verifier/Cargo.toml --check
+          cargo test --locked --manifest-path scripts/support-update-verifier/Cargo.toml
+          cargo clippy --locked --manifest-path scripts/support-update-verifier/Cargo.toml --all-targets -- -D warnings
       - name: Native formatting
         run: |
           if cargo fmt --check; then exit 0; fi
@@ -64,10 +69,15 @@ jobs:
           python3 scripts/inspect-packaged-csp.py src-tauri/tauri.conf.json src-tauri/src/support_session.rs "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app/Contents/MacOS/pst-quickview" || diagnostic_status=$?
           if ((package_status != 0 || diagnostic_status != 0)); then exit 1; fi
       - name: Archive app while preserving Mac executable modes and bundle structure
-        run: ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app" "$RUNNER_TEMP/PST-QuickView-support-development.zip"
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/universal-apple-darwin/release/bundle/macos/PST QuickView.app" "$RUNNER_TEMP/PST-QuickView-support-development.zip"
+          COPYFILE_DISABLE=1 tar -czf "$RUNNER_TEMP/PST-QuickView.app.tar.gz" -C "src-tauri/target/universal-apple-darwin/release/bundle/macos" "PST QuickView.app"
+          shasum -a 256 "$RUNNER_TEMP/PST-QuickView-support-development.zip" "$RUNNER_TEMP/PST-QuickView.app.tar.gz"
       - uses: actions/upload-artifact@v7
         with:
           name: pst-quickview-support-development-unsigned
-          path: ${{ runner.temp }}/PST-QuickView-support-development.zip
+          path: |
+            ${{ runner.temp }}/PST-QuickView-support-development.zip
+            ${{ runner.temp }}/PST-QuickView.app.tar.gz
           if-no-files-found: error
           retention-days: 3

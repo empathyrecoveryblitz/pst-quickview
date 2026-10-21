@@ -56,6 +56,7 @@ mod search_stress;
 mod sqlite_security;
 mod support_session;
 mod threading;
+mod updater;
 
 use calendar_msg::CalendarItemDetails;
 use message_security::{
@@ -1029,6 +1030,39 @@ impl AppState {
     }
 }
 
+pub(crate) struct UpdateInstallGuard(tauri::AppHandle);
+
+impl Drop for UpdateInstallGuard {
+    fn drop(&mut self) {
+        self.0
+            .state::<AppState>()
+            .import_running
+            .store(false, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn try_begin_update_install(
+    app: &tauri::AppHandle,
+) -> Result<UpdateInstallGuard, String> {
+    let state = app.state::<AppState>();
+    state
+        .import_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| {
+            "Finish or cancel the current workspace operation before updating.".to_string()
+        })?;
+    let guard = UpdateInstallGuard(app.clone());
+    if state
+        .integrity_operation
+        .lock()
+        .map_err(|_| "Workspace operation state is unavailable.".to_string())?
+        .is_some()
+    {
+        return Err("Finish the current workspace operation before updating.".to_string());
+    }
+    Ok(guard)
+}
+
 #[derive(Clone)]
 struct LocalTrashUndoRecord {
     workspace_id: String,
@@ -1550,6 +1584,7 @@ struct WalCheckpointResult {
 }
 
 pub fn run() {
+    updater::initialize_launch_proof();
     let context = tauri::generate_context!();
     let expected_identity = match RuntimeProfileIdentity::from_config(context.config()) {
         Ok(identity) => identity,
@@ -1633,6 +1668,8 @@ pub fn run() {
         })
         .manage(AppState::default())
         .manage(support_session::SupportSessionState::default())
+        .manage(updater::UpdaterState::default())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| -> Result<(), Box<dyn std::error::Error>> {
             let profile =
                 RuntimeProfile::resolve(app, &expected_identity).map_err(AppError::from)?;
@@ -1653,6 +1690,13 @@ pub fn run() {
             support_session::support_submit_action,
             support_session::stop_support_session,
             support_session::support_session_status,
+            updater::check_verified_update,
+            updater::approve_verified_update,
+            updater::support_resume_status,
+            updater::resume_support_after_update,
+            updater::poll_support_update_handoff,
+            updater::complete_support_update_handoff,
+            updater::support_confirm_update_resume,
             reveal_application_logs,
             reveal_project_license,
             reveal_third_party_notices,

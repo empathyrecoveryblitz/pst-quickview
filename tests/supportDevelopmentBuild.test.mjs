@@ -8,8 +8,11 @@ test('development workflow is Mac app-only, unsigned, and has no release or tag 
   assert.match(workflow, /contents: read/);
   assert.match(workflow, /persist-credentials: false/);
   assert.match(workflow, /--target universal-apple-darwin --bundles app --no-sign --ci/);
+  assert.match(workflow, /cargo test --locked --manifest-path scripts\/support-update-verifier\/Cargo.toml/);
+  assert.match(workflow, /cargo clippy --locked --manifest-path scripts\/support-update-verifier\/Cargo.toml --all-targets -- -D warnings/);
   assert.match(workflow, /EXPECT_DMG=0 bash scripts\/verify-macos-release.sh/);
   assert.match(workflow, /ditto -c -k --sequesterRsrc --keepParent/);
+  assert.match(workflow, /COPYFILE_DISABLE=1 tar -czf/);
   assert.doesNotMatch(workflow, /\.dmg|notarytool|altool|codesign |contents: write|gh release|git push|npm version/);
   const verification = workflow.indexOf('EXPECT_DMG=0');
   const artifact = workflow.indexOf('uses: actions/upload-artifact');

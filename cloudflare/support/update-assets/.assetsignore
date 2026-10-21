@@ -1,0 +1,7 @@
+*
+!updates/
+!updates/development.json
+!updates/artifacts/
+!updates/artifacts/*/
+!updates/artifacts/*/*.app.tar.gz
+!_headers

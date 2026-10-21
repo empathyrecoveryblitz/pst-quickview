@@ -270,6 +270,29 @@ test('actions are exact kind-specific messages bound to frame and target identif
   assert.throws(() => validateDataMessage({ type: 'heartbeat', action: action('click') }, { sid, sourceRole: 'guest' }));
 });
 
+const updateHandoff = (overrides = {}) => ({
+  v: 1, parentId: '1'.repeat(32), parentSid: sid, nonce: '2'.repeat(32), targetVersion: '0.2.0-beta.4',
+  artifactSha256: '3'.repeat(64), nativeSessionId: '4'.repeat(32), originalExpires: Date.now() + 60000,
+  resumeDeadline: Date.now() + 45000, resumeTicketSha256: '5'.repeat(64), ...overrides,
+});
+test('update handoff is bounded, exact, guest-only and bound to the current direct SID', () => {
+  const packet = { type: 'update-handoff', handoff: updateHandoff(), resumeAuth: '6'.repeat(64) };
+  assert.deepEqual(validateDataMessage(packet, { sid, sourceRole: 'guest' }), packet);
+  const ack = { type: 'update-handoff-ack', nonce: packet.handoff.nonce, proof: '7'.repeat(64) };
+  assert.deepEqual(validateDataMessage(ack, { sid, sourceRole: 'controller' }), ack);
+  assert.throws(() => validateDataMessage(packet, { sid, sourceRole: 'controller' }));
+  assert.throws(() => validateDataMessage(ack, { sid, sourceRole: 'guest' }));
+  for (const changes of [
+    { parentSid: '0'.repeat(32) }, { nonce: '../arbitrary' }, { targetVersion: 'x'.repeat(129) },
+    { targetVersion: 'https://untrusted.invalid' }, { artifactSha256: 'short' },
+    { resumeDeadline: Date.now() - 1 }, { resumeDeadline: Date.now() + 91000 },
+    { originalExpires: Date.now() + 30 * 60 * 1000 + 1000 }, { extra: true },
+  ]) assert.throws(() => validateDataMessage({ ...packet, handoff: { ...packet.handoff, ...changes } }, { sid, sourceRole: 'guest' }));
+  for (const invalid of [{ ...packet, resumeTicket: 'secret' }, { ...packet, resumeAuth: 'bad' }, { ...ack, proof: 'short' }, { ...ack, action: action('click') }]) {
+    assert.throws(() => validateDataMessage(invalid, { sid, sourceRole: invalid.type === 'update-handoff' ? 'guest' : 'controller' }));
+  }
+});
+
 test('peer starts STUN only after local and remote approval and Stop closes immediately', async () => {
   const originalRTC = globalThis.RTCPeerConnection, originalFetch = globalThis.fetch;
   const cfg = config('controller');
@@ -371,11 +394,14 @@ test('queued trickle candidates stay ahead of end while the first delivery is pe
   }
 });
 
-test('paired peers verify direct transport, carry direction-bound app data and revoke on Stop', async () => {
+for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' ? 'paired queue peer rejects a forged update ACK and cannot suspend' : mode === 'update' ? 'paired queue peers freeze sharing, authenticate the update ACK and suspend without stale Stop' : 'paired peers verify direct transport, carry direction-bound app data and revoke on Stop', async () => {
+  const updating = mode !== 'stop';
   const originalRTC = globalThis.RTCPeerConnection, originalFetch = globalThis.fetch;
-  const controllerConfig = config('controller');
-  const guestConfig = { ...controllerConfig, role: 'guest', token: 'b'.repeat(64), origin: 'https://example.run.pinggy-free.link' };
+  const controllerConfig = { ...config('controller'), ...(updating ? { origin: 'https://synthetic.example.workers.dev' } : {}) };
+  const guestConfig = { ...controllerConfig, role: 'guest', token: 'b'.repeat(64), origin: updating ? controllerConfig.origin : 'https://example.run.pinggy-free.link' };
+  const queue = updating ? { origin: controllerConfig.origin, requestId: '1'.repeat(32) } : undefined;
   const queues = { controller: [], guest: [] }, pcs = [], frames = [], actions = [], reasons = [];
+  const handoffs = [], acks = [];
   let controller, guest, controllerConnected, guestConnected, frameReceived, actionReceived;
   const connected = [new Promise(resolve => { controllerConnected = resolve; }), new Promise(resolve => { guestConnected = resolve; })];
   const nextFrame = new Promise(resolve => { frameReceived = resolve; });
@@ -426,9 +452,8 @@ test('paired peers verify direct transport, carry direction-bound app data and r
     globalThis.RTCPeerConnection = FakePeer;
     globalThis.fetch = async (url, options) => {
       const role = options.headers.Authorization === `Bearer ${controllerConfig.token}` ? 'controller' : 'guest';
-      assert.equal(options.headers['X-Pinggy-No-Screen'], role === 'guest' ? '1' : undefined);
-      if (role === 'guest') assert.ok(String(url).startsWith(guestConfig.origin + '/api/'));
-      else assert.ok(String(url).startsWith(controllerConfig.origin + '/api/'));
+      assert.equal(options.headers['X-Pinggy-No-Screen'], role === 'guest' && !updating ? '1' : undefined);
+      assert.ok(String(url).startsWith((role === 'guest' ? guestConfig.origin : controllerConfig.origin) + (updating ? '/v3/requests/' + queue.requestId : '') + '/api/'));
       if (options.method === 'POST') {
         const envelope = JSON.parse(options.body);
         assert.equal(envelope.from, role);
@@ -439,8 +464,8 @@ test('paired peers verify direct transport, carry direction-bound app data and r
       return response({ messages: queues[role === 'controller' ? 'guest' : 'controller'].filter(message => message.seq > after), expiresAt: controllerConfig.expires });
     };
     const { createSupportPeer } = await import('../public/support/peer.js');
-    controller = await createSupportPeer({ config: controllerConfig, onState: state => { if (state === 'connected') controllerConnected(); }, onFrame: value => { frames.push(value); frameReceived(); }, onClose: reason => reasons.push(['controller', reason]) });
-    guest = await createSupportPeer({ config: guestConfig, onState: state => { if (state === 'connected') guestConnected(); }, onAction: value => { actions.push(value); actionReceived(); }, onClose: reason => reasons.push(['guest', reason]) });
+    controller = await createSupportPeer({ config: controllerConfig, queue, onUpdateHandoff: value => handoffs.push(value), onState: state => { if (state === 'connected') controllerConnected(); }, onFrame: value => { frames.push(value); frameReceived(); }, onClose: reason => reasons.push(['controller', reason]) });
+    guest = await createSupportPeer({ config: guestConfig, queue, onUpdateHandoffAck: value => acks.push(value), onState: state => { if (state === 'connected') guestConnected(); }, onAction: value => { actions.push(value); actionReceived(); }, onClose: reason => reasons.push(['guest', reason]) });
     await controller.approve(); await guest.approve();
     await Promise.all(connected);
     assert.equal(controller.sendFrame(frame()), false);
@@ -452,6 +477,38 @@ test('paired peers verify direct transport, carry direction-bound app data and r
     assert.equal(controller.sendAction(action('input')), true);
     await nextAction;
     assert.deepEqual(actions, [action('input')]);
+    assert.equal(controller.suspendForUpdate(), false); assert.equal(guest.suspendForUpdate(), false);
+    if (updating) {
+      const packet = { handoff: updateHandoff({ originalExpires: controllerConfig.expires }), resumeAuth: '6'.repeat(64) };
+      const { ackProof } = await import('../public/support/queue-protocol.js');
+      assert.equal(controller.sendUpdateHandoff(packet), false);
+      assert.equal(guest.sendUpdateHandoff({ ...packet, handoff: { ...packet.handoff, parentId: '0'.repeat(32) } }), false);
+      assert.equal(guest.sendUpdateHandoff(packet), true);
+      assert.equal(guest.sendFrame(frame()), false);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      assert.deepEqual(handoffs, [packet]); assert.equal(controller.sendAction(action('click')), false);
+      assert.equal(guest.suspendForUpdate(), false);
+      if (mode === 'forged ACK') {
+        pcs[0].channel.send(JSON.stringify({ type: 'update-handoff-ack', nonce: packet.handoff.nonce, proof: '0'.repeat(64) }));
+        await new Promise(resolve => setTimeout(resolve, 10));
+        assert.deepEqual(acks, []); assert.equal(guest.suspendForUpdate(), false);
+        assert.ok(reasons.some(([role, reason]) => role === 'guest' && reason === 'update'));
+        assert.equal(controller.sendAction(action('click')), false); return;
+      }
+      assert.equal(await controller.sendUpdateHandoffAck({ nonce: packet.handoff.nonce, proof: '0'.repeat(64) }), false);
+      const ack = { nonce: packet.handoff.nonce, proof: await ackProof(packet.resumeAuth, packet.handoff) };
+      assert.equal(await controller.sendUpdateHandoffAck(ack), true);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      assert.deepEqual(acks, [ack]); assert.equal(await controller.sendUpdateHandoffAck(ack), false);
+      const setupCounts = [queues.controller.length, queues.guest.length];
+      assert.equal(guest.suspendForUpdate(), true);
+      assert.equal(guest.suspendForUpdate(), false); assert.equal(controller.sendAction(action('click')), false);
+      controller.close(); guest.close();
+      await new Promise(resolve => setTimeout(resolve, 5));
+      assert.deepEqual(reasons, []); assert.deepEqual([queues.controller.length, queues.guest.length], setupCounts);
+      assert.equal(JSON.stringify(queues).includes(packet.resumeAuth), false);
+      return;
+    }
     // A validated action queued before Stop must not reach a revoked receiver.
     assert.equal(controller.sendAction(action('click')), true);
     guest.close();

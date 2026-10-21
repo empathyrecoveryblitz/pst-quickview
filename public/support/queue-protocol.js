@@ -48,7 +48,13 @@ export function validateServiceConfig(raw) {
 export function validateRequest(raw, { requireToken = false } = {}) {
   const base = ['v', 'id', 'guestPublicKey', 'expires'];
   const privateRequest = exact(raw, [...base, 'token']);
-  const publicRequest = exact(raw, base) || (exact(raw, [...base, 'status']) && ['waiting', 'claimed'].includes(raw.status));
+  const handoffRow = exact(raw, [...base, 'status', 'handoff']) && raw.status === 'updating';
+  const resumeRow = exact(raw, [...base, 'status', 'handoff', 'resumeGuestProof', 'guestTokenSha256']) && raw.status === 'resuming' && HEX64.test(raw.resumeGuestProof) && HEX64.test(raw.guestTokenSha256);
+  if (handoffRow || resumeRow) {
+    const handoff = validateUpdateHandoff(raw.handoff);
+    if (handoff.parentId !== raw.id || handoff.originalExpires !== raw.expires) fail();
+  }
+  const publicRequest = exact(raw, base) || (exact(raw, [...base, 'status']) && ['waiting', 'claimed'].includes(raw.status)) || handoffRow || resumeRow;
   if ((!privateRequest && (!publicRequest || requireToken)) || raw.v !== 3 || !HEX32.test(raw.id) || (privateRequest && !HEX64.test(raw.token))) fail();
   publicKey(raw.guestPublicKey); expiry(raw.expires);
   return { v: 3, id: raw.id, ...(privateRequest ? { token: raw.token } : {}), guestPublicKey: raw.guestPublicKey, expires: raw.expires };
@@ -80,9 +86,10 @@ function signatureBytes(value) {
   return bytes;
 }
 export function validateClaim(raw) {
-  if (!exact(raw, ['payload', 'signature'])) fail();
+  const resumed = exact(raw, ['payload', 'signature', 'resumeProof']);
+  if ((!resumed && !exact(raw, ['payload', 'signature'])) || (resumed && !HEX64.test(raw.resumeProof))) fail();
   signatureBytes(raw.signature);
-  return { payload: validateClaimPayload(raw.payload), signature: raw.signature };
+  return { payload: validateClaimPayload(raw.payload), signature: raw.signature, ...(resumed ? { resumeProof: raw.resumeProof } : {}) };
 }
 export async function createClaim(request, helperPublicKey, expectedExit, operatorPrivateKey) {
   const row = validateRequest(request), api = runtime();
@@ -123,4 +130,51 @@ export async function deriveClaimConfig(payload, signature, privateKey, role, to
   const key = new Uint8Array(await api.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt, info: encoder.encode('pst-quickview-support-queue-v3:key') }, material, 256));
   const config = { v: 2, role, sid: claim.payload.sid, key: encodeQueueBytes(key), token, expires: claim.payload.expires, expectedExit: claim.payload.expectedExit, origin };
   key.fill(0); return config;
+}
+
+const HANDOFF_FIELDS = ['v', 'parentId', 'parentSid', 'nonce', 'targetVersion', 'artifactSha256', 'nativeSessionId', 'originalExpires', 'resumeDeadline'];
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+export function validateUpdateHandoff(raw, { requireTicketHash = true, now = Date.now() } = {}) {
+  const fields = requireTicketHash ? [...HANDOFF_FIELDS, 'resumeTicketSha256'] : HANDOFF_FIELDS;
+  if (!exact(raw, fields) || raw.v !== 1 || !HEX32.test(raw.parentId) || !HEX32.test(raw.parentSid) || !HEX32.test(raw.nonce) || !HEX32.test(raw.nativeSessionId) ||
+      typeof raw.targetVersion !== 'string' || raw.targetVersion.length > 128 || !SEMVER.test(raw.targetVersion) || !HEX64.test(raw.artifactSha256) ||
+      !Number.isSafeInteger(now) || !Number.isSafeInteger(raw.originalExpires) || raw.originalExpires <= now || raw.originalExpires > now + 30 * 60 * 1000 ||
+      !Number.isSafeInteger(raw.resumeDeadline) || raw.resumeDeadline <= now || raw.resumeDeadline > now + 90000 || raw.resumeDeadline > raw.originalExpires ||
+      (requireTicketHash && !HEX64.test(raw.resumeTicketSha256))) fail();
+  return Object.fromEntries(fields.map(key => [key, raw[key]]));
+}
+export function canonicalUpdateHandoff(raw) { return JSON.stringify(validateUpdateHandoff(raw)); }
+function hexadecimal(bytes) { return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join(''); }
+export async function queueTokenSha256(token) {
+  if (!HEX64.test(token)) fail();
+  return hexadecimal(new Uint8Array(await runtime().subtle.digest('SHA-256', encoder.encode(token))));
+}
+async function updateProof(secret, value) {
+  if (!HEX64.test(secret)) fail();
+  const bytes = Uint8Array.from(secret.match(/../g), value => Number.parseInt(value, 16)), api = runtime();
+  let key;
+  try { key = await api.subtle.importKey('raw', bytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); }
+  finally { bytes.fill(0); }
+  return hexadecimal(new Uint8Array(await api.subtle.sign('HMAC', key, encoder.encode(value))));
+}
+export async function ackProof(secret, handoff) {
+  return updateProof(secret, 'pst-quickview-update-ack-v1\n' + canonicalUpdateHandoff(handoff));
+}
+export async function resumedGuestProof(secret, handoff, guestPublicKey, guestTokenSha256) {
+  publicKey(guestPublicKey); if (!HEX64.test(guestTokenSha256)) fail();
+  return updateProof(secret, 'pst-quickview-update-guest-v1\n' + canonicalUpdateHandoff(handoff) + '\n' + guestPublicKey + '\n' + guestTokenSha256);
+}
+export async function resumedClaimProof(secret, handoff, raw) {
+  const grant = validateUpdateHandoff(handoff), claim = validateClaim(raw);
+  if (claim.payload.id !== grant.parentId || claim.payload.expires !== grant.originalExpires || claim.payload.sid === grant.parentSid) fail();
+  return updateProof(secret, 'pst-quickview-update-helper-v1\n' + JSON.stringify(grant) + '\n' + canonicalClaimPayload(claim.payload) + '\n' + claim.signature);
+}
+export function verifyUpdateProof(expected, actual) {
+  if (typeof expected !== 'string' || typeof actual !== 'string' || !HEX64.test(expected) || !HEX64.test(actual)) return false;
+  let difference = 0; for (let index = 0; index < 64; index++) difference |= expected.charCodeAt(index) ^ actual.charCodeAt(index);
+  return difference === 0;
+}
+export async function createResumedRequest(handoff) {
+  const grant = validateUpdateHandoff(handoff), result = await createRequest({ expires: grant.originalExpires });
+  result.request.id = grant.parentId; return result;
 }

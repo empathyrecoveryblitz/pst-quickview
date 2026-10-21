@@ -1,16 +1,21 @@
 # Approved app-only Remote Support
 
 This is an implementation candidate, not a packaged-Mac acceptance result.
+The current development version is `0.2.0-beta.3.support.1`. The verified
+updater and update/resume revision still need fresh native, package, and
+genuine-Mac installation/restart validation. No current CI pass or readiness
+claim is implied by this document.
 The automatic dashboard revision replaces invitation copying. Earlier
 invitation-based development ZIPs do not implement this workflow. Validate a
 fresh build containing the exact deployed service/key pins before sharing it.
-Rust and the Mac build tools are unavailable on this Linux host; the separate
+The Mac build tools and WKWebView are unavailable on this Linux host; the separate
 GitHub Mac gate must validate each new native revision. Source/build results
 do not establish an actual packaged-Mac support connection.
-The source-only GitHub development workflow
-produces only a zipped universal development `.app`, after the native and
-packaged checks pass, and has no release/tag write permission. Developer ID
-signing and notarization are not performed; the toolchain may leave an ad-hoc
+The source-only GitHub development workflow builds universal app-only
+development packaging, including a manual-install ZIP and updater archive,
+after the native and packaged checks pass, and has no release/tag write
+permission. Developer ID signing and notarization are not performed; the
+toolchain may leave an ad-hoc
 signature, which is not a distribution signature. Publishing a source
 snapshot requires explicit owner approval. Mail content and private history
 are excluded. A workflow definition is not evidence that its checks have passed.
@@ -38,8 +43,9 @@ remote desktop or a remote terminal.
    route checks, or heartbeat loss ends access. Stop revokes local sharing and
    control before cleanup. Reachable requests disappear from the dashboard on
    its next refresh; if Stop cannot reach the service, its 30-second lease
-   expires (the next refresh removes it). No automatic restart or unattended
-   access is authorized. A new session always needs a new local approval.
+   expires (the next refresh removes it). There is no unattended access.
+   A new ordinary session needs a new local approval. The sole continuity
+   exception is the separately owner-approved, one-use update flow below.
 
 The main view is a bounded live text/layout mirror, not a pixel-perfect screen
 recording. Visible message text can be included only during the approved
@@ -54,8 +60,60 @@ navigation, result/conversation selection, reader modes, and scrolling. No
 arbitrary selector, script, key event, OS command, filesystem API, export,
 attachment opening, workspace mutation/deletion, or native-dialog operation is
 available through the support protocol. The owner must perform operations
-outside this allowlist locally. The support feature does not install app
-updates or permit the technician to deploy/execute arbitrary fixes remotely.
+outside this allowlist locally. The technician cannot deploy or execute an
+arbitrary fix. The separately approved updater can install only a verified
+development app archive, not a script, terminal command, extension, or new
+remote-control permission.
+
+## Owner-approved development updates
+
+The first updater-capable PST QuickView build must be installed manually on
+the Mac. An older app cannot gain an updater merely because a server was
+changed. After that initial install, a future verified correction can be
+offered through the app without another manual replacement download.
+
+1. The owner opens **Help → About PST QuickView → Development updates** and
+   chooses **Check for a development update**. There is no periodic update
+   polling or ordinary background update check. A check downloads and verifies
+   a candidate; it does not approve installation.
+2. The owner chooses whether an existing approved support session should
+   resume. Resumption is optional and is meaningful only for a live approved
+   session. Updating without support must not authorize a new session.
+3. The owner deliberately chooses Update and confirms the native dialog on
+   the Mac. The update controls and native confirmation are excluded from
+   remote operation. Every future update needs another local approval.
+4. If resumption was approved, sharing and controls pause before the restart.
+   The same helper dashboard keeps the request marked **Updating/reconnecting**.
+   A matching acknowledgement must arrive through the already verified direct
+   encrypted channel before a one-use continuity grant can be saved.
+5. Only the updater-launched, exact new build can consume that grant, on the
+   same Mac boot, within 90 seconds and before the original support expiry.
+   The same still-open helper browser must retain its matching grant in RAM.
+   Fresh guest/helper ephemeral keys, role tokens, setup keys, and a new direct
+   session ID are required. Sharing and controls resume only after fresh
+   authentication and direct-route verification. Stop, expiry, service failure,
+   or closing the helper page cancels continuation; there is no reconnect to a
+   different helper or automatic reapproval after failure.
+
+The app pins the update origin, channel, archive path, and update-signing public
+key. It checks the bounded manifest, archive size and SHA-256, and the archive
+signature with its signed version; a changed URL, unknown key, stale/downgrade
+version, or changed archive fails closed. This does not claim a separate
+signature over every manifest metadata field. Source/package gates must bind
+each published archive to the audited source commit and compiled support/update
+pins. Signing the update archive is not Apple Developer ID signing,
+notarization, or Gatekeeper approval.
+
+Only a minimal one-use grant is stored in the Mac's local, nonsynchronized
+Keychain. Old queue role tokens, WebRTC keys, mailbox content, and source paths
+are not persisted for resumption. The helper's continuity secret is RAM-only,
+not in its operator configuration, launcher state, URL, or cloud service.
+Fresh successful connection clears the continuity grant; it cannot extend the
+original approval. macOS may show a local Keychain or installation permission
+prompt, particularly when an unsigned development build changes. Denial must
+fail closed; do not bypass Keychain, Gatekeeper, or other OS protections.
+If installation or an OS prompt exceeds the short continuation deadline, a
+fresh local support approval is required even if the app update installed.
 
 ## Technician dashboard
 
@@ -63,15 +121,20 @@ Use Node.js 22.12 or newer. The launcher does not install anything on either
 computer. In this repository:
 
 ```sh
-node scripts/support-dashboard.mjs
+node scripts/support-dashboard-launcher.mjs
 ```
 
 The launcher reads the pre-provisioned public service pin and an owner-only
-private operator configuration. It binds only `127.0.0.1` and prints the
-location of a private temporary state file, not its capability URL or secrets.
-Open its `dashboardURL` privately in the local browser. Keep the launcher
-running during support; stopping it removes the temporary state and ends its
-active request. A fresh launch generates a new dashboard access capability.
+private operator configuration. It binds only `127.0.0.1` and opens the local
+browser without printing its private access link or secrets. Reopening the
+launcher reuses only an authenticated dashboard with the exact configured
+service pin. The existing manual laptop shortcut uses its configured Node.js 24
+runtime and this entry point. It is not a
+login service and does not save customer approval or start support by itself.
+The local server remains available after the launcher exits. The dashboard's
+Stop button ends its active request; each new customer session still requires
+fresh approval on both sides. Private temporary access state is replaced on a
+fresh server launch, not published as an account or shareable dashboard link.
 
 Each claim checks the laptop's current Mullvad route, without changing VPN,
 firewall, router, or OS settings. No tunnel, incoming SSH, screen-sharing
@@ -87,6 +150,15 @@ app. The admin credential is configured as a Cloudflare Worker secret, never
 in the app, public source, URLs, or chat. The hosting account belongs to the
 operator and must remain on the usage-limited Free plan unless separately
 authorized. Customers do not sign in to Cloudflare.
+
+The updater uses a separate private archive-signing key, also kept locally and
+outside the repository. It is not the operator claim-signing key or an Apple
+signing identity. Public development software can be staged as Cloudflare
+Workers Static Assets, with each archive at most 25 MiB. Only the reviewed
+update manifest and immutable archive paths belong in that staging directory;
+never point asset hosting at the repository, a workspace, or a mail folder.
+This design needs no R2 bucket, paid server, or customer account. Staged source
+and a proposed asset configuration are not proof of a deployed working updater.
 
 The old Pinggy invitation launcher is preserved only as a legacy development
 harness. Its native invitation command has no permission in any current app
@@ -122,11 +194,19 @@ do not record frames, message text, keystrokes, or mail files. The latest view
 and a small recent-frame authorization map are held only in memory. Stop
 clears them. A remote technician can independently copy or record what is
 shown, so invite only a person the owner trusts.
+If the technician uses an AI operator to view or operate that mirror, the
+displayed text may also be processed by that tool or its service. Obtain the
+owner's explicit approval for that processing before displaying content to
+the AI operator; do not describe it as purely offline processing. This does
+not authorize mailbox uploads, GitHub mail/screenshot uploads, Cloudflare
+frame storage, or recordings by the support tools.
 
 The native broker checks the caller window, session, expiry, main-window
 heartbeat, frame size/rate, and fresh target tokens. A support WebView has only
-bootstrap, bounded frame polling/action submission, and Stop permissions.
-It has no application command, event, file, dialog, or WebView-creation rights.
+bootstrap, bounded frame polling/action submission, Stop, and narrowly scoped
+update-handoff/confirmation permissions.
+It has no general mail/indexing command, event, file, dialog, or WebView-creation
+rights.
 The main DOM bridge independently checks current geometry, visibility,
 occlusion, target kind, freshness, and explicit control tags. Email HTML is
 marked untrusted and cannot create actionable support controls. A lost main
@@ -155,6 +235,10 @@ universal app-only Mac build; current packaged CSP/capability inspection;
 actual WKWebView secure-context, WebRTC, CORS/preflight, and native broker
 checks; and a two-computer approved session against the packaged Mac app.
 Test owner Stop, helper Stop, close, freeze, disconnect/reconnect, expiration,
-no automatic resumption, and source-file integrity using fictional data.
+and source-file integrity using fictional data. Test an actual approved update,
+Keychain allow/deny/locked states, installed-build identity, restart timing,
+one-use same-helper resumption, Stop during each update stage, and failure to
+resume after page close, changed keys/builds, stale grants, or deadline expiry.
+Outside this explicit update flow, there must be no automatic resumption.
 Repeat the existing offline mail/security/import/search gates. Linux browser
 success or a generic direct-connectivity PASS does not establish Mac readiness.

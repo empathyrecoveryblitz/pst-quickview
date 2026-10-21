@@ -10,8 +10,8 @@ if [[ ! -r "${DYLIB_VALIDATION_SCRIPT}" ]]; then
 fi
 # shellcheck source=macos-dylib-validation.sh
 source "${DYLIB_VALIDATION_SCRIPT}"
-EXPECTED_VERSION="${PST_QUICKVIEW_EXPECTED_VERSION:-0.2.0-beta.3}"
-EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.0.3}"
+EXPECTED_VERSION="${PST_QUICKVIEW_EXPECTED_VERSION:-0.2.0-beta.3.support.1}"
+EXPECTED_BUNDLE_VERSION="${PST_QUICKVIEW_EXPECTED_BUNDLE_VERSION:-0.2.0.301}"
 EXPECTED_PRODUCT_NAME="${PST_QUICKVIEW_EXPECTED_PRODUCT_NAME:-PST QuickView}"
 EXPECTED_IDENTIFIER="${PST_QUICKVIEW_EXPECTED_IDENTIFIER:-com.local.pstquickview}"
 PRODUCTION_IDENTIFIER="com.local.pstquickview"
@@ -316,6 +316,11 @@ SUPPORT_PANEL_SOURCE="${ROOT_DIR}/src/RemoteSupportPanel.tsx"
 SUPPORT_CONTROL_SOURCE="${ROOT_DIR}/src/RemoteSupportControl.tsx"
 SUPPORT_SESSION_SOURCE="${ROOT_DIR}/public/support/session.js"
 SUPPORT_PROTOCOL_SOURCE="${ROOT_DIR}/public/support/protocol.js"
+SUPPORT_QUEUE_PROTOCOL_SOURCE="${ROOT_DIR}/public/support/queue-protocol.js"
+SUPPORT_SERVICE_CONFIG="${ROOT_DIR}/public/support/service.json"
+UPDATE_SERVICE_CONFIG="${ROOT_DIR}/public/support/update-service.json"
+UPDATE_RUST_SOURCE="${ROOT_DIR}/src-tauri/src/updater.rs"
+UPDATE_PANEL_SOURCE="${ROOT_DIR}/src/DevelopmentUpdatePanel.tsx"
 SUPPORT_PEER_SOURCE="${ROOT_DIR}/public/support/peer.js"
 SUPPORT_VIEW_SOURCE="${ROOT_DIR}/src/supportView.ts"
 SUPPORT_SESSION_DOCUMENT="${ROOT_DIR}/public/support/session.html"
@@ -410,8 +415,8 @@ for name, version in pins.items():
         raise SystemExit(f"dependency pin missing: {name} = {version!r}")
 
 macos = tauri.get("bundle", {}).get("macOS", {})
-if macos.get("bundleVersion") != "0.2.0.3":
-    raise SystemExit("macOS bundleVersion must be 0.2.0.3")
+if macos.get("bundleVersion") != "0.2.0.301":
+    raise SystemExit("macOS development bundleVersion must be 0.2.0.301")
 if macos.get("hardenedRuntime") is not True:
     raise SystemExit("macOS hardenedRuntime must be true")
 build = tauri.get("build", {})
@@ -827,13 +832,15 @@ def frontend_invocations(source):
 
 support_panel_path = app_source_path.with_name("RemoteSupportPanel.tsx")
 support_control_path = app_source_path.with_name("RemoteSupportControl.tsx")
+updater_panel_path = app_source_path.with_name("DevelopmentUpdatePanel.tsx")
 support_session_path = app_source_path.parent.parent / "public" / "support" / "session.js"
 support_rust_path = rust_source_path.with_name("support_session.rs")
-for path in (support_panel_path, support_control_path, support_session_path, support_rust_path):
+for path in (support_panel_path, support_control_path, support_session_path, support_rust_path, updater_panel_path):
     if path.is_symlink() or not path.is_file():
         raise SystemExit("support boundary source must be a regular, non-symlink file")
 support_panel_source = support_panel_path.read_text(encoding="utf-8")
 support_control_source = support_control_path.read_text(encoding="utf-8")
+updater_panel_source = updater_panel_path.read_text(encoding="utf-8")
 support_session_source = support_session_path.read_text(encoding="utf-8")
 support_rust_source = support_rust_path.read_text(encoding="utf-8")
 wrapper_start = support_session_source.find("const invoke = (command, args) => {")
@@ -848,7 +855,7 @@ if hashlib.sha256(wrapper.strip().encode()).hexdigest() != (
 ):
     raise SystemExit("support session invocation wrapper drifted from reviewed delegation")
 support_frontend_commands = frontend_invocations(support_session_source.replace(wrapper, "", 1))
-frontend_commands = [command for source in (app_source, support_panel_source, support_control_source)
+frontend_commands = [command for source in (app_source, support_panel_source, support_control_source, updater_panel_source)
                      for command in frontend_invocations(source)]
 all_frontend_commands = set(frontend_commands) | set(support_frontend_commands)
 if not all_frontend_commands.issubset(set(app_commands)):
@@ -857,11 +864,14 @@ if not all_frontend_commands.issubset(set(app_commands)):
 
 main_support_commands = {
     "request_support_session", "support_service_status", "support_session_status", "publish_support_frame", "stop_support_session",
+    "check_verified_update", "approve_verified_update", "support_resume_status", "resume_support_after_update",
 }
 support_commands = {
     "bootstrap_support_session", "poll_support_frame", "support_submit_action", "stop_support_session",
+    "poll_support_update_handoff", "complete_support_update_handoff",
+    "support_confirm_update_resume",
 }
-if set(frontend_invocations(support_panel_source) + frontend_invocations(support_control_source)) != main_support_commands:
+if set(frontend_invocations(support_panel_source) + frontend_invocations(support_control_source) + frontend_invocations(updater_panel_source)) != main_support_commands:
     raise SystemExit("main support controls invoke an unexpected command set")
 if set(support_frontend_commands) != support_commands:
     raise SystemExit("support session invokes an unexpected command set")
@@ -1055,6 +1065,11 @@ else
 fi
 
 STALE_SECURITY_SOURCES=()
+if python3 "${ROOT_DIR}/scripts/verify-packaged-support-pins.py" "${SUPPORT_SERVICE_CONFIG}" "${APP_BINARY}"; then
+  pass "packaged support origin and helper identity match current source"
+else
+  fail "packaged support trust pin verification failed"
+fi
 for security_source in \
   "${TAURI_CONFIG}" \
   "${BUILD_SCRIPT}" \
@@ -1069,6 +1084,11 @@ for security_source in \
   "${SUPPORT_CONTROL_SOURCE}" \
   "${SUPPORT_SESSION_SOURCE}" \
   "${SUPPORT_PROTOCOL_SOURCE}" \
+  "${SUPPORT_QUEUE_PROTOCOL_SOURCE}" \
+  "${SUPPORT_SERVICE_CONFIG}" \
+  "${UPDATE_SERVICE_CONFIG}" \
+  "${UPDATE_RUST_SOURCE}" \
+  "${UPDATE_PANEL_SOURCE}" \
   "${SUPPORT_PEER_SOURCE}" \
   "${SUPPORT_VIEW_SOURCE}" \
   "${SUPPORT_SESSION_DOCUMENT}" \

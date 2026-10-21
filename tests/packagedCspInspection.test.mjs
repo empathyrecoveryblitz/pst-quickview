@@ -66,6 +66,27 @@ test("CSP inspection reports counts and boundaries while retaining the existing 
   assert.equal(report.sourceLiteralObservations.production.locations[0].before, "nul");
 });
 
+test("support fragment accepts only the reviewed per-architecture packed or NUL layouts", () => {
+  const nulLayout = baseline.replace(`\0tauri${runtimePrefix}`, `\0${runtimePrefix}`);
+  for (const architecture of ["x86_64", "arm64"]) {
+    const { report } = inspect(nulLayout, { architecture });
+    assert.equal(report.existingVerifier.passed, true);
+    assert.equal(report.sourceLiteralObservations.support_connect_template.locations[0].before, "nul");
+    assert.deepEqual(report.outsideKnownLiteralDirectiveHistogram, {});
+    for (const unreviewed of ["taurj", "tauri/", "tauri ", "unknown", "\n", ";"]) {
+      const changed = nulLayout.replace(`\0${runtimePrefix}`, `\0${unreviewed}${runtimePrefix}`);
+      assert.equal(inspect(changed, { architecture }).report.existingVerifier.passed, false);
+    }
+  }
+  assert.equal(inspect(baseline, { architecture: "arm64" }).report.existingVerifier.passed, true);
+  assert.equal(inspect(baseline, { architecture: "x86_64" }).report.existingVerifier.passed, false);
+  for (const changed of [
+    nulLayout.replace(`${runtimePrefix}; `, `${runtimePrefix};x`),
+    nulLayout + "\0connect-src https:",
+    nulLayout + "\0script-src https:",
+  ]) assert.equal(inspect(changed).report.existingVerifier.passed, false);
+});
+
 test("recognized support literals remain observations and never approve an unreviewed policy", () => {
   const { report } = inspect(`${legacyBaseline}\0${fallback}\0connect-src ipc: http://ipc.localhost `);
   assert.equal(report.existingVerifier.passed, false);

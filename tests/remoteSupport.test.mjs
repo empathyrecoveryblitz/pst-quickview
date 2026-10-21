@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
 import { closeOpenPopover } from '../src/popoverBehavior.ts';
+import { SupportQueue } from '../cloudflare/support/worker.mjs';
 const read = name => readFileSync(new URL('../' + name, import.meta.url), 'utf8');
 const panel = read('src/RemoteSupportPanel.tsx');
 const control = read('src/RemoteSupportControl.tsx');
@@ -184,7 +185,7 @@ test('native listener failure and publish/status failure revoke rather than sile
 test('networking is in an isolated support window with no message/file/native authority', () => {
   assert.deepEqual(supportCapability.windows, ['support-session-*']);
   assert.equal(supportCapability.remote, undefined);
-  assert.deepEqual(new Set(supportCapability.permissions), new Set(['allow-bootstrap-support-session', 'allow-poll-support-frame', 'allow-support-submit-action', 'allow-stop-support-session']));
+  assert.deepEqual(new Set(supportCapability.permissions), new Set(['allow-bootstrap-support-session', 'allow-poll-support-frame', 'allow-support-submit-action', 'allow-stop-support-session', 'allow-poll-support-update-handoff', 'allow-complete-support-update-handoff', 'allow-support-confirm-update-resume']));
   assert.match(native, /on_navigation\(move \|url\| local_document/);
   assert.match(native, /NewWindowResponse::Deny/);
   assert.match(native, /\.on_download\(\|_, _\| false\)/);
@@ -236,6 +237,7 @@ async function queueWindowFixture({ claimed = false, wrongSigner = false, holdRe
       if (command === 'bootstrap_support_session') return config;
       if (command === 'stop_support_session') return;
       if (command === 'poll_support_frame') return null;
+      if (command === 'poll_support_update_handoff') return null;
       throw new Error('Unexpected native command');
     } } },
     validateServiceConfig(value) { return queueProtocol.validateServiceConfig(JSON.parse(JSON.stringify(value))); },
@@ -316,4 +318,319 @@ test('registration finishing after Stop gets a second bounded removal and never 
   assert.equal(fixture.peers.length, 0);
   assert.equal(fixture.approvals, 0);
   assert.ok(fixture.calls.filter(call => call.command === 'stop_support_session').length === 1);
+});
+
+// Execute the actual isolated session against the real queue handler and real
+// cryptography. Only native IPC, the peer interface, DOM and timers are mocked.
+// Every datum is synthetic; no public server, mailbox or native update is used.
+const plain = value => JSON.parse(JSON.stringify(value));
+const deferred = () => { let resolve; const promise = new Promise(value => { resolve = value; }); return { promise, resolve }; };
+async function until(predicate) {
+  for (let index = 0; index < 500; index++) {
+    if (await predicate()) return;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.fail('Synthetic session did not reach the expected categorical state');
+}
+class UpdateQueueStorage {
+  constructor() { this.data = new Map(); this.alarm = null; }
+  async get(key) { return structuredClone(this.data.get(key)); }
+  async put(key, value) { this.data.set(key, structuredClone(value)); }
+  async delete(keys) { for (const key of Array.isArray(keys) ? keys : [keys]) this.data.delete(key); }
+  async list({ prefix = '', limit = 10000 } = {}) {
+    return new Map([...this.data].filter(([key]) => key.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b)).slice(0, limit).map(([key, value]) => [key, structuredClone(value)]));
+  }
+  async transaction(operation) { const before = structuredClone(this.data); try { return await operation(this); } catch (error) { this.data = before; throw error; } }
+  async getAlarm() { return this.alarm; }
+  async setAlarm(value) { this.alarm = value; }
+  async deleteAlarm() { this.alarm = null; }
+}
+
+async function updateWindowFixture({ resumed = false, holdHandoff = false, holdComplete = false, holdConfirm = false,
+  confirmResult = true, completeResult = true, wrongResumeProof = false, expiredResume = false, autoConnect = true, badAck = false,
+  executableSource = sessionSource } = {}) {
+  const operator = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+  const service = { v: 3, origin: 'https://synthetic.synthetic.workers.dev', operatorLabel: 'Fictional helper',
+    operatorPublicKey: queueProtocol.encodeQueueBytes(new Uint8Array(await crypto.subtle.exportKey('raw', operator.publicKey))) };
+  let now = Date.now();
+  class ClockDate extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
+  const config = { ...service, role: 'guest', expires: now + 120000 };
+  const storage = new UpdateQueueStorage(), env = { SERVICE_ORIGIN: service.origin, OPERATOR_PUBLIC_KEY: service.operatorPublicKey,
+    OPERATOR_LABEL: service.operatorLabel, ADMIN_TOKEN: 'a'.repeat(64) };
+  const queue = new SupportQueue({ storage }, env, { now: () => now });
+  const nativeId = 'c'.repeat(32), resumeAuth = '4'.repeat(64);
+  const calls = [], peers = [], packets = [], frames = [], proofChecks = [], peerCreationWasVerified = [], elements = new Map(), timers = [], intervals = [], events = new Map();
+  const handoffResponse = deferred(), completeResponse = deferred(), confirmResponse = deferred();
+  let registration, original, helperClaim, issued, pendingUpdate, persisted = 0, suspended = 0, closed = 0, approvals = 0;
+  const admin = async (path, body) => {
+    const response = await queue.fetch(new Request(service.origin + path, { method: body === undefined ? 'GET' : 'POST',
+      headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
+    assert.equal(response.status, 200); return response.json();
+  };
+  const post = async (path, token, body) => {
+    const response = await queue.fetch(new Request(service.origin + path, { method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Origin: 'tauri://localhost' }, body: JSON.stringify(body) }));
+    assert.equal(response.status, 200); return response.json();
+  };
+  if (resumed) {
+    const parent = await queueProtocol.createRequest({ expires: config.expires });
+    original = parent.request;
+    await post('/v3/requests', original.token, original);
+    const helper = await queueProtocol.createEphemeralKeyPair();
+    const claim = await queueProtocol.createClaim(original, helper.publicKey, '8.8.8.8', operator.privateKey);
+    await admin(`/v3/admin/requests/${original.id}/claim`, claim);
+    issued = await post(`/v3/requests/${original.id}/handoff`, original.token, { v: 1, parentId: original.id, parentSid: claim.payload.sid,
+      nonce: '1'.repeat(32), targetVersion: '0.2.0-beta.4', artifactSha256: '2'.repeat(64), nativeSessionId: nativeId,
+      originalExpires: config.expires, resumeDeadline: now + 60000 });
+    config.resume = { ...plain(issued), resumeAuth };
+    if (expiredResume) config.resume.handoff.resumeDeadline = now - 1;
+  }
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, { textContent: '', disabled: false });
+    return elements.get(id);
+  };
+  const context = {
+    console: undefined, crypto, URLSearchParams, Date: ClockDate, JSON, Object, Uint8Array, TextDecoder, AbortController, AbortSignal,
+    location: { search: '?session=' + nativeId }, document: { getElementById: element },
+    addEventListener(name, callback) { events.set(name, callback); },
+    setTimeout(callback, delay) { const timer = { callback, delay, cleared: false }; timers.push(timer); return timer; },
+    clearTimeout(timer) { if (timer) timer.cleared = true; },
+    setInterval(callback, delay) { const timer = { callback, delay, cleared: false }; intervals.push(timer); return timer; },
+    clearInterval(timer) { if (timer) timer.cleared = true; },
+    window: { __TAURI_INTERNALS__: { async invoke(command, args) {
+      calls.push({ category: 'native', command, args: args && plain(args) });
+      if (command === 'bootstrap_support_session') return config;
+      if (command === 'stop_support_session') return;
+      if (command === 'poll_support_update_handoff') return pendingUpdate ?? null;
+      if (command === 'poll_support_frame') return { id: 'e'.repeat(32) };
+      if (command === 'complete_support_update_handoff') {
+        assert.equal(args.sessionId, nativeId);
+        assert.equal(await queueProtocol.queueTokenSha256(args.resumeTicket), args.handoff.resumeTicketSha256);
+        assert.equal(args.proof, await queueProtocol.ackProof(resumeAuth, plain(args.handoff)));
+        persisted++;
+        if (holdComplete) await completeResponse.promise;
+        return completeResult;
+      }
+      if (command === 'support_confirm_update_resume') {
+        assert.equal(args.sessionId, nativeId);
+        if (holdConfirm) await confirmResponse.promise;
+        return confirmResult;
+      }
+      throw new Error('Unexpected native command');
+    } } },
+    validateServiceConfig: value => queueProtocol.validateServiceConfig(plain(value)),
+    validateUpdateHandoff: (value, options = {}) => queueProtocol.validateUpdateHandoff(plain(value), { ...options, now }),
+    decodeQueueBytes: queueProtocol.decodeQueueBytes, createRequest: queueProtocol.createRequest,
+    createResumedRequest: value => queueProtocol.createResumedRequest(plain(value)),
+    acceptClaim: queueProtocol.acceptClaim, deriveClaimConfig: queueProtocol.deriveClaimConfig,
+    queueTokenSha256: queueProtocol.queueTokenSha256,
+    ackProof: (secret, handoff) => queueProtocol.ackProof(secret, plain(handoff)),
+    resumedGuestProof: (secret, handoff, key, hash) => queueProtocol.resumedGuestProof(secret, plain(handoff), key, hash),
+    resumedClaimProof: (secret, handoff, claim) => queueProtocol.resumedClaimProof(secret, plain(handoff), claim),
+    verifyUpdateProof(expected, actual) { const accepted = queueProtocol.verifyUpdateProof(expected, actual); proofChecks.push(accepted); return accepted; },
+    async createSupportPeer(options) {
+      peerCreationWasVerified.push(!resumed || proofChecks.includes(true));
+      peers.push(options);
+      return {
+        async approve() { approvals++; if (autoConnect) options.onState('connected'); return true; },
+        sendFrame(frame) { frames.push(frame); return true; }, close() { closed++; },
+        sendUpdateHandoff(packet) {
+          packets.push(plain(packet));
+          void queueProtocol.ackProof(packet.resumeAuth, plain(packet.handoff)).then(proof => options.onUpdateHandoffAck({
+            nonce: packet.handoff.nonce, proof: badAck ? 'f'.repeat(64) : proof,
+          }));
+          return true;
+        },
+        suspendForUpdate() { suspended++; return true; },
+      };
+    },
+    async fetch(url, options = {}) {
+      assert.ok(String(url).startsWith(service.origin + '/v3/requests'));
+      assert.equal(options.credentials, 'omit'); assert.equal(options.redirect, 'error');
+      const pathname = new URL(url).pathname, body = options.body === undefined ? undefined : JSON.parse(options.body);
+      const token = options.headers.Authorization.slice(7);
+      const call = { category: 'network', pathname, method: options.method ?? 'GET', token, body, keepalive: options.keepalive === true };
+      calls.push(call);
+      if (pathname === '/v3/requests' || pathname.endsWith('/resume')) registration = body;
+      const record = await storage.get(`request:${registration?.id ?? original?.id}`);
+      if (options.method === 'GET' && record && !record.claim && (!record.handoff || record.handoffState === 'resuming')) {
+        const helper = await queueProtocol.createEphemeralKeyPair();
+        helperClaim = await queueProtocol.createClaim({ v: 3, id: record.id, guestPublicKey: record.guestPublicKey, expires: record.expires }, helper.publicKey, '8.8.8.8', operator.privateKey);
+        if (record.handoff) helperClaim.resumeProof = await queueProtocol.resumedClaimProof(wrongResumeProof ? '5'.repeat(64) : resumeAuth, record.handoff, helperClaim);
+        await admin(`/v3/admin/requests/${record.id}/claim`, helperClaim);
+      }
+      const response = await queue.fetch(new Request(String(url), { method: options.method ?? 'GET', headers: {
+        ...options.headers, Origin: 'tauri://localhost',
+      }, ...(options.body === undefined ? {} : { body: options.body }) }));
+      call.status = response.status;
+      if (pathname.endsWith('/handoff') && response.ok) {
+        issued = await response.clone().json();
+        if (holdHandoff) await handoffResponse.promise;
+      }
+      return response;
+    },
+  };
+  const executable = executableSource.replace(/^import .*;\n/gm, '');
+  const ready = vm.runInNewContext(`(async () => {\n${executable}\n})()`, context);
+  const fixture = { ready, calls, peers, packets, frames, proofChecks, peerCreationWasVerified, storage, timers, intervals, events,
+    get persisted() { return persisted; }, get suspended() { return suspended; }, get closed() { return closed; }, get approvals() { return approvals; },
+    get status() { return element('status').textContent; }, get registration() { return registration; }, get original() { return original; },
+    get issued() { return issued; }, get claim() { return helperClaim; }, get config() { return config; },
+    stop() { element('stop').onclick(); }, event(name) { events.get(name)?.(); },
+    releaseHandoff() { handoffResponse.resolve(); }, releaseComplete() { completeResponse.resolve(); }, releaseConfirm() { confirmResponse.resolve(); },
+    advance(value) { now += value; },
+    async poll() {
+      await new Promise(resolve => setImmediate(resolve));
+      const timer = timers.findLast(timer => timer.delay === 500 && !timer.cleared);
+      assert.ok(timer); timer.cleared = true; timer.callback();
+      await new Promise(resolve => setImmediate(resolve));
+    },
+    async beginHandoff() {
+      await ready;
+      pendingUpdate = { v: 1, nonce: '1'.repeat(32), targetVersion: '0.2.0-beta.4', artifactSha256: '2'.repeat(64), nativeSessionId: nativeId,
+        originalExpires: config.expires, resumeDeadline: now + 60000, resumeAuth };
+      await fixture.poll();
+    },
+    async cleanup() {
+      fixture.stop(); handoffResponse.resolve(); completeResponse.resolve(); confirmResponse.resolve();
+      await ready; await new Promise(resolve => setImmediate(resolve));
+    },
+  };
+  return fixture;
+}
+
+async function successfulHandoffScenario(source = sessionSource, earlyRestart = false) {
+  const f = await updateWindowFixture({ executableSource: source, holdComplete: earlyRestart });
+  try {
+    await f.beginHandoff(); await until(() => f.persisted === 1);
+    assert.equal(f.packets.length, 1);
+    assert.equal(f.packets[0].handoff.parentSid, f.peers[0].config.sid);
+    assert.equal(f.proofChecks.includes(true), true);
+    if (earlyRestart) { f.event('pqv-support-update-restart'); f.event('pagehide'); f.releaseComplete(); }
+    await until(() => f.suspended === 1 || f.calls.some(call => call.command === 'stop_support_session'));
+    assert.equal(f.suspended, 1);
+    f.event('pqv-support-update-restart'); f.event('pagehide');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.suspended, 1);
+    assert.equal(f.calls.some(call => call.command === 'stop_support_session'), false);
+    assert.equal(f.calls.some(call => call.pathname?.endsWith('/stop')), false);
+    assert.equal((await f.storage.get(`request:${f.registration.id}`)).handoffState, 'updating');
+    assert.match(f.status, /Sharing and control are paused/);
+  } finally { await f.cleanup(); }
+}
+test('actual session persists an acknowledged handoff and preserves it across pagehide', async () => {
+  await successfulHandoffScenario();
+});
+test('native restart before a held completion reply suspends idempotently without revoking the grant', async () => {
+  await successfulHandoffScenario(sessionSource, true);
+});
+
+async function stoppedHandoffScenario(source = sessionSource) {
+  const f = await updateWindowFixture({ executableSource: source, holdHandoff: true });
+  try {
+    await f.beginHandoff(); await until(() => f.issued !== undefined);
+    assert.equal((await f.storage.get(`request:${f.registration.id}`)).handoffState, 'updating');
+    f.stop(); await until(() => f.calls.some(call => call.command === 'stop_support_session'));
+    await until(() => f.calls.some(call => call.pathname?.endsWith('/handoff/stop') && call.status !== undefined));
+    assert.equal(Boolean(await f.storage.get(`request:${f.registration.id}`)), false);
+    assert.ok(f.calls.some(call => call.pathname?.endsWith('/handoff/stop') && call.token === f.registration.token));
+    f.releaseHandoff();
+    await until(() => f.calls.some(call => call.pathname?.endsWith('/handoff/stop') && call.token === f.issued.resumeTicket));
+    assert.equal(f.persisted, 0); assert.equal(f.packets.length, 0); assert.equal(f.suspended, 0);
+    assert.equal(Boolean(await f.storage.get(`request:${f.registration.id}`)), false);
+  } finally { await f.cleanup(); }
+}
+test('Stop during a held handoff reply removes the pending grant and cleans the late ticket', async () => {
+  await stoppedHandoffScenario();
+});
+
+test('bad handoff acknowledgement or failed native persistence revokes instead of restarting support', async () => {
+  for (const options of [{ badAck: true }, { completeResult: false }]) {
+    const f = await updateWindowFixture(options);
+    try {
+      await f.beginHandoff(); await until(() => f.calls.some(call => call.command === 'stop_support_session'));
+      await until(async () => !(await f.storage.get(`request:${f.registration.id}`)));
+      assert.equal(f.persisted, options.badAck ? 0 : 1);
+      assert.equal(f.suspended, 0);
+      assert.equal(f.status.startsWith('Connected.'), false);
+      assert.ok(f.intervals.every(timer => timer.cleared));
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('resumed actual session rotates guest credentials and verifies helper continuity before creating a peer', async () => {
+  const f = await updateWindowFixture({ resumed: true, holdConfirm: true });
+  try {
+    await f.ready; await until(() => f.calls.some(call => call.command === 'support_confirm_update_resume'));
+    assert.equal(f.peers.length, 1); assert.equal(f.approvals, 1); assert.deepEqual(f.proofChecks, [true]);
+    assert.deepEqual(f.peerCreationWasVerified, [true]);
+    assert.equal(f.registration.id, undefined); // Resume wire has no authority to choose another request ID.
+    assert.notEqual(f.registration.token, f.original.token);
+    assert.notEqual(f.registration.guestPublicKey, f.original.guestPublicKey);
+    assert.equal(f.peers[0].queue.requestId, f.original.id);
+    assert.notEqual(f.peers[0].config.sid, f.issued.handoff.parentSid);
+    assert.equal(f.status.startsWith('Connected.'), false); assert.equal(f.frames.length, 0);
+    f.releaseConfirm(); await until(() => f.status.startsWith('Connected.'));
+    await f.poll(); assert.equal(f.frames.length, 1);
+    const before = f.calls.length; f.stop(); await until(() => f.calls.some(call => call.command === 'stop_support_session'));
+    assert.equal(f.calls.slice(before).some(call => call.pathname?.endsWith('/handoff/stop')), false);
+    await until(async () => !(await f.storage.get(`request:${f.original.id}`)));
+    assert.equal(Boolean(await f.storage.get(`request:${f.original.id}`)), false);
+  } finally { await f.cleanup(); }
+});
+
+async function rejectedResumeScenario(options = {}, source = sessionSource) {
+    const f = await updateWindowFixture({ resumed: true, ...options, executableSource: source });
+    try {
+      await f.ready;
+      assert.equal(f.peers.length, 0); assert.equal(f.approvals, 0); assert.equal(f.frames.length, 0);
+      assert.equal(f.calls.some(call => call.command === 'support_confirm_update_resume'), false);
+      assert.ok(f.calls.some(call => call.command === 'stop_support_session'));
+      await until(async () => !(await f.storage.get(`request:${f.original.id}`)));
+      assert.equal(Boolean(await f.storage.get(`request:${f.original.id}`)), false);
+    } finally { await f.cleanup(); }
+}
+test('invalid or expired helper continuity never creates a peer or resumes sharing', async () => {
+  for (const options of [{ wrongResumeProof: true }, { expiredResume: true }]) await rejectedResumeScenario(options);
+});
+
+async function failedConfirmationScenario(mode, source = sessionSource) {
+    const f = await updateWindowFixture({ resumed: true, holdConfirm: mode !== 'rejected', confirmResult: mode !== 'rejected', executableSource: source });
+    try {
+      await f.ready; await until(() => f.calls.some(call => call.command === 'support_confirm_update_resume'));
+      if (mode === 'stop') f.stop();
+      if (mode === 'deadline') {
+        f.advance(60001);
+        const timer = f.timers.find(timer => timer.delay > 10000 && timer.delay <= 60000 && !timer.cleared);
+        assert.ok(timer); timer.callback();
+      }
+      f.releaseConfirm(); await until(() => f.calls.some(call => call.command === 'stop_support_session'));
+      f.peers[0].onState('connected');
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(f.status.startsWith('Connected.'), false); assert.equal(f.frames.length, 0);
+      assert.ok(f.intervals.every(timer => timer.cleared));
+    } finally { await f.cleanup(); }
+}
+test('Stop, the continuation deadline, or failed native confirmation cannot silently enable sharing', async () => {
+  for (const mode of ['stop', 'deadline', 'rejected']) await failedConfirmationScenario(mode);
+});
+
+test('known regression mutants are rejected by actual-session handoff and continuity scenarios', async () => {
+  const noAttemptStop = sessionSource.replace('if (service && handoffAttempt) bestEffortHandoffStop(service.origin, handoffAttempt.parentId, handoffAttempt.nonce, handoffAttempt.token);', '/* synthetic mutant: missing in-flight grant Stop */');
+  const noRestartEvent = sessionSource.replace("addEventListener('pqv-support-update-restart', () => { if (!suspendApprovedUpdate()) void stop('failed'); });", '/* synthetic mutant: missing native restart event */');
+  assert.notEqual(noAttemptStop, sessionSource); assert.notEqual(noRestartEvent, sessionSource);
+  await assert.rejects(stoppedHandoffScenario(noAttemptStop), { name: 'AssertionError' });
+  await assert.rejects(successfulHandoffScenario(noRestartEvent, true), { name: 'AssertionError' });
+  const noProofCheck = sessionSource.replace("if (!verifyUpdateProof(proof, result.claim.resumeProof)) throw Error('continuity');", '/* synthetic mutant: unchecked continuity proof */');
+  assert.notEqual(noProofCheck, sessionSource);
+  await assert.rejects(rejectedResumeScenario({ wrongResumeProof: true }, noProofCheck), { name: 'AssertionError' });
+  const noConfirmationGate = sessionSource.replace('if (ending || confirmed !== true || !resumedGrant || Date.now() >= resumedGrant.handoff.resumeDeadline)',
+    'if (ending || !resumedGrant || Date.now() >= resumedGrant.handoff.resumeDeadline)');
+  const noResumeTimer = sessionSource.replace("resumeTimer = setTimeout(() => { if (resumedGrant) void stop('expired'); }, Math.max(1, handoff.resumeDeadline - Date.now()));", '/* synthetic mutant: missing continuation deadline */');
+  const noLateTicketCleanup = sessionSource.replace("if (/^[a-f0-9]{64}$/.test(issued?.resumeTicket || '')) bestEffortHandoffStop(service.origin, raw.parentId, raw.nonce, issued.resumeTicket);", '/* synthetic mutant: missing late ticket cleanup */');
+  for (const mutant of [noConfirmationGate, noResumeTimer, noLateTicketCleanup]) assert.notEqual(mutant, sessionSource);
+  await assert.rejects(failedConfirmationScenario('rejected', noConfirmationGate), { name: 'AssertionError' });
+  await assert.rejects(failedConfirmationScenario('deadline', noResumeTimer), { name: 'AssertionError' });
+  await assert.rejects(stoppedHandoffScenario(noLateTicketCleanup), { name: 'AssertionError' });
 });

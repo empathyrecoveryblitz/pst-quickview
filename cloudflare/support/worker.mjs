@@ -1,8 +1,8 @@
-import { acceptClaim, validateRequest, validateServiceConfig, decodeQueueBytes } from '../../public/support/queue-protocol.js';
+import { acceptClaim, validateRequest, validateServiceConfig, validateUpdateHandoff, decodeQueueBytes } from '../../public/support/queue-protocol.js';
 
 export const QUEUE_LIMITS = Object.freeze({ requests: 64, messages: 128, ciphertext: 256 * 1024,
   leaseMs: 30000, bodyBytes: 32 * 1024, inFlight: 32, rateKeys: 512, replayKeys: 4096,
-  registrationReaders: 8, setupReaders: 128, controlReaders: 256, adminReaders: 2, controlBodyBytes: 64 });
+  registrationReaders: 8, setupReaders: 192, controlReaders: 384, adminReaders: 2, controlBodyBytes: 64 });
 const HEADERS = Object.freeze({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
   'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff',
   'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
@@ -57,12 +57,25 @@ async function jsonBody(request, deadlineMs, maxBytes = QUEUE_LIMITS.bodyBytes) 
 }
 async function deleteKeys(storage, keys) { for (let start = 0; start < keys.length; start += 128) await storage.delete(keys.slice(start, start + 128)); }
 async function deleteRequest(storage, id) {
+  await clearMessages(storage, id);
+  await storage.delete(`request:${id}`);
+}
+async function clearMessages(storage, id) {
   const messages = await storage.list({ prefix: `message:${id}:`, limit: 257 });
-  await deleteKeys(storage, [`request:${id}`, ...messages.keys()]);
+  await deleteKeys(storage, [...messages.keys()]);
 }
 function expired(record, now) {
+  if (record.handoff) return record.expires <= now || record.handoff.resumeDeadline <= now ||
+    record.controllerSeen + QUEUE_LIMITS.leaseMs <= now ||
+    (record.handoffState === 'resuming' && record.guestSeen + QUEUE_LIMITS.leaseMs <= now);
   return record.expires <= now || record.guestSeen + QUEUE_LIMITS.leaseMs <= now ||
     (record.claim !== null && record.controllerSeen + QUEUE_LIMITS.leaseMs <= now);
+}
+function queueRow(record) {
+  return { v: 3, id: record.id, guestPublicKey: record.guestPublicKey, expires: record.expires,
+    status: record.handoff ? record.handoffState : record.claim ? 'claimed' : 'waiting',
+    ...(record.handoff ? { handoff: record.handoff } : {}),
+    ...(record.handoffState === 'resuming' ? { resumeGuestProof: record.resumeGuestProof, guestTokenSha256: record.guestHash } : {}) };
 }
 
 // Wrangler configures this class with new_sqlite_classes. The transactional KV
@@ -141,15 +154,20 @@ export class SupportQueue {
         if (request.method !== 'POST') return null;
         let kind, key;
         if (url.pathname === '/v3/requests' && !url.search) kind = 'registration';
-        else if (/^\/v3\/admin\/requests\/[a-f0-9]{32}\/claim$/.test(url.pathname) && !url.search) {
+        else if (/^\/v3\/admin\/requests\/[a-f0-9]{32}\/(?:claim|handoff\/stop)$/.test(url.pathname) && !url.search) {
           if (!equal(bearer(request), this.env.ADMIN_TOKEN)) reject(401);
-          kind = 'admin';
+          if (url.pathname.endsWith('/handoff/stop')) { kind = 'control'; key = `${url.pathname.split('/')[4]}:admin:control:stop`; }
+          else kind = 'admin';
         } else {
-          const bodyRoute = /^\/v3\/requests\/([a-f0-9]{32})\/(api\/send|send|heartbeat|stop)$/.exec(url.pathname);
+          const bodyRoute = /^\/v3\/requests\/([a-f0-9]{32})\/(api\/send|send|heartbeat|stop|handoff|resume|handoff\/heartbeat|handoff\/stop)$/.exec(url.pathname);
           if (!bodyRoute || url.search) return null;
-          const { role } = await this.authenticate(request, bodyRoute[1]);
-          kind = ['heartbeat', 'stop'].includes(bodyRoute[2]) ? 'control' : 'setup';
-          key = `${bodyRoute[1]}:${role}:${kind}${kind === 'control' ? ':' + bodyRoute[2] : ''}`;
+          const action = bodyRoute[2];
+          const { role } = ['resume', 'handoff/heartbeat', 'handoff/stop'].includes(action) ?
+            await this.authenticateHandoff(request, bodyRoute[1], action) : await this.authenticate(request, bodyRoute[1]);
+          kind = ['heartbeat', 'stop', 'handoff/heartbeat', 'handoff/stop'].includes(action) ? 'control' : 'setup';
+          // Normal and handoff aliases share one semantic control slot. Ticket
+          // and admin revocation retain independent bounded Stop authority.
+          key = `${bodyRoute[1]}:${role}:${kind}${kind === 'control' ? ':' + (action.endsWith('stop') ? 'stop' : 'heartbeat') : ''}`;
         }
         if (this.receiving[kind] >= QUEUE_LIMITS[`${kind}Readers`] || (key && this.readerKeys.has(key))) reject(429);
         this.receiving[kind]++; if (key) this.readerKeys.add(key);
@@ -183,17 +201,38 @@ export class SupportQueue {
     if (expired(record, this.now())) reject(410);
     return { record, role };
   }
+  async authenticateHandoff(request, id, action) {
+    const record = await this.state.storage.get(`request:${id}`); if (!record) reject(404);
+    const token = bearer(request); if (!token) reject(401);
+    const hash = await digest(token);
+    if (expired(record, this.now())) reject(410);
+    if (record.handoff && ['resume', 'handoff/stop'].includes(action) && equal(hash, record.handoff.resumeTicketSha256)) return { record, role: 'ticket' };
+    if (record.handoffState === 'updating' && action !== 'resume') {
+      if (equal(hash, record.guestHash)) return { record, role: 'guest' };
+      if (equal(hash, record.controllerHash)) return { record, role: 'controller' };
+    }
+    reject(401);
+  }
   async handle(request, url, service, preparedBody) {
     const storage = this.state.storage, now = this.now(), token = bearer(request);
     if (url.pathname.startsWith('/v3/admin/')) {
       if (!token || !equal(token, this.env.ADMIN_TOKEN)) reject(401);
       if (url.pathname === '/v3/admin/queue' && request.method === 'GET' && !url.search) {
         const rows = await storage.list({ prefix: 'request:', limit: QUEUE_LIMITS.requests });
-        return { requests: [...rows.values()].map(record => ({ v: 3, id: record.id, guestPublicKey: record.guestPublicKey, expires: record.expires, status: record.claim ? 'claimed' : 'waiting' })) };
+        return { requests: [...rows.values()].map(queueRow) };
+      }
+      const stop = /^\/v3\/admin\/requests\/([a-f0-9]{32})\/handoff\/stop$/.exec(url.pathname);
+      if (stop && !url.search && request.method === 'POST') {
+        const record = await storage.get(`request:${stop[1]}`); if (!record) reject(404);
+        if (!record.handoff) reject(409);
+        if (!exact(preparedBody, ['nonce']) || preparedBody.nonce !== record.handoff.nonce) reject(400);
+        await storage.transaction(transaction => deleteRequest(transaction, record.id)); return { stopped: true };
       }
       const match = /^\/v3\/admin\/requests\/([a-f0-9]{32})\/claim$/.exec(url.pathname);
       if (!match || url.search || request.method !== 'POST') reject(404);
       const record = await storage.get(`request:${match[1]}`); if (!record) reject(404);
+      if (record.handoffState === 'updating') reject(409);
+      if (!record.claim && (record.handoffState === 'resuming') !== Object.hasOwn(preparedBody || {}, 'resumeProof')) reject(400);
       let claim;
       try { claim = await acceptClaim({ v: 3, id: record.id, guestPublicKey: record.guestPublicKey, expires: record.expires }, preparedBody, service); }
       catch (error) { if (typeof error === 'number') throw error; reject(400); }
@@ -203,8 +242,10 @@ export class SupportQueue {
           if (JSON.stringify(current.claim) !== JSON.stringify(claim)) reject(409);
           return { token: current.controllerToken, claim: current.claim };
         }
+        if (current.handoff && (current.handoffState !== 'resuming' || claim.payload.sid === current.handoff.parentSid || claim.payload.helperPublicKey === current.previousHelperPublicKey)) reject(400);
         const controllerToken = hex(crypto.getRandomValues(new Uint8Array(32)));
         current.claim = claim; current.controllerToken = controllerToken; current.controllerHash = await digest(controllerToken); current.controllerSeen = this.now();
+        delete current.handoff; delete current.handoffState; delete current.previousHelperPublicKey; delete current.resumeGuestProof;
         await transaction.put(`request:${record.id}`, current);
         return { token: controllerToken, claim };
       });
@@ -216,7 +257,7 @@ export class SupportQueue {
       await crypto.subtle.importKey('raw', decodeQueueBytes(row.guestPublicKey, 65), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
       return await storage.transaction(async transaction => {
         const existing = await transaction.get(`request:${row.id}`);
-        if (existing && !expired(existing, now) && equal(existing.guestHash, guestHash) && existing.guestPublicKey === row.guestPublicKey && existing.expires === row.expires) {
+        if (existing && !existing.handoff && !expired(existing, now) && equal(existing.guestHash, guestHash) && existing.guestPublicKey === row.guestPublicKey && existing.expires === row.expires) {
           return { v: 3, id: row.id, expires: row.expires, claim: existing.claim };
         }
         if (await transaction.get(`replay:${row.id}`)) reject(409);
@@ -229,10 +270,54 @@ export class SupportQueue {
         return { v: 3, id: row.id, expires: row.expires, claim: null };
       });
     }
+    const transition = /^\/v3\/requests\/([a-f0-9]{32})\/(resume|handoff|handoff\/heartbeat|handoff\/stop)$/.exec(url.pathname);
+    if (transition && request.method === 'POST' && !url.search) {
+      const id = transition[1], action = transition[2];
+      const { record, role } = action === 'handoff' ? await this.authenticate(request, id) : await this.authenticateHandoff(request, id, action);
+      if (role !== 'ticket') {
+        if (++record.calls[role] > 6000) reject(429);
+        await storage.put(`request:${id}`, record);
+      }
+      if (action === 'handoff') {
+        if (role !== 'guest') reject(403);
+        if (!record.claim || record.handoff) reject(409);
+        let base; try { base = validateUpdateHandoff(preparedBody, { requireTicketHash: false, now }); } catch { reject(400); }
+        if (base.parentId !== id || base.parentSid !== record.claim.payload.sid || base.originalExpires !== record.expires) reject(400);
+        const resumeTicket = hex(crypto.getRandomValues(new Uint8Array(32)));
+        const handoff = { ...base, resumeTicketSha256: await digest(resumeTicket) };
+        record.handoff = handoff; record.handoffState = 'updating'; record.previousHelperPublicKey = record.claim.payload.helperPublicKey;
+        record.sequences = { guest: 0, controller: 0 }; record.bytes = { guest: 0, controller: 0 };
+        await storage.transaction(async transaction => { await clearMessages(transaction, id); await transaction.put(`request:${id}`, record); });
+        return { resumeTicket, handoff };
+      }
+      if (action === 'handoff/stop' || action === 'handoff/heartbeat') {
+        if (!exact(preparedBody, ['nonce']) || preparedBody.nonce !== record.handoff.nonce) reject(400);
+        if (action === 'handoff/stop') { await storage.transaction(transaction => deleteRequest(transaction, id)); return { stopped: true }; }
+        if (role === 'controller') record.controllerSeen = now;
+        else record.guestSeen = now;
+        await storage.put(`request:${id}`, record); return { alive: true, expiresAt: record.expires };
+      }
+      if (record.handoffState !== 'updating') reject(409);
+      if (!exact(preparedBody, ['v', 'nonce', 'targetVersion', 'artifactSha256', 'guestPublicKey', 'token', 'proof']) || preparedBody.v !== 1 ||
+          preparedBody.nonce !== record.handoff.nonce || preparedBody.targetVersion !== record.handoff.targetVersion || preparedBody.artifactSha256 !== record.handoff.artifactSha256 ||
+          !HEX.test(preparedBody.token) || !HEX.test(preparedBody.proof) || preparedBody.guestPublicKey === record.guestPublicKey || preparedBody.guestPublicKey === record.previousHelperPublicKey) reject(400);
+      let key; try { key = decodeQueueBytes(preparedBody.guestPublicKey, 65); } catch { reject(400); }
+      await crypto.subtle.importKey('raw', key, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+      const guestHash = await digest(preparedBody.token);
+      if ([record.guestHash, record.controllerHash, record.handoff.resumeTicketSha256].some(hash => equal(hash, guestHash))) reject(400);
+      // HMAC proofs remain opaque: only the two approved endpoints know the
+      // continuation secret. Fresh role tokens revoke all old peer authority.
+      record.handoffState = 'resuming'; record.guestHash = guestHash; record.guestPublicKey = preparedBody.guestPublicKey; record.guestSeen = now;
+      record.resumeGuestProof = preparedBody.proof; record.claim = null; record.controllerHash = null; delete record.controllerToken;
+      record.sequences = { guest: 0, controller: 0 }; record.bytes = { guest: 0, controller: 0 }; record.calls = { guest: 0, controller: 0 };
+      await storage.transaction(async transaction => { await clearMessages(transaction, id); await transaction.put(`request:${id}`, record); });
+      return { v: 3, id, expires: record.expires, claim: null };
+    }
     const match = /^\/v3\/requests\/([a-f0-9]{32})(?:\/(api\/send|api\/poll|send|poll|heartbeat|stop))?$/.exec(url.pathname);
     if (!match) reject(404);
     const id = match[1], action = match[2]?.replace('api/', '');
     const { record, role } = await this.authenticate(request, id);
+    if (record.handoffState === 'updating' || (record.handoff && !['heartbeat', undefined].includes(action))) reject(409);
     if (++record.calls[role] > 6000) reject(429);
     await storage.put(`request:${id}`, record);
     if (!action && request.method === 'GET' && !url.search) {

@@ -31,6 +31,7 @@ const importIntegrityPhase2Source = readFileSync(importIntegrityPhase2Url, "utf8
 const appSource = readFileSync(appSourceUrl, "utf8");
 const supportPanelSource = readFileSync(new URL("../src/RemoteSupportPanel.tsx", import.meta.url), "utf8");
 const supportControlSource = readFileSync(new URL("../src/RemoteSupportControl.tsx", import.meta.url), "utf8");
+const updaterPanelSource = readFileSync(new URL("../src/DevelopmentUpdatePanel.tsx", import.meta.url), "utf8");
 const supportSessionSource = readFileSync(new URL("../public/support/session.js", import.meta.url), "utf8");
 const supportRustSource = readFileSync(new URL("../src-tauri/src/support_session.rs", import.meta.url), "utf8");
 const releaseVerifier = readFileSync(releaseVerifierUrl, "utf8");
@@ -184,7 +185,7 @@ function extractSupportSessionCommands(source) {
   return extractFrontendCommands(source.replace(wrapper, ""));
 }
 
-const mainFrontendCommands = [appSource, supportPanelSource, supportControlSource]
+const mainFrontendCommands = [appSource, supportPanelSource, supportControlSource, updaterPanelSource]
   .flatMap(extractFrontendCommands);
 const supportFrontendCommands = extractSupportSessionCommands(supportSessionSource);
 
@@ -196,9 +197,12 @@ const previewCorePermissions = new Set(["core:window:allow-set-title"]);
 const previewOnlyCommands = new Set(["get_preview_window_target"]);
 const mainSupportCommands = new Set([
   "request_support_session", "support_service_status", "support_session_status", "publish_support_frame", "stop_support_session",
+  "check_verified_update", "approve_verified_update", "support_resume_status", "resume_support_after_update",
 ]);
 const supportCommands = new Set([
   "bootstrap_support_session", "poll_support_frame", "support_submit_action", "stop_support_session",
+  "poll_support_update_handoff", "complete_support_update_handoff",
+  "support_confirm_update_resume",
 ]);
 const capabilityKeys = ["$schema", "description", "identifier", "permissions", "windows"];
 const previewCommands = new Set([
@@ -366,7 +370,7 @@ test("main, preview, and support capabilities have exact constrained authority",
   assert.equal(new Set(preview.permissions).size, preview.permissions.length);
   assert.equal(new Set(support.permissions).size, support.permissions.length);
   assert.deepEqual(new Set(supportFrontendCommands), supportCommands);
-  assert.deepEqual(new Set([supportPanelSource, supportControlSource].flatMap(extractFrontendCommands)), mainSupportCommands);
+  assert.deepEqual(new Set([supportPanelSource, supportControlSource, updaterPanelSource].flatMap(extractFrontendCommands)), mainSupportCommands);
   assert.deepEqual(
     [...generatedCommands.filter((command) => !allFrontendCommands.has(command))].sort(),
     ["export_original_eml", "reveal_exported_file", "start_support_session"],
@@ -723,6 +727,10 @@ test("packaged support inventory pins exact literals, architecture neighbors, an
       exact.replace("content-security-policy", "Content-Security-Policy"),
       exact.replace("content-security-policy", "CoNtEnT-SeCuRiTy-PoLiCy"),
     ]) assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(rejected), arch).status, 0);
-    assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(exact), arch === "arm64" ? "x86_64" : "arm64").status, 0);
+    if (arch === "arm64") {
+      assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(exact), "x86_64").status, 0);
+    } else {
+      assert.equal(verifySyntheticPackagedCsp(Buffer.from(exact), "arm64").status, 0);
+    }
   }
 });

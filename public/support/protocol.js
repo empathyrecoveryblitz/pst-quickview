@@ -343,5 +343,17 @@ export function validateDataMessage(raw, { sid, sourceRole } = {}) {
     validateAction(raw.action);
     return raw;
   }
+  if (raw.type === 'update-handoff' && sourceRole === 'guest' && exactKeys(raw, ['type', 'handoff', 'resumeAuth'])) {
+    const handoff = raw.handoff, now = Date.now(), hex64 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+    if (exactKeys(handoff, ['v', 'parentId', 'parentSid', 'nonce', 'targetVersion', 'artifactSha256', 'nativeSessionId', 'originalExpires', 'resumeDeadline', 'resumeTicketSha256'])
+      && handoff.v === 1 && identifier(handoff.parentId) && handoff.parentSid === sid && identifier(handoff.nonce)
+      && typeof handoff.targetVersion === 'string' && handoff.targetVersion.length <= 128
+      && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(handoff.targetVersion)
+      && hex64(handoff.artifactSha256) && identifier(handoff.nativeSessionId) && hex64(handoff.resumeTicketSha256) && hex64(raw.resumeAuth)
+      && Number.isSafeInteger(handoff.originalExpires) && handoff.originalExpires > now && handoff.originalExpires <= now + 30 * 60 * 1000
+      && Number.isSafeInteger(handoff.resumeDeadline) && handoff.resumeDeadline > now && handoff.resumeDeadline <= handoff.originalExpires && handoff.resumeDeadline <= now + 90000) return raw;
+  }
+  if (raw.type === 'update-handoff-ack' && sourceRole === 'controller' && exactKeys(raw, ['type', 'nonce', 'proof'])
+    && identifier(raw.nonce) && typeof raw.proof === 'string' && /^[a-f0-9]{64}$/.test(raw.proof)) return raw;
   throw new Error('Invalid support data.');
 }

@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "origin": "https://pst-quickview-support.pstquickview.workers.dev",
+  "manifestPath": "/updates/development.json",
+  "artifactPrefix": "/updates/artifacts/",
+  "publicKey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQwQUEyQTI4Q0M5NzdBOUYKUldTZmVwZk1LQ3FxMERrdnBmdzlRQXZnMTVtSU1FZXJnekRNLzhTVldGWWZwNjFXN29Sa2R2TCsK",
+  "channel": "support-development"
+}

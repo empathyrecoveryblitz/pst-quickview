@@ -49,9 +49,10 @@ export function RemoteSupportPanel({ onApproved }: { onApproved: () => void }) {
       <p>{service.configured ? <>Your approved helper is <strong>{service.operatorLabel}</strong>. Request support here; your helper can accept it from their dashboard.</> : "Remote Support is not configured in this application build. No request can be sent."}</p>
       <p>A direct encrypted connection is required; there is no data-relay fallback. Cloudflare handles the temporary request and encrypted connection setup, without receiving app content.</p>
       <label className="support-approval"><input type="checkbox" checked={approved} disabled={busy || !service.configured} onChange={event => setApproved(event.target.checked)} />
-        I trust {service.configured ? service.operatorLabel : "the configured helper"} and approve sharing visible PST QuickView text and layout, including visible messages, and control of marked navigation/search controls for this session (up to 30 minutes).
+        I trust {service.configured ? service.operatorLabel : "the configured helper"} and approve sharing visible PST QuickView text and layout, including visible messages, and control of marked navigation/search controls for this session (up to 30 minutes). I understand my helper may use an AI assistant to inspect the shared view.
       </label>
       <p>No desktop, terminal, arbitrary files, attachments, native dialogs, audio, camera, or microphone access. The app view is a live text/layout mirror, not a pixel-perfect screen recording. Mail images and separate preview windows are not shared. No mailbox data goes through the setup service or is recorded by this app.</p>
+      <p>Only share mail you are authorized to disclose. If your helper uses an AI assistant, displayed content may be processed by that assistant; keeping mail out of GitHub does not prevent that processing.</p>
       <button type="button" disabled={!approved || !service.configured || busy} onClick={() => void start()}>{busy ? "Requesting…" : "Approve and request support"}</button>
       <p className="message-action-status" role="status" aria-live="polite">{status}</p>
     </div>

@@ -26,13 +26,20 @@ run_frontend_security_tests() {
     tests/loggingPrivacy.test.mjs \
     tests/runtimeProfileIsolation.test.mjs \
     tests/remoteSupport.test.mjs \
+    tests/developmentUpdateUI.test.mjs \
+    tests/developmentUpdateDispatch.test.mjs \
     tests/packagedCspInspection.test.mjs \
+    tests/packagedSupportPins.test.mjs \
     tests/supportDashboard.test.mjs \
+    tests/supportDashboardLauncher.test.mjs \
     tests/supportOperatorSetup.test.mjs \
     tests/supportProtocol.test.mjs \
     tests/supportQueueProtocol.test.mjs \
     tests/supportQueueWorker.test.mjs \
     tests/supportServer.test.mjs \
+    tests/supportUpdateArtifact.test.mjs \
+    tests/supportUpdateAssets.test.mjs \
+    tests/supportUpdateLive.test.mjs \
     tests/supportView.test.mjs \
     tests/searchCancellation.test.mjs \
     tests/searchHighlight.test.mjs \

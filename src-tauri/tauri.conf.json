@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PST QuickView",
-  "version": "0.2.0-beta.3",
+  "version": "0.2.0-beta.3.support.1",
   "identifier": "com.local.pstquickview",
   "build": {
     "beforeBuildCommand": "npm run build",
@@ -50,7 +50,7 @@
       }
     ],
     "macOS": {
-      "bundleVersion": "0.2.0.3",
+      "bundleVersion": "0.2.0.301",
       "hardenedRuntime": true,
       "infoPlist": "Info.plist"
     },
@@ -70,5 +70,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQwQUEyQTI4Q0M5NzdBOUYKUldTZmVwZk1LQ3FxMERrdnBmdzlRQXZnMTVtSU1FZXJnekRNLzhTVldGWWZwNjFXN29Sa2R2TCsK",
+      "endpoints": ["https://pst-quickview-support.pstquickview.workers.dev/updates/development.json"],
+      "requireSignedVersion": true,
+      "allowDowngrades": false
+    }
   }
 }

@@ -9,7 +9,7 @@ const ICE = [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:stun.l.goo
 const encoder = new TextEncoder();
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-export async function createSupportPeer({ config, queue, onState, onFrame, onAction, onClose } = {}) {
+export async function createSupportPeer({ config, queue, onState, onFrame, onAction, onClose, onUpdateHandoff, onUpdateHandoffAck } = {}) {
   if (queue !== undefined && (!queue || typeof queue !== 'object' || Array.isArray(queue)
     || Object.keys(queue).length !== 2 || !Object.hasOwn(queue, 'origin') || !Object.hasOwn(queue, 'requestId')
     || typeof queue.requestId !== 'string' || !/^[a-f0-9]{32}$/.test(queue.requestId))) {
@@ -28,17 +28,18 @@ export async function createSupportPeer({ config, queue, onState, onFrame, onAct
   let remoteSequence = 0, remoteCandidates = 0, lastPeerAt = 0, lastFrameAt = -Infinity;
   let sendChain = Promise.resolve(), pendingLocal = [], pendingRemote = [];
   let negotiationTimer, gatheringTimer, heartbeatTimer;
+  let updatePacket, updateAck = false, updateAckPending = false, updateTimer;
   const localCandidates = new Set(), requests = new Set();
   let receiveWindow = Date.now(), receivedInWindow = 0, actionWindow = Date.now(), actionsInWindow = 0;
   const emit = state => { try { onState?.(state); } catch {} };
   const notifyClose = reason => { try { onClose?.(reason); } catch {} };
   const expiryTimer = setTimeout(() => fail('expired'), Math.max(1, cfg.expires - Date.now()));
 
-  function shutdown(reason) {
+  function shutdown(reason, notify = true) {
     if (ended) return;
     ended = true;
     connected = false;
-    clearTimeout(expiryTimer); clearTimeout(negotiationTimer); clearTimeout(gatheringTimer); clearInterval(heartbeatTimer);
+    clearTimeout(expiryTimer); clearTimeout(negotiationTimer); clearTimeout(gatheringTimer); clearInterval(heartbeatTimer); clearTimeout(updateTimer);
     for (const request of requests) request.abort();
     requests.clear();
     if (channel) {
@@ -51,8 +52,10 @@ export async function createSupportPeer({ config, queue, onState, onFrame, onAct
       try { pc.close(); } catch {}
     }
     pendingLocal = []; pendingRemote = []; localCandidates.clear();
+    if (updatePacket) updatePacket.resumeAuth = '';
+    updatePacket = undefined;
     cipher = null; cfg.key = ''; cfg.token = '';
-    notifyClose(reason);
+    if (notify) notifyClose(reason);
   }
 
   function fail(phase) {
@@ -231,6 +234,25 @@ export async function createSupportPeer({ config, queue, onState, onFrame, onAct
     catch { fail('data'); return false; }
   }
 
+  function rememberHandoff(packet) {
+    if (queue === undefined || updatePacket || packet.handoff.parentId !== queue.requestId || packet.handoff.originalExpires !== cfg.expires) throw new Error('update');
+    updatePacket = JSON.parse(JSON.stringify(packet));
+    updateTimer = setTimeout(() => fail('expired'), Math.max(1, packet.handoff.resumeDeadline - Date.now()));
+    emit('updating');
+  }
+
+  function suspendForUpdate() {
+    if (ended || !updatePacket || !updateAck || Date.now() >= updatePacket.handoff.resumeDeadline) return false;
+    emit('updating'); shutdown('updating', false); return true;
+  }
+
+  async function updateAckMatches(packet, proof) {
+    // The retired manual-invitation helper does not serve queue assets. Load
+    // queue continuity crypto only for an authenticated queue-mode handoff.
+    const { ackProof, verifyUpdateProof } = await import('./queue-protocol.js');
+    return verifyUpdateProof(await ackProof(packet.resumeAuth, packet.handoff), proof);
+  }
+
   async function heartbeat() {
     if (ended) return;
     if (Date.now() - lastPeerAt >= 12000) { fail('disconnected'); return; }
@@ -281,11 +303,24 @@ export async function createSupportPeer({ config, queue, onState, onFrame, onAct
           return;
         }
         if (!connected) throw new Error('state');
-        if (message.type === 'frame') { try { onFrame?.(message.frame); } catch {} }
-        else if (message.type === 'action') { try { onAction?.(message.action); } catch {} }
+        if (message.type === 'update-handoff') {
+          rememberHandoff({ handoff: message.handoff, resumeAuth: message.resumeAuth });
+          try { onUpdateHandoff?.({ handoff: { ...message.handoff }, resumeAuth: message.resumeAuth }); } catch { fail('update'); }
+        } else if (message.type === 'update-handoff-ack') {
+          if (!updatePacket || updateAck || updateAckPending || message.nonce !== updatePacket.handoff.nonce) throw new Error('update');
+          updateAckPending = true;
+          const packet = updatePacket;
+          void updateAckMatches(packet, message.proof).then(valid => {
+            if (ended || packet !== updatePacket) return;
+            if (!valid) { fail('update'); return; }
+            updateAck = true;
+            try { onUpdateHandoffAck?.({ nonce: message.nonce, proof: message.proof }); } catch { fail('update'); }
+          }).catch(() => fail('update'));
+        } else if (!updatePacket && message.type === 'frame') { try { onFrame?.(message.frame); } catch {} }
+        else if (!updatePacket && message.type === 'action') { try { onAction?.(message.action); } catch {} }
       } catch { fail('protocol'); }
     };
-    ch.onclose = () => fail('disconnected');
+    ch.onclose = () => { if (!suspendForUpdate()) fail('disconnected'); };
     ch.onerror = () => fail('data');
   }
 
@@ -354,7 +389,7 @@ export async function createSupportPeer({ config, queue, onState, onFrame, onAct
       } catch { fail('signaling'); return false; }
     },
     sendFrame(frame) {
-      if (ended || !connected || cfg.role !== 'guest') return false;
+      if (ended || !connected || updatePacket || cfg.role !== 'guest') return false;
       validateFrame(frame);
       const now = performance.now();
       if (now - lastFrameAt < 500) return false;
@@ -363,7 +398,7 @@ export async function createSupportPeer({ config, queue, onState, onFrame, onAct
       return true;
     },
     sendAction(action) {
-      if (ended || !connected || cfg.role !== 'controller') return false;
+      if (ended || !connected || updatePacket || cfg.role !== 'controller') return false;
       validateAction(action);
       const now = Date.now();
       if (now - actionWindow >= 1000) { actionWindow = now; actionsInWindow = 0; }
@@ -372,6 +407,29 @@ export async function createSupportPeer({ config, queue, onState, onFrame, onAct
       actionsInWindow++;
       return true;
     },
+    sendUpdateHandoff(packet) {
+      if (ended || !connected || updatePacket || cfg.role !== 'guest' || queue === undefined) return false;
+      const message = validateDataMessage({ type: 'update-handoff', ...packet }, { sid: cfg.sid, sourceRole: 'guest' });
+      if (message.type !== 'update-handoff' || message.handoff.parentId !== queue.requestId || message.handoff.originalExpires !== cfg.expires) return false;
+      rememberHandoff({ handoff: message.handoff, resumeAuth: message.resumeAuth });
+      if (!dataSend(message)) { fail('update'); return false; }
+      return true;
+    },
+    async sendUpdateHandoffAck(ack) {
+      if (ended || !connected || cfg.role !== 'controller' || !updatePacket || updateAck || updateAckPending) return false;
+      const message = validateDataMessage({ type: 'update-handoff-ack', ...ack }, { sid: cfg.sid, sourceRole: 'controller' });
+      const packet = updatePacket;
+      if (message.type !== 'update-handoff-ack' || message.nonce !== packet.handoff.nonce) return false;
+      updateAckPending = true;
+      try {
+        const valid = await updateAckMatches(packet, message.proof);
+        if (ended || packet !== updatePacket || !valid) { updateAckPending = false; return false; }
+        updateAck = true;
+        if (!dataSend(message)) { updateAck = false; fail('update'); return false; }
+        return true;
+      } catch { fail('update'); return false; }
+    },
+    suspendForUpdate,
     close() {
       if (ended) return;
       const finalCipher = cipher, token = cfg.token, origin = cfg.origin;

@@ -27,6 +27,7 @@ const INVALID_ACTION: &str = "This support action is invalid or no longer curren
 const SERVICE_UNAVAILABLE: &str = "Remote Support is not configured in this application build.";
 const SERVICE_CONFIG: &str = include_str!("../../public/support/service.json");
 const REVOKE_EVENT: &str = "window.dispatchEvent(new Event('pqv-support-revoked'))";
+const UPDATE_RESTART_EVENT: &str = "window.dispatchEvent(new Event('pqv-support-update-restart'))";
 type SupportResult<T> = Result<T, String>;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -61,6 +62,8 @@ pub(crate) struct QueueBootstrap {
     operator_public_key: String,
     operator_label: String,
     expires: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume: Option<crate::updater::ResumeBootstrap>,
 }
 
 #[derive(Clone, Serialize)]
@@ -103,9 +106,19 @@ pub(crate) struct ServiceStatus {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionStatus {
-    session_id: String,
+    pub(crate) session_id: String,
     expires_at: u64,
     operator_label: String,
+    updating: bool,
+}
+
+pub(crate) struct UpdateParent {
+    pub(crate) session_id: String,
+    pub(crate) expires: u64,
+    pub(crate) origin: String,
+    pub(crate) operator_public_key: String,
+    pub(crate) operator_label: String,
+    pub(crate) remaining_ms: u64,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -192,6 +205,8 @@ struct Session {
     frames: VecDeque<(Instant, SupportFrame)>,
     published: VecDeque<Instant>,
     actions: VecDeque<Instant>,
+    updating: bool,
+    resume_original_deadline: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -480,6 +495,7 @@ impl Session {
             session_id: self.id.clone(),
             expires_at: self.config.expires(),
             operator_label: self.config.operator_label().to_string(),
+            updating: self.updating,
         }
     }
 
@@ -495,6 +511,9 @@ impl Session {
 
     fn publish(&mut self, frame: SupportFrame, now: Instant) -> SupportResult<bool> {
         self.heartbeat = now;
+        if self.updating {
+            return Ok(false);
+        }
         while self
             .published
             .front()
@@ -522,7 +541,7 @@ impl Session {
     }
 
     fn authorize_action(&mut self, action: &SupportAction, now: Instant) -> SupportResult<()> {
-        if !self.alive(now) || !validate_action(action) {
+        if self.updating || !self.alive(now) || !validate_action(action) {
             return Err(INVALID_ACTION.to_string());
         }
         while self
@@ -548,6 +567,23 @@ impl Session {
         }
         self.actions.push_back(now);
         Ok(())
+    }
+
+    fn confirm_resumed(&mut self, now: Instant) -> SupportResult<bool> {
+        if !self.alive(now) || self.updating {
+            return Err(SESSION_UNAVAILABLE.to_string());
+        }
+        let Some(original_deadline) = self.resume_original_deadline.take() else {
+            return Ok(false);
+        };
+        if original_deadline <= now {
+            return Err(SESSION_UNAVAILABLE.to_string());
+        }
+        self.deadline = original_deadline;
+        if let SessionConfig::Queue(config) = &mut self.config {
+            config.resume = None;
+        }
+        Ok(true)
     }
 }
 
@@ -608,9 +644,12 @@ fn take_session(app: &tauri::AppHandle, id: Option<&str>) -> Option<String> {
 }
 
 fn stop_matching(app: &tauri::AppHandle, id: Option<&str>) {
+    let revoked = crate::updater::revoke_resume_authority(app, id);
     // Revoke broker authority before asking the isolated bundled document to
-    // notify the queue. This fixed event contains no remote or user input.
-    if let Some(label) = take_session(app, id) {
+    // notify the queue or touching Keychain, which may require OS interaction.
+    // This fixed event contains no remote or user input.
+    let stopped_label = take_session(app, id);
+    if let Some(label) = stopped_label {
         if let Some(window) = app.get_webview_window(&label) {
             let _ = window.eval(REVOKE_EVENT);
             thread::spawn(move || {
@@ -619,9 +658,31 @@ fn stop_matching(app: &tauri::AppHandle, id: Option<&str>) {
             });
         }
     }
+    if revoked {
+        crate::updater::cleanup_revoked_resume();
+    }
 }
 
 pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: &tauri::RunEvent) {
+    if crate::updater::expected_update_restart(app)
+        && matches!(
+            event,
+            tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+        )
+    {
+        if let Some(label) = take_session(app, None) {
+            if let Some(window) = app.get_webview_window(&label) {
+                let _ = window.eval(UPDATE_RESTART_EVENT);
+            }
+        }
+        if matches!(event, tauri::RunEvent::Exit) {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+            crate::updater::finish_expected_update_exit(app);
+        }
+        return;
+    }
     match event {
         tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. } => stop_matching(app, None),
         tauri::RunEvent::WindowEvent {
@@ -641,7 +702,9 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: &tauri::RunEvent) 
                     .is_some_and(|session| session.label == *label)
             };
             if relevant {
-                stop_matching(app, None);
+                if !crate::updater::expected_update_restart(app) {
+                    stop_matching(app, None);
+                }
             }
         }
         _ => {}
@@ -696,6 +759,7 @@ pub(crate) async fn request_support_session(
         operator_public_key: config.operator_public_key,
         operator_label: config.operator_label,
         expires: now.saturating_add(30 * 60 * 1000),
+        resume: None,
     };
     open_approved_session(app, SessionConfig::Queue(queue), now)
 }
@@ -715,12 +779,47 @@ fn open_approved_session(
         .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
     let id = hex::encode(random);
     let label = format!("{PREFIX}{id}");
+    let starts_paused = matches!(
+        &config,
+        SessionConfig::Queue(QueueBootstrap {
+            resume: Some(_),
+            ..
+        })
+    );
     let status = SessionStatus {
         session_id: id.clone(),
         expires_at: config.expires(),
         operator_label: config.operator_label().to_string(),
+        updating: starts_paused,
     };
     let instant = Instant::now();
+    let resume_original_deadline = match &config {
+        SessionConfig::Queue(QueueBootstrap {
+            resume: Some(resume),
+            ..
+        }) => Some(
+            instant
+                + Duration::from_millis(
+                    resume
+                        .native_remaining_ms
+                        .min(config.expires().saturating_sub(now)),
+                ),
+        ),
+        _ => None,
+    };
+    let remaining_ms = match &config {
+        SessionConfig::Queue(QueueBootstrap {
+            resume: Some(resume),
+            ..
+        }) => resume
+            .native_remaining_ms
+            .min(resume.native_connect_remaining_ms)
+            .min(config.expires().saturating_sub(now)),
+        _ => config.expires().saturating_sub(now),
+    };
+    if remaining_ms == 0 {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    }
     let state = app.state::<SupportSessionState>();
     {
         let mut broker = state
@@ -733,12 +832,14 @@ fn open_approved_session(
         broker.active = Some(Session {
             id: id.clone(),
             label: label.clone(),
-            deadline: instant + Duration::from_millis(config.expires() - now),
+            deadline: instant + Duration::from_millis(remaining_ms),
             config,
             heartbeat: instant,
             frames: VecDeque::new(),
             published: VecDeque::new(),
             actions: VecDeque::new(),
+            updating: starts_paused,
+            resume_original_deadline,
         });
     }
     let navigation_id = id.clone();
@@ -898,6 +999,9 @@ pub(crate) fn poll_support_frame(
     if !session.support_window(window.label(), &session_id) || !session.alive(now) {
         return Err(SESSION_UNAVAILABLE.to_string());
     }
+    if session.updating {
+        return Ok(None);
+    }
     Ok(session
         .frames
         .back()
@@ -939,7 +1043,7 @@ pub(crate) fn support_submit_action(
         .map_err(|_| SESSION_UNAVAILABLE.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn stop_support_session(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
@@ -957,10 +1061,167 @@ pub(crate) fn stop_support_session(
         })
     };
     if !allowed {
+        // Stop remains authoritative during the brief interval after the live
+        // broker was closed and before an approved update has relaunched.
+        if window.label() == "main" && crate::updater::resume_matches(&app, &session_id) {
+            crate::updater::revoke_resume(&app, Some(&session_id));
+            return Ok(());
+        }
         return Err(SESSION_UNAVAILABLE.to_string());
     }
     stop_matching(&app, Some(&session_id));
     Ok(())
+}
+
+pub(crate) fn update_service_identity() -> SupportResult<(String, String, String)> {
+    let config = service_config()?;
+    Ok((
+        config.origin,
+        config.operator_public_key,
+        config.operator_label,
+    ))
+}
+
+pub(crate) fn update_parent(app: &tauri::AppHandle) -> SupportResult<UpdateParent> {
+    let state = app.state::<SupportSessionState>();
+    let broker = state
+        .0
+        .lock()
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+    let session = broker
+        .active
+        .as_ref()
+        .ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
+    let SessionConfig::Queue(config) = &session.config else {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    };
+    if !session.alive(Instant::now()) || session.updating {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    }
+    Ok(UpdateParent {
+        session_id: session.id.clone(),
+        expires: config.expires,
+        origin: config.origin.clone(),
+        operator_public_key: config.operator_public_key.clone(),
+        operator_label: config.operator_label.clone(),
+        remaining_ms: u64::try_from(
+            session
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?,
+    })
+}
+
+pub(crate) fn update_window_authorized(app: &tauri::AppHandle, label: &str, id: &str) -> bool {
+    let state = app.state::<SupportSessionState>();
+    let authorized = state.0.lock().is_ok_and(|broker| {
+        broker.active.as_ref().is_some_and(|session| {
+            session.support_window(label, id) && session.alive(Instant::now())
+        })
+    });
+    authorized
+}
+
+pub(crate) fn pause_for_update(app: &tauri::AppHandle, id: &str) -> SupportResult<()> {
+    let state = app.state::<SupportSessionState>();
+    let mut broker = state
+        .0
+        .lock()
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+    let session = broker
+        .active
+        .as_mut()
+        .ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
+    if session.id != id || !session.alive(Instant::now()) || session.updating {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    }
+    session.updating = true;
+    session.frames.clear();
+    session.actions.clear();
+    session.published.clear();
+    Ok(())
+}
+
+pub(crate) fn stop_for_update_failure(app: &tauri::AppHandle, id: Option<&str>) {
+    stop_matching(app, id);
+}
+
+pub(crate) fn open_resumed_session(
+    app: tauri::AppHandle,
+    resume: crate::updater::ResumeBootstrap,
+) -> SupportResult<SessionStatus> {
+    let config = service_config()?;
+    let now = now_ms()?;
+    let expires = resume.handoff.original_expires;
+    if expires <= now || expires > now.saturating_add(30 * 60 * 1000) {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    }
+    open_approved_session(
+        app,
+        SessionConfig::Queue(QueueBootstrap {
+            v: 3,
+            role: "guest".to_string(),
+            origin: config.origin,
+            operator_public_key: config.operator_public_key,
+            operator_label: config.operator_label,
+            expires,
+            resume: Some(resume),
+        }),
+        now,
+    )
+}
+
+pub(crate) fn activate_resumed_session(
+    app: &tauri::AppHandle,
+    id: &str,
+) -> SupportResult<SessionStatus> {
+    let state = app.state::<SupportSessionState>();
+    let mut broker = state
+        .0
+        .lock()
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+    let session = broker
+        .active
+        .as_mut()
+        .ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
+    if session.id != id
+        || !session.alive(Instant::now())
+        || !session.updating
+        || !matches!(
+            &session.config,
+            SessionConfig::Queue(QueueBootstrap {
+                resume: Some(_),
+                ..
+            })
+        )
+    {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    }
+    session.updating = false;
+    Ok(session.status())
+}
+
+pub(crate) fn confirm_update_resume(
+    app: &tauri::AppHandle,
+    label: &str,
+    id: &str,
+) -> SupportResult<bool> {
+    let state = app.state::<SupportSessionState>();
+    let mut broker = state
+        .0
+        .lock()
+        .map_err(|_| SESSION_UNAVAILABLE.to_string())?;
+    let session = broker
+        .active
+        .as_mut()
+        .ok_or_else(|| SESSION_UNAVAILABLE.to_string())?;
+    let now = Instant::now();
+    if !session.support_window(label, id) {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    }
+    session.confirm_resumed(now)
 }
 
 #[cfg(test)]
@@ -1043,6 +1304,7 @@ mod tests {
             operator_public_key: service.operator_public_key,
             operator_label: service.operator_label,
             expires,
+            resume: None,
         });
         let wire = serde_json::to_value(&bootstrap).unwrap();
         assert_eq!(wire["v"], 3);
@@ -1068,6 +1330,82 @@ mod tests {
         );
         assert!(!REVOKE_EVENT.contains("fetch"));
         assert!(!REVOKE_EVENT.contains("token"));
+    }
+
+    #[test]
+    fn updating_revokes_old_frames_and_controls_without_extending_the_session() {
+        let now = Instant::now();
+        let mut session = session(now);
+        let deadline = session.deadline;
+        let value = frame('a');
+        let action = SupportAction {
+            frame: value.id.clone(),
+            target: "c".repeat(32),
+            kind: ActionKind::Click,
+            value: None,
+            delta_y: None,
+        };
+        assert!(session.publish(value, now).unwrap());
+        session.updating = true;
+        session.frames.clear();
+        session.actions.clear();
+        session.published.clear();
+        assert!(!session
+            .publish(frame('b'), now + Duration::from_millis(10))
+            .unwrap());
+        assert!(session.frames.is_empty());
+        assert!(session
+            .authorize_action(&action, now + Duration::from_millis(10))
+            .is_err());
+        assert_eq!(session.deadline, deadline);
+        assert!(session.status().updating);
+    }
+
+    #[test]
+    fn resumed_connection_must_finish_within_grace_and_can_restore_only_its_original_deadline_once()
+    {
+        let now = Instant::now();
+        let mut timely = session(now);
+        let original = timely.deadline;
+        let service = parse_service_config(&queue_service().to_string()).unwrap();
+        let expires = now_ms().unwrap() + 30_000;
+        let resume = serde_json::from_value::<crate::updater::ResumeBootstrap>(serde_json::json!({
+            "handoff":{"v":1,"parentId":"1".repeat(32),"parentSid":"2".repeat(32),"nonce":"3".repeat(32),
+                "targetVersion":"0.2.0-beta.4-support.2","artifactSha256":"4".repeat(64),"nativeSessionId":"5".repeat(32),
+                "originalExpires":expires,"resumeDeadline":expires,"resumeTicketSha256":"6".repeat(64)},
+            "resumeTicket":"7".repeat(64),"resumeAuth":"8".repeat(64)})).unwrap();
+        timely.config = SessionConfig::Queue(QueueBootstrap {
+            v: 3,
+            role: "guest".to_string(),
+            origin: service.origin,
+            operator_public_key: service.operator_public_key,
+            operator_label: service.operator_label,
+            expires,
+            resume: Some(resume),
+        });
+        timely.deadline = now + Duration::from_secs(2);
+        timely.resume_original_deadline = Some(original);
+        assert!(timely
+            .confirm_resumed(now + Duration::from_millis(10))
+            .unwrap());
+        assert_eq!(timely.deadline, original);
+        assert!(matches!(
+            &timely.config,
+            SessionConfig::Queue(QueueBootstrap { resume: None, .. })
+        ));
+        assert!(!timely
+            .confirm_resumed(now + Duration::from_millis(20))
+            .unwrap());
+        let mut late = session(now);
+        late.deadline = now + Duration::from_secs(2);
+        late.resume_original_deadline = Some(original);
+        assert!(late.confirm_resumed(now + Duration::from_secs(2)).is_err());
+        assert_eq!(late.deadline, now + Duration::from_secs(2));
+        let mut paused = session(now);
+        paused.updating = true;
+        paused.resume_original_deadline = Some(original);
+        assert!(paused.confirm_resumed(now).is_err());
+        assert!(!session(now).confirm_resumed(now).unwrap());
     }
 
     fn config(expires: u64) -> SupportConfig {
@@ -1106,6 +1444,8 @@ mod tests {
             frames: VecDeque::new(),
             published: VecDeque::new(),
             actions: VecDeque::new(),
+            updating: false,
+            resume_original_deadline: None,
         }
     }
 
