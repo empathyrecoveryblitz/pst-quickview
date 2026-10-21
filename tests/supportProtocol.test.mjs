@@ -404,3 +404,144 @@ test('paired peers verify direct transport, carry direction-bound app data and r
     globalThis.RTCPeerConnection = originalRTC; globalThis.fetch = originalFetch;
   }
 });
+
+async function setupDeliveryFailure(t, kind, connect) {
+  const originalRTC = globalThis.RTCPeerConnection, originalFetch = globalThis.fetch, originalTimeout = globalThis.setTimeout;
+  const controllerConfig = config('controller');
+  const guestConfig = { ...controllerConfig, role: 'guest', token: 'b'.repeat(64), origin: 'https://example.run.pinggy-free.link' };
+  const queues = { controller: [], guest: [] }, pcs = [], gathering = [], states = [], reasons = [], received = [];
+  const observed = { controller: new Map(), guest: new Map() };
+  const observers = {
+    controller: await createCipher({ ...controllerConfig, role: 'guest' }),
+    guest: await createCipher({ ...guestConfig, role: 'controller' }),
+  };
+  let controller, guest, releaseFailure, markPending, markFinished, markReady, markSeed, markFrame, markAction;
+  let controllerConnected, guestConnected, attempts = 0;
+  const pending = new Promise(resolve => { markPending = resolve; });
+  const finished = new Promise(resolve => { markFinished = resolve; });
+  const ready = new Promise(resolve => { markReady = resolve; });
+  const seed = new Promise(resolve => { markSeed = resolve; });
+  const blocked = new Promise(resolve => { releaseFailure = resolve; });
+  const connected = [new Promise(resolve => { controllerConnected = resolve; }), new Promise(resolve => { guestConnected = resolve; })];
+  const response = value => new Response(JSON.stringify(value), { status: 200 });
+  const tick = () => new Promise(resolve => originalTimeout(resolve, 0));
+  let guard;
+  const timed = promise => Promise.race([promise, new Promise((_, reject) => {
+    guard = originalTimeout(() => reject(new Error('Synthetic setup did not finish.')), 5000);
+  })]).finally(() => clearTimeout(guard));
+  t.after(async () => {
+    releaseFailure(); controller?.close(); guest?.close();
+    await new Promise(resolve => originalTimeout(resolve, 5));
+    globalThis.RTCPeerConnection = originalRTC; globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout;
+  });
+  class FakeChannel {
+    constructor(label, options) { Object.assign(this, { label, ...options, maxRetransmits: null, maxPacketLifeTime: null, readyState: 'connecting', bufferedAmount: 0 }); }
+    send(text) { queueMicrotask(() => { if (this.other.readyState === 'open') this.other.onmessage?.({ data: text }); }); }
+    close() {
+      if (this.readyState === 'closed') return;
+      this.readyState = 'closed'; this.onclose?.();
+      if (this.other && this.other.readyState !== 'closed') { this.other.readyState = 'closed'; this.other.onclose?.(); }
+    }
+  }
+  class FakePeer {
+    constructor() { this.role = pcs.length ? 'guest' : 'controller'; pcs.push(this); }
+    createDataChannel(label, options) { this.channel = new FakeChannel(label, options); return this.channel; }
+    async createOffer() { return { type: 'offer', sdp: description('actpass') }; }
+    async createAnswer() { return { type: 'answer', sdp: description('active') }; }
+    async setLocalDescription(value) { this.localDescription = value; }
+    async setRemoteDescription(value) {
+      this.remoteDescription = value;
+      if (value.type === 'offer') {
+        const first = pcs[0].channel;
+        this.channel = new FakeChannel(first.label, { protocol: first.protocol, ordered: true });
+        this.channel.other = first; first.other = this.channel;
+        this.ondatachannel({ channel: this.channel });
+      } else markReady();
+    }
+    async addIceCandidate() {}
+    async getStats() {
+      return new Map([
+        ['transport', { type: 'transport', selectedCandidatePairId: 'pair', dtlsState: 'connected' }],
+        ['pair', { type: 'candidate-pair', state: 'succeeded', nominated: true, localCandidateId: 'local', remoteCandidateId: 'remote' }],
+        ['local', { type: 'local-candidate', candidateType: 'srflx', protocol: 'udp', address: this.role === 'controller' ? exit : '9.9.9.9' }],
+        ['remote', { type: 'remote-candidate', candidateType: 'srflx', protocol: 'udp', address: this.role === 'guest' ? exit : '9.9.9.9' }],
+      ]);
+    }
+    close() { this.channel?.close(); }
+  }
+  globalThis.RTCPeerConnection = FakePeer;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay === 15000) { gathering.push(callback); return 0; }
+    return originalTimeout(callback, delay, ...args);
+  };
+  globalThis.fetch = async (url, options) => {
+    const role = options.headers.Authorization === `Bearer ${controllerConfig.token}` ? 'controller' : 'guest';
+    if (options.method === 'POST') {
+      const envelope = JSON.parse(options.body);
+      if (!observed[role].has(envelope.seq)) observed[role].set(envelope.seq, await observers[role].open(envelope));
+      const message = observed[role].get(envelope.seq);
+      if (role === 'guest' && message.kind === (kind === 'candidate' ? 'candidate' : 'end')) {
+        attempts++; markPending(); await blocked;
+        if (attempts === 3) markFinished();
+        return new Response('{}', { status: 503 });
+      }
+      if (!queues[role].some(item => item.seq === envelope.seq)) queues[role].push(envelope);
+      if (role === 'guest' && message.kind === 'candidate') markSeed();
+      return response({});
+    }
+    const after = Number(new URL(url).searchParams.get('after'));
+    return response({ messages: queues[role === 'controller' ? 'guest' : 'controller'].filter(item => item.seq > after), expiresAt: controllerConfig.expires });
+  };
+  const { createSupportPeer } = await import('../public/support/peer.js');
+  controller = await createSupportPeer({ config: controllerConfig,
+    onState: state => { states.push(['controller', state]); if (state === 'connected') controllerConnected(); },
+    onClose: reason => reasons.push(['controller', reason]), onFrame: value => { received.push(value); markFrame?.(); },
+  });
+  guest = await createSupportPeer({ config: guestConfig,
+    onState: state => { states.push(['guest', state]); if (state === 'connected') guestConnected(); },
+    onClose: reason => reasons.push(['guest', reason]), onAction: () => markAction?.(),
+  });
+  await controller.approve(); await guest.approve(); await timed(ready); await tick();
+  const candidate = { candidate: rawCandidate.replace(exit, '9.9.9.9') };
+  pcs[1].onicecandidate({ candidate });
+  if (kind !== 'candidate') {
+    await timed(seed);
+    if (kind === 'timeout') gathering[1]();
+    else pcs[1].onicecandidate({ candidate: null });
+  }
+  await timed(pending);
+  if (connect) {
+    for (const pc of pcs) pc.channel.readyState = 'open';
+    for (const pc of pcs) queueMicrotask(() => { void pc.channel.onopen?.(); });
+    await timed(Promise.all(connected));
+    const delivered = new Promise(resolve => { markFrame = resolve; });
+    assert.equal(guest.sendFrame(frame()), true); await timed(delivered);
+  }
+  releaseFailure(); await timed(finished); await tick();
+  assert.equal(attempts, 3);
+  if (connect) {
+    assert.deepEqual(reasons, []);
+    assert.equal(states.some(([, state]) => state.startsWith('failed:')), false);
+    const delivered = new Promise(resolve => { markFrame = resolve; });
+    assert.equal(guest.sendFrame({ ...frame(), id: '3'.repeat(32) }), true); await timed(delivered);
+    const applied = new Promise(resolve => { markAction = resolve; });
+    assert.equal(controller.sendAction(action('input')), true); await timed(applied);
+    assert.equal(received.length, 2);
+    guest.close(); await tick();
+    assert.equal(controller.sendAction(action('click')), false);
+    assert.ok(reasons.some(([role, reason]) => role === 'guest' && reason === 'stopped'));
+  } else {
+    assert.ok(reasons.some(([role, reason]) => role === 'guest' && reason === 'signaling'));
+    assert.equal(states.some(([, state]) => state === 'connected'), false);
+    assert.equal(guest.sendFrame(frame()), false);
+  }
+}
+
+for (const kind of ['candidate', 'end', 'timeout']) {
+  test(`late ${kind} setup delivery failure does not revoke a verified direct connection`, async t => {
+    await setupDeliveryFailure(t, kind, true);
+  });
+}
+test('candidate setup delivery failure before direct verification remains fail-closed', async t => {
+  await setupDeliveryFailure(t, 'candidate', false);
+});

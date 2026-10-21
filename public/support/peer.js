@@ -147,11 +147,12 @@ export async function createSupportPeer({ config, onState, onFrame, onAction, on
     if (pc || ended || !approved || !peerApproved) throw new Error('state');
     emit('negotiating');
     pc = new RTCPeerConnection({ iceServers: ICE, iceCandidatePoolSize: 0 });
-    pc.onicecandidate = event => { void localCandidate(event.candidate).catch(() => fail('signaling')); };
+    // An in-flight setup delivery can become obsolete after direct verification.
+    pc.onicecandidate = event => { void localCandidate(event.candidate).catch(() => { if (!ended && !connected) fail('signaling'); }); };
     pc.ondatachannel = event => wire(event.channel);
     pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') fail('connectivity'); };
     pc.oniceconnectionstatechange = () => { if (pc.iceConnectionState === 'failed') fail('connectivity'); };
-    gatheringTimer = setTimeout(() => { void finishGathering().catch(() => fail('signaling')); }, 15000);
+    gatheringTimer = setTimeout(() => { void finishGathering().catch(() => { if (!ended && !connected) fail('signaling'); }); }, 15000);
     negotiationTimer = setTimeout(() => fail('connectivity'), 65000);
   }
 
