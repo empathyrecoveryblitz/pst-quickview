@@ -837,10 +837,12 @@ support_control_source = support_control_path.read_text(encoding="utf-8")
 support_session_source = support_session_path.read_text(encoding="utf-8")
 support_rust_source = support_rust_path.read_text(encoding="utf-8")
 wrapper_start = support_session_source.find("const invoke = (command, args) => {")
-wrapper_end = support_session_source.find("\nasync function stop(", wrapper_start)
+wrapper_end = support_session_source.find("\n};", wrapper_start)
 if wrapper_start < 0 or wrapper_end < 0:
     raise SystemExit("support session invoke wrapper was not found")
-wrapper = support_session_source[wrapper_start:wrapper_end]
+wrapper = support_session_source[wrapper_start:wrapper_end + len("\n};")]
+if support_session_source.count(wrapper) != 1:
+    raise SystemExit("support session must contain exactly one reviewed invocation wrapper")
 if hashlib.sha256(wrapper.strip().encode()).hexdigest() != (
     "217a03400c2ddf58c35bed262b4b68080e594794efb1036a6c4a790ff147ad16"
 ):
@@ -854,7 +856,7 @@ if not all_frontend_commands.issubset(set(app_commands)):
     raise SystemExit(f"frontend invokes commands absent from the generated ACL: {unknown}")
 
 main_support_commands = {
-    "start_support_session", "support_session_status", "publish_support_frame", "stop_support_session",
+    "request_support_session", "support_service_status", "support_session_status", "publish_support_frame", "stop_support_session",
 }
 support_commands = {
     "bootstrap_support_session", "poll_support_frame", "support_submit_action", "stop_support_session",
@@ -863,7 +865,7 @@ if set(frontend_invocations(support_panel_source) + frontend_invocations(support
     raise SystemExit("main support controls invoke an unexpected command set")
 if set(support_frontend_commands) != support_commands:
     raise SystemExit("support session invokes an unexpected command set")
-if set(app_commands) - all_frontend_commands != {"export_original_eml", "reveal_exported_file"}:
+if set(app_commands) - all_frontend_commands != {"export_original_eml", "reveal_exported_file", "start_support_session"}:
     raise SystemExit("registered unused commands drifted from the reviewed set")
 
 preview_commands = {
@@ -956,14 +958,17 @@ resource_end = resource_start + resource_end_match.start() if resource_end_match
 if min(support_csp_start, support_csp_end, resource_start, resource_end) < 0:
     raise SystemExit("scoped support CSP implementation was not found")
 support_csp_source = support_rust_source[support_csp_start:support_csp_end]
+support_csp_normalized = re.sub(r"\s+", " ", support_csp_source)
 resource_source = support_rust_source[resource_start:resource_end]
 for required in (
-    "if !allowed_origin(origin)",
+    "if !(allowed_origin(origin) || (allowed_queue_origin(origin) && pinned_origin == Some(origin)))",
+    "let pinned_origin = service_config().ok().map(|config| config.origin)",
+    "support_csp_for_service(existing, origin, pinned_origin.as_deref())",
     'directive.split_whitespace().next() != Some("connect-src")',
     'directives.push(format!("connect-src ipc: http://ipc.localhost {origin}"))',
     'Some(directives.join("; "))',
 ):
-    if required not in support_csp_source:
+    if required not in support_csp_normalized:
         raise SystemExit("support CSP is not the exact reviewed origin-scoped connect exception")
 expected_support_fallback = (
     "default-src 'none'; script-src 'self'; style-src 'self'; "

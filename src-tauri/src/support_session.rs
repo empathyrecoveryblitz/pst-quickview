@@ -24,6 +24,9 @@ const SESSION_UNAVAILABLE: &str = "This support session is unavailable or has st
 const INVALID_INVITATION: &str = "The support invitation is invalid or expired.";
 const INVALID_FRAME: &str = "The shared application frame exceeds its permitted limits.";
 const INVALID_ACTION: &str = "This support action is invalid or no longer current.";
+const SERVICE_UNAVAILABLE: &str = "Remote Support is not configured in this application build.";
+const SERVICE_CONFIG: &str = include_str!("../../public/support/service.json");
+const REVOKE_EVENT: &str = "window.dispatchEvent(new Event('pqv-support-revoked'))";
 type SupportResult<T> = Result<T, String>;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -40,11 +43,69 @@ pub(crate) struct SupportConfig {
     origin: Option<String>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServiceConfig {
+    v: u8,
+    origin: String,
+    operator_public_key: String,
+    operator_label: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QueueBootstrap {
+    v: u8,
+    role: String,
+    origin: String,
+    operator_public_key: String,
+    operator_label: String,
+    expires: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+pub(crate) enum SessionConfig {
+    Direct(SupportConfig),
+    Queue(QueueBootstrap),
+}
+
+impl SessionConfig {
+    fn expires(&self) -> u64 {
+        match self {
+            Self::Direct(config) => config.expires,
+            Self::Queue(config) => config.expires,
+        }
+    }
+
+    fn origin(&self) -> Option<&str> {
+        match self {
+            Self::Direct(config) => config.origin.as_deref(),
+            Self::Queue(config) => Some(&config.origin),
+        }
+    }
+
+    fn operator_label(&self) -> &str {
+        match self {
+            Self::Direct(_) => "Invited technician",
+            Self::Queue(config) => &config.operator_label,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ServiceStatus {
+    configured: bool,
+    operator_label: String,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionStatus {
     session_id: String,
     expires_at: u64,
+    operator_label: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -125,7 +186,7 @@ struct ActionEvent {
 struct Session {
     id: String,
     label: String,
-    config: SupportConfig,
+    config: SessionConfig,
     deadline: Instant,
     heartbeat: Instant,
     frames: VecDeque<(Instant, SupportFrame)>,
@@ -185,6 +246,54 @@ fn allowed_origin(value: &str) -> bool {
         && label
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn allowed_queue_origin(value: &str) -> bool {
+    let Some(labels) = value
+        .strip_prefix("https://")
+        .and_then(|host| host.strip_suffix(".workers.dev"))
+    else {
+        return false;
+    };
+    let labels: Vec<_> = labels.split('.').collect();
+    labels.len() == 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                })
+        })
+}
+
+fn parse_service_config(raw: &str) -> SupportResult<ServiceConfig> {
+    let invalid = || SERVICE_UNAVAILABLE.to_string();
+    if raw.len() > 2048 {
+        return Err(invalid());
+    }
+    let config: ServiceConfig = serde_json::from_str(raw).map_err(|_| invalid())?;
+    let key = URL_SAFE_NO_PAD
+        .decode(&config.operator_public_key)
+        .map_err(|_| invalid())?;
+    if config.v != 3
+        || !allowed_queue_origin(&config.origin)
+        || key.len() != 65
+        || key.first() != Some(&4)
+        || URL_SAFE_NO_PAD.encode(&key) != config.operator_public_key
+        || config.operator_label.trim() != config.operator_label
+        || config.operator_label.is_empty()
+        || !bounded_text(&config.operator_label, 80)
+        || config.operator_label.chars().any(char::is_control)
+    {
+        return Err(invalid());
+    }
+    Ok(config)
+}
+
+fn service_config() -> SupportResult<ServiceConfig> {
+    parse_service_config(SERVICE_CONFIG)
 }
 
 fn parse_invitation(invitation: &str, now: u64) -> SupportResult<SupportConfig> {
@@ -369,14 +478,15 @@ impl Session {
     fn status(&self) -> SessionStatus {
         SessionStatus {
             session_id: self.id.clone(),
-            expires_at: self.config.expires,
+            expires_at: self.config.expires(),
+            operator_label: self.config.operator_label().to_string(),
         }
     }
 
     fn alive(&self, now: Instant) -> bool {
         now < self.deadline
             && now.saturating_duration_since(self.heartbeat) < HEARTBEAT_TIMEOUT
-            && now_ms().is_ok_and(|wall_clock| wall_clock < self.config.expires)
+            && now_ms().is_ok_and(|wall_clock| wall_clock < self.config.expires())
     }
 
     fn support_window(&self, label: &str, id: &str) -> bool {
@@ -454,7 +564,18 @@ fn local_document(url: &tauri::Url, id: &str) -> bool {
 }
 
 fn support_csp(existing: &str, origin: &str) -> Option<String> {
-    if !allowed_origin(origin) {
+    let pinned_origin = service_config().ok().map(|config| config.origin);
+    support_csp_for_service(existing, origin, pinned_origin.as_deref())
+}
+
+fn support_csp_for_service(
+    existing: &str,
+    origin: &str,
+    pinned_origin: Option<&str>,
+) -> Option<String> {
+    if !(allowed_origin(origin)
+        || (allowed_queue_origin(origin) && pinned_origin == Some(origin)))
+    {
         return None;
     }
     let mut directives: Vec<String> = existing
@@ -488,9 +609,15 @@ fn take_session(app: &tauri::AppHandle, id: Option<&str>) -> Option<String> {
 }
 
 fn stop_matching(app: &tauri::AppHandle, id: Option<&str>) {
+    // Revoke broker authority before asking the isolated bundled document to
+    // notify the queue. This fixed event contains no remote or user input.
     if let Some(label) = take_session(app, id) {
         if let Some(window) = app.get_webview_window(&label) {
-            let _ = window.destroy();
+            let _ = window.eval(REVOKE_EVENT);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                let _ = window.destroy();
+            });
         }
     }
 }
@@ -532,10 +659,56 @@ pub(crate) async fn start_support_session(
         return Err(SESSION_UNAVAILABLE.to_string());
     }
     let now = now_ms()?;
-    let config = parse_invitation(&invitation, now)?;
+    let config = SessionConfig::Direct(parse_invitation(&invitation, now)?);
+    open_approved_session(app, config, now)
+}
+
+#[tauri::command]
+pub(crate) fn support_service_status(window: tauri::WebviewWindow) -> SupportResult<ServiceStatus> {
+    if window.label() != "main" {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    }
+    Ok(match service_config() {
+        Ok(config) => ServiceStatus {
+            configured: true,
+            operator_label: config.operator_label,
+        },
+        Err(_) => ServiceStatus {
+            configured: false,
+            operator_label: String::new(),
+        },
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn request_support_session(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> SupportResult<SessionStatus> {
+    if window.label() != "main" {
+        return Err(SESSION_UNAVAILABLE.to_string());
+    }
+    let config = service_config()?;
+    let now = now_ms()?;
+    let queue = QueueBootstrap {
+        v: 3,
+        role: "guest".to_string(),
+        origin: config.origin,
+        operator_public_key: config.operator_public_key,
+        operator_label: config.operator_label,
+        expires: now.saturating_add(30 * 60 * 1000),
+    };
+    open_approved_session(app, SessionConfig::Queue(queue), now)
+}
+
+fn open_approved_session(
+    app: tauri::AppHandle,
+    config: SessionConfig,
+    now: u64,
+) -> SupportResult<SessionStatus> {
     let origin = config
-        .origin
-        .clone()
+        .origin()
+        .map(str::to_owned)
         .ok_or_else(|| INVALID_INVITATION.to_string())?;
     let mut random = [0_u8; 16];
     File::open("/dev/urandom")
@@ -545,7 +718,8 @@ pub(crate) async fn start_support_session(
     let label = format!("{PREFIX}{id}");
     let status = SessionStatus {
         session_id: id.clone(),
-        expires_at: config.expires,
+        expires_at: config.expires(),
+        operator_label: config.operator_label().to_string(),
     };
     let instant = Instant::now();
     let state = app.state::<SupportSessionState>();
@@ -560,7 +734,7 @@ pub(crate) async fn start_support_session(
         broker.active = Some(Session {
             id: id.clone(),
             label: label.clone(),
-            deadline: instant + Duration::from_millis(config.expires - now),
+            deadline: instant + Duration::from_millis(config.expires() - now),
             config,
             heartbeat: instant,
             frames: VecDeque::new(),
@@ -643,7 +817,7 @@ pub(crate) fn bootstrap_support_session(
     window: tauri::WebviewWindow,
     state: State<SupportSessionState>,
     session_id: String,
-) -> SupportResult<SupportConfig> {
+) -> SupportResult<SessionConfig> {
     let broker = state
         .0
         .lock()
@@ -794,6 +968,90 @@ pub(crate) fn stop_support_session(
 mod tests {
     use super::*;
 
+    fn queue_service() -> serde_json::Value {
+        let public_key = hex::decode("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5").unwrap();
+        serde_json::json!({"v":3,"origin":"https://synthetic.synthetic.workers.dev",
+            "operatorPublicKey":URL_SAFE_NO_PAD.encode(public_key),"operatorLabel":"Fictional helper"})
+    }
+
+    #[test]
+    fn queue_service_requires_exact_bundled_origin_identity_and_canonical_public_key() {
+        let valid = queue_service();
+        assert!(parse_service_config(&valid.to_string()).is_ok());
+        for origin in [
+            "", "http://synthetic.synthetic.workers.dev", "https://synthetic.workers.dev",
+            "https://nested.synthetic.synthetic.workers.dev", "https://synthetic.synthetic.workers.dev/",
+            "https://synthetic.synthetic.workers.dev:443", "https://user@synthetic.synthetic.workers.dev",
+            "https://synthetic.synthetic.workers.dev.invalid", "https://synthetic.synthetic.workers.dev; connect-src *",
+        ] {
+            let mut invalid = valid.clone();
+            invalid["origin"] = origin.into();
+            assert!(parse_service_config(&invalid.to_string()).is_err());
+        }
+        for label in ["", " label", "label ", "helper\nidentity"] {
+            let mut invalid = valid.clone();
+            invalid["operatorLabel"] = label.into();
+            assert!(parse_service_config(&invalid.to_string()).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid["operatorPublicKey"] = "".into();
+        assert!(parse_service_config(&invalid.to_string()).is_err());
+        invalid = valid.clone();
+        invalid["operatorPublicKey"] = format!("{}=", valid["operatorPublicKey"].as_str().unwrap()).into();
+        assert!(parse_service_config(&invalid.to_string()).is_err());
+        invalid = valid;
+        invalid["unexpected"] = true.into();
+        assert!(parse_service_config(&invalid.to_string()).is_err());
+        assert!(parse_service_config(r#"{"v":3,"origin":"","operatorPublicKey":"","operatorLabel":"PST QuickView support"}"#).is_err());
+    }
+
+    #[test]
+    fn queue_csp_pins_only_the_compiled_service_without_wildcards() {
+        let baseline = "default-src 'none'; script-src 'self' 'nonce-generated'; connect-src ipc: http://ipc.localhost; object-src 'none'";
+        let origin = "https://synthetic.synthetic.workers.dev";
+        assert!(support_csp_for_service(baseline, origin, None).is_none());
+        assert!(support_csp_for_service(baseline, origin, Some("https://other.synthetic.workers.dev")).is_none());
+        let csp = support_csp_for_service(baseline, origin, Some(origin)).unwrap();
+        assert!(csp.contains("script-src 'self' 'nonce-generated'"));
+        assert!(csp.contains("connect-src ipc: http://ipc.localhost https://synthetic.synthetic.workers.dev"));
+        assert!(!csp.contains("*.workers.dev"));
+    }
+
+    #[test]
+    fn queue_bootstrap_is_public_identity_only_and_bound_to_local_session_lifetime() {
+        let service = parse_service_config(&queue_service().to_string()).unwrap();
+        let expires = now_ms().unwrap() + 30_000;
+        let bootstrap = SessionConfig::Queue(QueueBootstrap {
+            v: 3,
+            role: "guest".to_string(),
+            origin: service.origin,
+            operator_public_key: service.operator_public_key,
+            operator_label: service.operator_label,
+            expires,
+        });
+        let wire = serde_json::to_value(&bootstrap).unwrap();
+        assert_eq!(wire["v"], 3);
+        assert_eq!(wire["role"], "guest");
+        assert_eq!(bootstrap.expires(), expires);
+        assert_eq!(bootstrap.operator_label(), "Fictional helper");
+        for secret in ["sid", "token", "key", "privateKey", "expectedExit"] {
+            assert!(wire.get(secret).is_none());
+        }
+        let mut record = session(Instant::now());
+        record.config = bootstrap;
+        assert_eq!(record.status().operator_label, "Fictional helper");
+        assert_eq!(record.status().expires_at, expires);
+        assert!(record.alive(Instant::now()));
+        assert!(!record.alive(Instant::now() + HEARTBEAT_TIMEOUT));
+    }
+
+    #[test]
+    fn queue_revocation_event_is_fixed_local_code_without_session_data() {
+        assert_eq!(REVOKE_EVENT, "window.dispatchEvent(new Event('pqv-support-revoked'))");
+        assert!(!REVOKE_EVENT.contains("fetch"));
+        assert!(!REVOKE_EVENT.contains("token"));
+    }
+
     fn config(expires: u64) -> SupportConfig {
         SupportConfig {
             v: 2,
@@ -824,7 +1082,7 @@ mod tests {
         Session {
             id: "d".repeat(32),
             label: format!("{PREFIX}{}", "d".repeat(32)),
-            config: config(now_ms().unwrap() + 30_000),
+            config: SessionConfig::Direct(config(now_ms().unwrap() + 30_000)),
             deadline: now + Duration::from_secs(30),
             heartbeat: now,
             frames: VecDeque::new(),

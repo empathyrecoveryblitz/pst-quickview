@@ -236,7 +236,7 @@ export async function createCipher({ key, sid, role, expires } = {}) {
   });
 }
 
-export function validateConfig(raw) {
+export function validateConfig(raw, { serviceOrigin } = {}) {
   if (!plainObject(raw) || raw.v !== 2 || !ROLES.has(raw.role) ||
       !/^[a-f0-9]{32}$/.test(raw.sid) || !/^[a-f0-9]{64}$/.test(raw.token) ||
       !/^[A-Za-z0-9_-]{43}$/.test(raw.key) || !publicIPv4(raw.expectedExit) ||
@@ -246,7 +246,12 @@ export function validateConfig(raw) {
   }
   const publicOrigin = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.run\.pinggy-free\.link$/.test(raw.origin);
   const loopback = /^http:\/\/127\.0\.0\.1:([1-9]\d{3,4})$/.exec(raw.origin);
-  if (!publicOrigin && !(raw.role === 'controller' && loopback && Number(loopback[1]) >= 1024 && Number(loopback[1]) <= 65535)) {
+  // The automatic queue uses an exact deployment pin supplied by trusted local
+  // bootstrap, never a wildcard learned from an invitation or service response.
+  const pinned = serviceOrigin !== undefined;
+  const canonicalWorker = typeof serviceOrigin === 'string' && /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$/.test(serviceOrigin);
+  if (pinned ? (!canonicalWorker || raw.origin !== serviceOrigin)
+    : (!publicOrigin && !(raw.role === 'controller' && loopback && Number(loopback[1]) >= 1024 && Number(loopback[1]) <= 65535))) {
     throw new Error('Invalid support invitation.');
   }
   decode64(raw.key, 32, 32);

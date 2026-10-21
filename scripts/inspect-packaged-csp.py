@@ -95,10 +95,12 @@ def source_literals(config_bytes, support_bytes):
     start = support.find("fn support_csp(")
     if start < 0:
         raise DiagnosticError("source_literal_unavailable")
-    following = re.search(r"\n(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s", support[start + 1 :])
-    if following is None:
+    # The reviewed queue implementation delegates to a separately testable
+    # origin guard. Observe that fixed span, not just the small caller wrapper.
+    end = support.find("\nfn take_session(", start)
+    if end < 0:
         raise DiagnosticError("source_literal_unavailable")
-    function = support[start : start + 1 + following.start()]
+    function = support[start:end]
     string = r'"(?:[^"\\]|\\.)*"'
     templates = re.findall(r"directives\.push\(\s*format!\(\s*(" + string + r")\s*,?\s*\)\s*\)", function)
     tokens = re.findall(r"Some\(\s*(" + string + r")\s*\)", function)

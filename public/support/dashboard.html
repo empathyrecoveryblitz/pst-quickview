@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>PST QuickView Support</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script type="module" src="/dashboard.js"></script>
+</head>
+<body>
+  <header class="topbar"><div><p class="eyebrow">PST QUICKVIEW</p><h1>Support dashboard</h1></div><span class="local-badge">Private laptop dashboard</span></header>
+  <main>
+    <aside class="queue-panel" aria-labelledby="queue-heading">
+      <div class="panel-heading"><h2 id="queue-heading">Waiting for help</h2><span id="queue-count" class="count">0</span></div>
+      <p class="muted">Requests appear after the owner approves support in PST QuickView. No invitation codes or customer accounts.</p>
+      <p id="queue-status" class="status" role="status" aria-live="polite">Checking the support service…</p>
+      <ul id="queue" class="queue" aria-label="Support requests"></ul>
+      <label class="consent"><input id="consent" type="checkbox" disabled><span>I am ready to help this owner. I will use only the approved app view and marked controls.</span></label>
+      <p class="privacy">Only one request can be connected at a time. App text travels directly between the two devices, not through the waiting-list service. Shared app content is not recorded by this tool.</p>
+    </aside>
+    <section class="session-panel" aria-labelledby="session-heading">
+      <div class="panel-heading"><div><p class="eyebrow" id="operator-label">Approved support</p><h2 id="session-heading">No active session</h2></div><button id="stop" class="stop" type="button" disabled>Stop support</button></div>
+      <p id="status" class="status" role="status" aria-live="polite">Choose a waiting request when you are ready.</p>
+      <div class="viewer"><canvas id="view" width="980" height="750" aria-label="Live approved PST QuickView text and layout"></canvas><p id="placeholder">The approved app view will appear here.</p></div>
+      <section id="controls" class="controls" aria-label="Shared app controls" hidden>
+        <label>Shared control<select id="target" disabled></select></label>
+        <button id="activate" type="button" disabled>Activate</button>
+        <label>Input value<input id="input" maxlength="2000" autocomplete="off" spellcheck="false" disabled></label>
+        <button id="send-input" type="button" disabled>Send input</button>
+        <div class="scroll-buttons"><button id="scroll-up" type="button" disabled>Scroll up</button><button id="scroll-down" type="button" disabled>Scroll down</button></div>
+      </section>
+      <p class="privacy">A bounded text/layout mirror, not desktop sharing. Native dialogs, attachments, separate previews, images, terminal and arbitrary files are unavailable. The owner can stop at any time.</p>
+    </section>
+  </main>
+</body>
+</html>

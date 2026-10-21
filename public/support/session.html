@@ -2,12 +2,13 @@
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Active PST QuickView support</title><link rel="stylesheet" href="./support.css"></head>
 <body class="session-page"><main>
-<h1>Remote support is active</h1>
-<p>The approved helper can view the shared PST QuickView window, including visible message text, and use the controls shared by the app.</p>
+<h1>Remote support approved</h1>
+<p id="operator"></p>
+<p>After your approved helper accepts and the direct connection is verified, they can view visible PST QuickView text and use the controls shared by the app.</p>
 <p>Keep this window open. Close it or press Stop support to end access.</p>
 <button id="stop">Stop support</button>
 <p id="status" role="status" aria-live="polite">Preparing the approved session…</p>
 <p id="expiry"></p>
 <p class="note">The rest of the desktop, native file dialogs, and your system settings are outside this session. App content travels only over the verified direct encrypted connection.</p>
-<p class="note">Pinggy provides temporary connection setup; Pinggy and the Cloudflare/Google route-discovery services can see connection metadata.</p>
+<p class="note">Cloudflare handles temporary support requests and encrypted connection setup. Cloudflare and Google route-discovery services can see connection metadata. No app content goes through the request service.</p>
 </main><script type="module" src="./session.js"></script></body></html>

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "pst-quickview-support",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-20",
+  "workers_dev": true,
+  "preview_urls": false,
+  "send_metrics": false,
+  "logpush": false,
+  "observability": { "enabled": false, "logs": { "enabled": false, "invocation_logs": false } },
+  "vars": {
+    "SERVICE_ORIGIN": "https://pst-quickview-support.developerbilling001.workers.dev",
+    "OPERATOR_PUBLIC_KEY": "BPKMEzAJ-It88NPDGmSboV9lVIkFPW7w8P4WaF_yZc4IITHpcK8uU3HXsKEMTQh8dWMAuTnshagVc3XxA-5DmLs",
+    "OPERATOR_LABEL": "PST QuickView support"
+  },
+  "durable_objects": { "bindings": [{ "name": "SUPPORT_QUEUE", "class_name": "SupportQueue" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SupportQueue"] }]
+}

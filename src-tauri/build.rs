@@ -9,6 +9,8 @@ const APP_COMMANDS: &[&str] = &[
     "check_readpst",
     "get_app_diagnostics",
     "start_support_session",
+    "request_support_session",
+    "support_service_status",
     "bootstrap_support_session",
     "publish_support_frame",
     "poll_support_frame",

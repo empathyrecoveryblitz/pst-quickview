@@ -1645,6 +1645,8 @@ pub fn run() {
             check_readpst,
             get_app_diagnostics,
             support_session::start_support_session,
+            support_session::request_support_session,
+            support_session::support_service_status,
             support_session::bootstrap_support_session,
             support_session::publish_support_frame,
             support_session::poll_support_frame,

@@ -9,8 +9,14 @@ const ICE = [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:stun.l.goo
 const encoder = new TextEncoder();
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-export async function createSupportPeer({ config, onState, onFrame, onAction, onClose } = {}) {
-  const cfg = validateConfig(config);
+export async function createSupportPeer({ config, queue, onState, onFrame, onAction, onClose } = {}) {
+  if (queue !== undefined && (!queue || typeof queue !== 'object' || Array.isArray(queue)
+    || Object.keys(queue).length !== 2 || !Object.hasOwn(queue, 'origin') || !Object.hasOwn(queue, 'requestId')
+    || typeof queue.requestId !== 'string' || !/^[a-f0-9]{32}$/.test(queue.requestId))) {
+    throw new Error('Invalid support queue.');
+  }
+  const cfg = validateConfig(config, queue === undefined ? {} : { serviceOrigin: queue.origin });
+  const signalingPrefix = queue === undefined ? '' : `/v3/requests/${queue.requestId}`;
   if (typeof globalThis.RTCPeerConnection !== 'function' || typeof globalThis.fetch !== 'function') {
     throw new Error('This browser does not support direct app support.');
   }
@@ -85,9 +91,9 @@ export async function createSupportPeer({ config, onState, onFrame, onAction, on
       requests.add(controller);
       const timeout = setTimeout(() => controller.abort(), 6000);
       try {
-        const response = await fetch(cfg.origin + path, {
+        const response = await fetch(cfg.origin + signalingPrefix + path, {
           method, mode: 'cors', credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer',
-          headers: { Authorization: `Bearer ${cfg.token}`, ...(cfg.role === 'guest' ? { 'X-Pinggy-No-Screen': '1' } : {}), ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}) },
+          headers: { Authorization: `Bearer ${cfg.token}`, ...(cfg.role === 'guest' && queue === undefined ? { 'X-Pinggy-No-Screen': '1' } : {}), ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}) },
           ...(value === undefined ? {} : { body: JSON.stringify(value) }), signal: controller.signal,
         });
         if (!response.ok) throw new Error('signaling');
@@ -376,9 +382,9 @@ export async function createSupportPeer({ config, onState, onFrame, onAction, on
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 1500);
         try {
-          await fetch(origin + '/api/send', {
+          await fetch(origin + signalingPrefix + '/api/send', {
             method: 'POST', mode: 'cors', credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer',
-            headers: { Authorization: `Bearer ${token}`, ...(cfg.role === 'guest' ? { 'X-Pinggy-No-Screen': '1' } : {}), 'Content-Type': 'application/json' },
+            headers: { Authorization: `Bearer ${token}`, ...(cfg.role === 'guest' && queue === undefined ? { 'X-Pinggy-No-Screen': '1' } : {}), 'Content-Type': 'application/json' },
             body: JSON.stringify(envelope), signal: controller.signal,
           });
         } catch {} finally { clearTimeout(timeout); }

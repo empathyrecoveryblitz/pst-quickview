@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createSupportView } from "./supportView";
-export type SupportSession = { sessionId: string; expiresAt: number };
+export type SupportSession = { sessionId: string; expiresAt: number; operatorLabel: string };
 export const SUPPORT_SESSION_CHANGED = "pst-support-session-changed";
 
 // Always mounted outside About: closing Help cannot hide Stop.
@@ -23,7 +23,9 @@ export function RemoteSupportControl() {
         const next = await invoke<SupportSession | null>("support_session_status");
         if (disposed) return;
         if (!healthy) { revoke(next?.sessionId); return; }
-        if (!next || next.expiresAt <= Date.now() || revoked.current.has(next.sessionId)) { clear(); return; }
+        if (!next || typeof next.sessionId !== "string" || !/^[a-f0-9]{32}$/.test(next.sessionId) || !Number.isSafeInteger(next.expiresAt)
+          || next.expiresAt <= Date.now() || typeof next.operatorLabel !== "string" || !next.operatorLabel || next.operatorLabel.length > 80
+          || revoked.current.has(next.sessionId)) { clear(); return; }
         if (next.sessionId !== active.current?.sessionId) { view.current?.close(); view.current = createSupportView(document); active.current = next; setSession(next); setNotice(""); }
       } catch { revoke(active.current?.sessionId); } finally { busy = false; }
     }
@@ -58,7 +60,7 @@ export function RemoteSupportControl() {
   }
   return <>
     {session ? <section className="support-live-banner" data-support-private="true" aria-label="Active remote support">
-      <span><strong>Remote support approved.</strong> Visible app content may be shared. Only marked app controls are available; no desktop or file access.</span>
+      <span><strong>Support approved for {session.operatorLabel}.</strong> Waiting or connected: visible app content may be shared with this helper. Only marked app controls are available; no desktop or file access.</span>
       <button type="button" onClick={() => void stop()}>Stop support</button>
     </section> : null}
     {notice ? <p className="support-stop-notice" data-support-private="true" role="status">{notice}</p> : null}

@@ -158,6 +158,69 @@ test('support invitations restrict origin, role, key and session lifetime', () =
   ]) assert.throws(() => validateConfig(invalid));
 });
 
+test('queue transport accepts only the exact explicitly pinned Worker origin', () => {
+  const origin = 'https://support.synthetic.workers.dev';
+  const value = { ...config('guest'), origin };
+  assert.throws(() => validateConfig(value));
+  assert.equal(validateConfig(value, { serviceOrigin: origin }).origin, origin);
+  for (const candidate of [origin + '/', origin + '/path', origin + ':443',
+    'http://support.synthetic.workers.dev',
+    'https://support.synthetic.workers.dev.attacker.invalid', 'https://workers.dev',
+    'https://*.workers.dev', 'https://user:pass@support.synthetic.workers.dev']) {
+    assert.throws(() => validateConfig({ ...value, origin: candidate }, { serviceOrigin: origin }));
+    assert.throws(() => validateConfig({ ...value, origin: candidate }, { serviceOrigin: candidate }));
+  }
+  assert.throws(() => validateConfig({ ...value, origin: 'https://other.synthetic.workers.dev' }, { serviceOrigin: origin }));
+  assert.throws(() => validateConfig(config('guest'), { serviceOrigin: origin }));
+});
+
+test('queue peers route only encrypted setup to a bound request, without the legacy tunnel header', async () => {
+  const previousRTC = globalThis.RTCPeerConnection, previousFetch = globalThis.fetch;
+  const origin = 'https://support.synthetic.workers.dev', id = 'c'.repeat(32);
+  const value = { ...config('guest'), origin };
+  let peer;
+  const urls = [];
+  const envelopes = [];
+  let signalStop;
+  const stopSent = new Promise(resolve => { signalStop = resolve; });
+  const remoteCipher = await createCipher({ ...value, role: 'controller' });
+  try {
+    globalThis.RTCPeerConnection = class { constructor() { throw Error('Must not create a peer before mutual approval'); } };
+    globalThis.fetch = async (url, options) => {
+      urls.push(String(url));
+      assert.equal(options.headers['X-Pinggy-No-Screen'], undefined);
+      assert.equal(options.headers.Authorization, 'Bearer ' + value.token);
+      assert.equal(options.credentials, 'omit');
+      assert.equal(options.redirect, 'error');
+      if (options.method === 'POST') {
+        const envelope = JSON.parse(options.body);
+        assert.equal(envelope.from, 'guest'); assert.equal(typeof envelope.ct, 'string');
+        assert.equal(Object.hasOwn(envelope, 'key'), false);
+        const opened = await remoteCipher.open(envelope); envelopes.push(opened.kind);
+        if (opened.kind === 'stop') signalStop();
+        return new Response('{}');
+      }
+      return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(Error('closed')), { once: true }));
+    };
+    const { createSupportPeer } = await import('../public/support/peer.js');
+    for (const queue of [{ origin, requestId: '../other' }, { origin: origin + '/path', requestId: id },
+      { origin, requestId: id, extra: true }, { origin: 'https://other.synthetic.workers.dev', requestId: id }]) {
+      await assert.rejects(createSupportPeer({ config: value, queue }));
+    }
+    assert.equal(urls.length, 0);
+    peer = await createSupportPeer({ config: value, queue: { origin, requestId: id } });
+    assert.equal(urls.length, 0);
+    assert.equal(await peer.approve(), true);
+    assert.ok(urls.includes(`${origin}/v3/requests/${id}/api/send`));
+    assert.ok(urls.includes(`${origin}/v3/requests/${id}/api/poll?after=0`));
+    peer.close();
+    await Promise.race([stopSent, new Promise((_, reject) => { const timer = setTimeout(() => reject(Error('Stop setup was not delivered')), 1500); timer.unref(); })]);
+    assert.deepEqual(envelopes, ['approved', 'stop']);
+    assert.ok(urls.every(url => url.startsWith(`${origin}/v3/requests/${id}/api/`)));
+    assert.equal(peer.sendFrame(frame()), false);
+  } finally { peer?.close(); globalThis.RTCPeerConnection = previousRTC; globalThis.fetch = previousFetch; }
+});
+
 test('data-only WebKit SDP variants preserve the original bytes', () => {
   const webkit = description('actpass').replace('IN IP4 127.0.0.1', 'IN IP4 0.0.0.0').replace('a=msid-semantic: WMS', 'a=msid-semantic: WMS *');
   assert.equal(validateDescription(webkit, 'offer').sdp, webkit);

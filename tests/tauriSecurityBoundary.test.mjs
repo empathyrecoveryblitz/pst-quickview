@@ -174,13 +174,13 @@ function extractFrontendCommands(source) {
 }
 
 function extractSupportSessionCommands(source) {
-  const wrapper = sourceSection(source, "const invoke = (command, args) => {", "\nasync function stop(");
-  assert.equal(wrapper.trim(), [
+  const wrapper = [
     "const invoke = (command, args) => {",
     "  if (typeof window.__TAURI_INTERNALS__?.invoke !== 'function') return Promise.reject(new Error('native'));",
     "  return window.__TAURI_INTERNALS__.invoke(command, args);",
     "};",
-  ].join("\n"), "the session shell may delegate only through its exact reviewed invoke wrapper");
+  ].join("\n");
+  assert.equal(source.split(wrapper).length, 2, "the session shell must contain exactly one reviewed invoke wrapper");
   return extractFrontendCommands(source.replace(wrapper, ""));
 }
 
@@ -195,7 +195,7 @@ const mainCorePermissions = new Set([
 const previewCorePermissions = new Set(["core:window:allow-set-title"]);
 const previewOnlyCommands = new Set(["get_preview_window_target"]);
 const mainSupportCommands = new Set([
-  "start_support_session", "support_session_status", "publish_support_frame", "stop_support_session",
+  "request_support_session", "support_service_status", "support_session_status", "publish_support_frame", "stop_support_session",
 ]);
 const supportCommands = new Set([
   "bootstrap_support_session", "poll_support_frame", "support_submit_action", "stop_support_session",
@@ -369,7 +369,7 @@ test("main, preview, and support capabilities have exact constrained authority",
   assert.deepEqual(new Set([supportPanelSource, supportControlSource].flatMap(extractFrontendCommands)), mainSupportCommands);
   assert.deepEqual(
     [...generatedCommands.filter((command) => !allFrontendCommands.has(command))].sort(),
-    ["export_original_eml", "reveal_exported_file"],
+    ["export_original_eml", "reveal_exported_file", "start_support_session"],
     "registered but unused commands must not leak into a window capability",
   );
   assert.deepEqual(
@@ -405,6 +405,7 @@ test("main, preview, and support capabilities have exact constrained authority",
     false,
   );
   assert.equal(main.permissions.includes("core:webview:allow-create-webview-window"), false);
+  for (const capability of [main, preview, support]) assert.equal(capability.permissions.includes("allow-start-support-session"), false);
   assert.equal(main.permissions.includes("allow-get-preview-window-target"), false);
   assert.equal(preview.permissions.includes("allow-open-message-preview-window"), false);
   assert.equal(main.permissions.includes("allow-open-message-preview-window"), true);
@@ -454,7 +455,9 @@ test("module command paths and session invocation classification reject ambiguou
 
 test("support CSP exception is restricted to the fixed local session document and verified origin", () => {
   const csp = sourceSection(supportRustSource, "fn support_csp(", "\nfn take_session(");
-  assert.match(csp, /if !allowed_origin\(origin\)/);
+  assert.match(csp.replace(/\s+/g, " "), /if !\(allowed_origin\(origin\) \|\| \(allowed_queue_origin\(origin\) && pinned_origin == Some\(origin\)\)\)/);
+  assert.match(csp, /let pinned_origin = service_config\(\)\.ok\(\)\.map\(\|config\| config\.origin\)/);
+  assert.match(csp, /support_csp_for_service\(existing, origin, pinned_origin\.as_deref\(\)\)/);
   assert.match(csp, /directive\.split_whitespace\(\)\.next\(\) != Some\("connect-src"\)/);
   assert.match(csp, /directives\.push\(format!\("connect-src ipc: http:\/\/ipc\.localhost \{origin\}"\)\)/);
   assert.match(csp, /Some\(directives\.join\("; "\)\)/);
@@ -600,7 +603,9 @@ test("release source gate independently accepts the exact three-window boundary"
     supportRustSource.replace(supportFallbackCsp, supportFallbackCsp.replace("script-src 'self'", "script-src https:")),
     supportRustSource.replace('Some(directives.join("; "))', 'Some(directives.join(";"))'),
     supportRustSource.replace('directives.push(format!("connect-src ipc: http://ipc.localhost {origin}"))', 'directives.push(format!("connect-src * {origin}"))'),
-    supportRustSource.replace("if !allowed_origin(origin)", "if false"),
+    supportRustSource.replace("if !(allowed_origin(origin)", "if false && (allowed_origin(origin)"),
+    supportRustSource.replace("pinned_origin == Some(origin)", "true"),
+    supportRustSource.replace("pinned_origin.as_deref()", 'Some(origin)'),
     supportRustSource.replace("if !local_document(&url, &resource_id)", "if false"),
   ]) {
     const overridden = body.replace("support_csp_start =", `support_rust_source = ${JSON.stringify(changed)}\nsupport_csp_start =`);
