@@ -85,7 +85,13 @@ function parseCsp(csp) {
   return directives;
 }
 
-function verifySyntheticPackagedCsp(binary, arch = "synthetic") {
+const supportFallbackCsp = "default-src 'none'; script-src 'self'; style-src 'self'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'; media-src 'none'; base-uri 'none'; form-action 'none'";
+const supportConnectPrefix = "connect-src ipc: http://ipc.localhost ";
+function supportLiteralInventory(arch = "arm64") {
+  return `\0Content-Security-Policy${supportFallbackCsp}Cache-Control\0${arch === "x86_64" ? "\0" : "tauri"}${supportConnectPrefix}; \0`;
+}
+
+function verifySyntheticPackagedCsp(binary, arch = "arm64") {
   const runner = String.raw`
 import importlib.util
 import sys
@@ -451,9 +457,13 @@ test("support CSP exception is restricted to the fixed local session document an
   assert.match(csp, /if !allowed_origin\(origin\)/);
   assert.match(csp, /directive\.split_whitespace\(\)\.next\(\) != Some\("connect-src"\)/);
   assert.match(csp, /directives\.push\(format!\("connect-src ipc: http:\/\/ipc\.localhost \{origin\}"\)\)/);
+  assert.match(csp, /Some\(directives\.join\("; "\)\)/);
   const startMarker = ".on_web_resource_request(move |request, response| {";
   const endMarker = /^[ \t]*\}\)[ \t]*\r?\n[ \t]*\.build\(\);[ \t]*\r?$/m;
   const handler = sourceSection(supportRustSource, startMarker, endMarker);
+  const fallbacks = [...handler.matchAll(/\.unwrap_or\(\s*("(?:[^"\\]|\\.)*")\s*\)/g)];
+  assert.equal(fallbacks.length, 1);
+  assert.equal(JSON.parse(fallbacks[0][1]), supportFallbackCsp);
   assert.ok(handler.indexOf("if !local_document(&url, &resource_id)") < handler.indexOf("support_csp(existing, &origin)"));
   for (const indent of ["    ", "\t"]) {
     const formatted = supportRustSource.replace(endMarker, `${indent}})\n${indent}.build();`);
@@ -580,10 +590,22 @@ test("release source gate independently accepts the exact three-window boundary"
   const bodyStart = releaseVerifier.indexOf("<<'PY'\n", start) + "<<'PY'\n".length;
   const end = releaseVerifier.indexOf("\nPY\nthen", bodyStart);
   assert.ok(bodyStart > start && end > bodyStart);
-  const result = spawnSync("python3", ["-c", releaseVerifier.slice(bodyStart, end),
+  const body = releaseVerifier.slice(bodyStart, end);
+  const args = [
     fileURLToPath(capabilitiesPathUrl), fileURLToPath(tauriConfigUrl), fileURLToPath(buildScriptUrl),
-    fileURLToPath(rustSourceUrl), fileURLToPath(appSourceUrl)], { encoding: "utf8" });
+    fileURLToPath(rustSourceUrl), fileURLToPath(appSourceUrl)];
+  const result = spawnSync("python3", ["-c", body, ...args], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
+  for (const changed of [
+    supportRustSource.replace(supportFallbackCsp, supportFallbackCsp.replace("script-src 'self'", "script-src https:")),
+    supportRustSource.replace('Some(directives.join("; "))', 'Some(directives.join(";"))'),
+    supportRustSource.replace('directives.push(format!("connect-src ipc: http://ipc.localhost {origin}"))', 'directives.push(format!("connect-src * {origin}"))'),
+    supportRustSource.replace("if !allowed_origin(origin)", "if false"),
+    supportRustSource.replace("if !local_document(&url, &resource_id)", "if false"),
+  ]) {
+    const overridden = body.replace("support_csp_start =", `support_rust_source = ${JSON.stringify(changed)}\nsupport_csp_start =`);
+    assert.notEqual(spawnSync("python3", ["-c", overridden, ...args], { encoding: "utf8" }).status, 0);
+  }
 });
 
 test("packaged CSP inventory rejects missing, duplicate, and unreviewed policies", () => {
@@ -596,15 +618,16 @@ test("packaged CSP inventory rejects missing, duplicate, and unreviewed policies
     "Content-Security-Policy\0Content-Security-Policy\0" +
     "content-security-policy\0content-security-policy\0" +
     "content-security-policy\0content-security-policy\0";
-  const exact = Buffer.from(`${headers}${productionCsp}\0${printableCsp}`);
+  const exact = Buffer.from(`${headers}${productionCsp}\0${printableCsp}${supportLiteralInventory()}`);
 
   assert.equal(verifySyntheticPackagedCsp(exact).status, 0);
   for (const rejected of [
-    Buffer.from(`${headers}${printableCsp}`),
-    Buffer.from(`${headers}${productionCsp}\0${productionCsp}\0${printableCsp}`),
-    Buffer.from(`${headers}x${productionCsp}\0${printableCsp}`),
-    Buffer.concat([exact, Buffer.from("; script-src-elem https:")]),
-    Buffer.concat([exact, Buffer.from(" https:")]),
+    Buffer.from(`${headers}${printableCsp}${supportLiteralInventory()}`),
+    Buffer.from(`${headers}${productionCsp}\0${productionCsp}\0${printableCsp}${supportLiteralInventory()}`),
+    Buffer.from(`${headers}x${productionCsp}\0${printableCsp}${supportLiteralInventory()}`),
+    Buffer.from(exact.toString().replace(printableCsp, `${printableCsp}; script-src-elem https:`)),
+    Buffer.from(exact.toString().replace(printableCsp, `${printableCsp} https:`)),
+    Buffer.from(exact.toString().replace(printableCsp, `${printableCsp}; future-directive value`)),
     Buffer.concat([exact, Buffer.from("\0navigate-to https:")]),
     Buffer.concat([exact, Buffer.from("\0default-src\t'none'")]),
     Buffer.concat([exact, Buffer.from("\0ScRiPt-SrC-ElEm https:")]),
@@ -635,10 +658,10 @@ test("packaged CSP boundary retains only reviewed source prefixes for alternate 
     "content-security-policy\0content-security-policy\0";
   const reviewedPrefix = "PST QuickView";
   const observedAlternateSlice = Buffer.from(
-    `${headers}${reviewedPrefix}${productionCsp}\0${printableCsp}`,
+    `${headers}${reviewedPrefix}${productionCsp}\0${printableCsp}${supportLiteralInventory("x86_64")}`,
   );
   const bundleNamePrefix = Buffer.from(
-    `${headers}PST QuickView Beta4 Runtime Test${productionCsp}\0${printableCsp}`,
+    `${headers}PST QuickView Beta4 Runtime Test${productionCsp}\0${printableCsp}${supportLiteralInventory("x86_64")}`,
   );
 
   assert.equal(
@@ -650,18 +673,51 @@ test("packaged CSP boundary retains only reviewed source prefixes for alternate 
     0,
   );
   assert.equal(
-    verifySyntheticPackagedCsp(observedAlternateSlice, "arm64").status,
+    verifySyntheticPackagedCsp(Buffer.from(observedAlternateSlice.toString().replace(supportLiteralInventory("x86_64"), supportLiteralInventory("arm64"))), "arm64").status,
     0,
   );
   const armEntryPointPrefix = Buffer.from(
-    `${headers}index.html${productionCsp}\0${printableCsp}`,
+    `${headers}index.html${productionCsp}\0${printableCsp}${supportLiteralInventory("arm64")}`,
   );
   assert.equal(
     verifySyntheticPackagedCsp(armEntryPointPrefix, "arm64").status,
     0,
   );
   assert.notEqual(
-    verifySyntheticPackagedCsp(bundleNamePrefix, "arm64").status,
+    verifySyntheticPackagedCsp(Buffer.from(bundleNamePrefix.toString().replace(supportLiteralInventory("x86_64"), supportLiteralInventory("arm64"))), "arm64").status,
     0,
   );
+});
+
+test("packaged support inventory pins exact literals, architecture neighbors, and token coverage", () => {
+  const productionCsp = tauriConfig.app.security.csp;
+  const printableCsp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'";
+  const headers = "Content-Security-Policy\0".repeat(2) + "content-security-policy\0".repeat(4);
+  for (const arch of ["x86_64", "arm64"]) {
+    const exact = `${headers}${productionCsp}\0${printableCsp}${supportLiteralInventory(arch)}`;
+    assert.equal(verifySyntheticPackagedCsp(Buffer.from(exact), arch).status, 0);
+    for (const rejected of [
+      exact.replace(supportFallbackCsp, ""),
+      `${exact}\0${supportFallbackCsp}`,
+      exact.replace(supportFallbackCsp, supportFallbackCsp.replace("script-src 'self'", "script-src https:")),
+      exact.replace(supportConnectPrefix, ""),
+      `${exact}\0${supportConnectPrefix}`,
+      exact.replace(supportConnectPrefix, "connect-src https://example.invalid "),
+      exact.replace(`Content-Security-Policy${supportFallbackCsp}`, `Wrong-Neighbor${supportFallbackCsp}`),
+      exact.replace(`${supportFallbackCsp}Cache-Control`, `${supportFallbackCsp}Wrong-Neighbor`),
+      exact.replace(`${supportFallbackCsp}Cache-Control`, `${supportFallbackCsp} https://example.invalid Cache-Control`),
+      exact.replace(`${supportConnectPrefix}; `, `${supportConnectPrefix}https://example.invalid; `),
+      exact.replace(`${supportConnectPrefix}; `, `${supportConnectPrefix};`),
+      arch === "arm64" ? exact.replace(`tauri${supportConnectPrefix}`, `wrong${supportConnectPrefix}`) : exact.replace(`\0${supportConnectPrefix}`, `x${supportConnectPrefix}`),
+      `${exact}\0connect-src`,
+      `${exact}\0embeddedconnect-srcword`,
+      `${exact}\0CoNnEcT-SrC`,
+      `${exact}\0script-src https:`,
+      `${exact}\0ScRiPt-SrC-ElEm https:`,
+      `${exact}\0Content-Security-Policy`,
+      exact.replace("content-security-policy", "Content-Security-Policy"),
+      exact.replace("content-security-policy", "CoNtEnT-SeCuRiTy-PoLiCy"),
+    ]) assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(rejected), arch).status, 0);
+    assert.notEqual(verifySyntheticPackagedCsp(Buffer.from(exact), arch === "arm64" ? "x86_64" : "arm64").status, 0);
+  }
 });

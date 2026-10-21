@@ -3,8 +3,11 @@
 This is an implementation candidate, not a packaged-Mac acceptance result.
 The local application/JavaScript suite currently passes, and the development
 dependency audit is clean after the authorized development-only lock updates.
-Native checks are blocked on this Linux host because Rust and the Mac build
-tools are unavailable. The separate source-only GitHub development workflow
+Rust and the Mac build tools are unavailable on this Linux host. Native
+formatting, checking, strict Clippy, and tests have passed in the separate
+GitHub Mac development build, which has also compiled the universal app.
+These source/build results do not establish packaged-Mac acceptance.
+The source-only GitHub development workflow
 produces only a zipped unsigned universal `.app`, after the native and packaged
 checks pass, and has no release/tag write permission. Publishing a source
 snapshot requires explicit owner approval. Mail content and private history

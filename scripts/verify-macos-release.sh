@@ -961,9 +961,18 @@ for required in (
     "if !allowed_origin(origin)",
     'directive.split_whitespace().next() != Some("connect-src")',
     'directives.push(format!("connect-src ipc: http://ipc.localhost {origin}"))',
+    'Some(directives.join("; "))',
 ):
     if required not in support_csp_source:
         raise SystemExit("support CSP is not the exact reviewed origin-scoped connect exception")
+expected_support_fallback = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; "
+    "frame-src 'none'; frame-ancestors 'none'; object-src 'none'; "
+    "media-src 'none'; base-uri 'none'; form-action 'none'"
+)
+fallback_literals = re.findall(r'\.unwrap_or\(\s*("(?:[^"\\]|\\.)*")\s*\)', resource_source)
+if len(fallback_literals) != 1 or json.loads(fallback_literals[0]) != expected_support_fallback:
+    raise SystemExit("support fallback CSP is not the exact reviewed policy")
 guard = resource_source.find("if !local_document(&url, &resource_id)")
 update = resource_source.find("support_csp(existing, &origin)")
 if guard < 0 or update < 0 or guard >= update:

@@ -19,10 +19,24 @@ PRINTABLE_CSP = (
     b"object-src 'none'; base-uri 'none'; form-action 'none'; "
     b"frame-src 'none'; connect-src 'none'"
 )
+# Fixed, reviewed support literals, not policies learned from arbitrary source.
+SUPPORT_FALLBACK_CSP = (
+    b"default-src 'none'; script-src 'self'; style-src 'self'; "
+    b"frame-src 'none'; frame-ancestors 'none'; object-src 'none'; "
+    b"media-src 'none'; base-uri 'none'; form-action 'none'"
+)
+# This is a format-string fragment, NOT a complete active policy. The guarded
+# native constructor appends one validated session origin at runtime.
+SUPPORT_CONNECT_PREFIX = b"connect-src ipc: http://ipc.localhost "
+SUPPORT_FALLBACK_BEFORE = b"Content-Security-Policy"
+SUPPORT_FALLBACK_AFTER = b"Cache-Control"
+SUPPORT_CONNECT_BEFORE = {"x86_64": b"\x00", "arm64": b"tauri"}
+SUPPORT_CONNECT_AFTER = b"; "
+CONNECT_TOKEN_PATTERN = re.compile(rb"connect-src", re.IGNORECASE)
 CSP_HEADER = b"Content-Security-Policy"
 EXPECTED_CSP_HEADER_INVENTORY = Counter(
     {
-        b"Content-Security-Policy": 2,
+        b"Content-Security-Policy": 3,
         b"content-security-policy": 4,
     }
 )
@@ -98,6 +112,8 @@ def verify_slice(
     arch: str,
     policies: tuple[bytes, bytes],
 ) -> None:
+    if arch not in APP_ARCHITECTURES:
+        raise VerificationError("packaged executable has an unreviewed architecture")
     policy_ranges: list[tuple[int, int]] = []
     packed_prefixes = REVIEWED_PACKED_PREFIXES.get(arch, ())
     for policy_index, policy in enumerate(policies):
@@ -125,6 +141,23 @@ def verify_slice(
             )
         policy_ranges.append((start, end))
 
+    inventory_ranges = list(policy_ranges)
+    for literal, before, after in (
+        (SUPPORT_FALLBACK_CSP, SUPPORT_FALLBACK_BEFORE, SUPPORT_FALLBACK_AFTER),
+        (SUPPORT_CONNECT_PREFIX, SUPPORT_CONNECT_BEFORE[arch], SUPPORT_CONNECT_AFTER),
+    ):
+        if binary.count(literal) != 1:
+            raise VerificationError(
+                f"packaged {arch} executable does not contain exactly one of each reviewed support literal"
+            )
+        start = binary.index(literal)
+        end = start + len(literal)
+        if not binary.endswith(before, 0, start) or not binary.startswith(after, end):
+            raise VerificationError(
+                f"packaged {arch} executable changes reviewed support literal adjacency"
+            )
+        inventory_ranges.append((start, end))
+
     header_inventory = Counter(
         match.group() for match in CSP_HEADER_PATTERN.finditer(binary)
     )
@@ -133,8 +166,17 @@ def verify_slice(
             f"packaged {arch} executable contains an unexpected CSP header inventory"
         )
 
+    connect_tokens = list(CONNECT_TOKEN_PATTERN.finditer(binary))
+    if len(connect_tokens) != 3 or any(
+        not any(start <= match.start() and match.end() <= end for start, end in inventory_ranges)
+        for match in connect_tokens
+    ):
+        raise VerificationError(
+            f"packaged {arch} executable contains an unreviewed connect-src token inventory"
+        )
+
     for match in CSP_DIRECTIVE_PATTERN.finditer(binary):
-        if not any(start <= match.start() < end for start, end in policy_ranges):
+        if not any(start <= match.start() and match.end() <= end for start, end in inventory_ranges):
             raise VerificationError(
                 f"packaged {arch} executable contains an unreviewed CSP directive: "
                 f"{match.group().decode()}"

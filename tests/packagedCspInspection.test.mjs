@@ -11,9 +11,10 @@ const support = readFileSync(new URL("../src-tauri/src/support_session.rs", impo
 const production = JSON.parse(config).app.security.csp;
 const printable = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'";
 const headers = "Content-Security-Policy\0Content-Security-Policy\0" + "content-security-policy\0".repeat(4);
-const baseline = `${headers}${production}\0${printable}`;
+const legacyBaseline = `${headers}${production}\0${printable}`;
 const fallback = "default-src 'none'; script-src 'self'; style-src 'self'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'; media-src 'none'; base-uri 'none'; form-action 'none'";
 const runtimePrefix = "connect-src ipc: http://ipc.localhost ";
+const baseline = `${legacyBaseline}\0Content-Security-Policy${fallback}Cache-Control\0tauri${runtimePrefix}; \0`;
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const runner = String.raw`
 import importlib.util,json,sys
@@ -57,27 +58,26 @@ test("CSP inspection reports counts and boundaries while retaining the existing 
   const { status, report } = inspect();
   assert.equal(status, 0);
   assert.deepEqual(report.existingVerifier, { passed: true, failureCategory: "none" });
-  assert.equal(report.headerSpellings.canonical, 2);
+  assert.equal(report.headerSpellings.canonical, 3);
   assert.equal(report.headerSpellings.lowercase, 4);
   assert.equal(report.sourceLiteralObservations.production.occurrences, 1);
-  assert.equal(report.sourceLiteralObservations.support_fallback.occurrences, 0);
+  assert.equal(report.sourceLiteralObservations.support_fallback.occurrences, 1);
   assert.deepEqual(report.outsideKnownLiteralDirectiveHistogram, {});
   assert.equal(report.sourceLiteralObservations.production.locations[0].before, "nul");
 });
 
 test("recognized support literals remain observations and never approve an unreviewed policy", () => {
-  const { report } = inspect(`${baseline}\0${fallback}\0connect-src ipc: http://ipc.localhost `);
+  const { report } = inspect(`${legacyBaseline}\0${fallback}\0connect-src ipc: http://ipc.localhost `);
   assert.equal(report.existingVerifier.passed, false);
-  assert.equal(report.existingVerifier.failureCategory, "unreviewed_directive");
   assert.equal(report.sourceLiteralObservations.support_fallback.occurrences, 1);
   assert.equal(report.sourceLiteralObservations.support_connect_template.occurrences, 1);
   assert.equal(report.safe, undefined);
 });
 
-test("adjacent complete source literals are fingerprinted longest-first without approving policies", () => {
+test("adjacent complete source literals are fingerprinted longest-first without changing the verdict", () => {
   const before = "Content-Security-Policy";
   const after = "Cache-Control";
-  const { report, output } = inspect(`${baseline}\0${before}${fallback}${after}\0${runtimePrefix}; `);
+  const { report, output } = inspect(`${legacyBaseline}\0${before}${fallback}${after}\0tauri${runtimePrefix}; `);
   const location = report.sourceLiteralObservations.support_fallback.locations[0];
   assert.equal(location.adjacency.before.classification, "source_literal_match");
   assert.deepEqual(location.adjacency.before.matches[0], { sha256: sha256(before), byteLength: before.length, kinds: ["rust_string"] });
@@ -85,7 +85,7 @@ test("adjacent complete source literals are fingerprinted longest-first without 
   assert.equal(report.sourceLiteralObservations.support_connect_template.locations[0].adjacency.after.matches[0].sha256, sha256("; "));
   assert.match(report.adjacencySourceCatalog.sourceSha256, /^[a-f0-9]{64}$/);
   assert.equal(report.adjacencySourceCatalog.sourceFileCount, 1);
-  assert.equal(report.existingVerifier.passed, false);
+  assert.equal(report.existingVerifier.passed, true);
   assert.equal(output.includes(before), false);
   assert.equal(output.includes(after), false);
 });
@@ -93,7 +93,7 @@ test("adjacent complete source literals are fingerprinted longest-first without 
 test("changed or arbitrary adjacency stays unclassified with only bounded context fingerprints", () => {
   const before = "SYNTHETIC_UNCLASSIFIED~".repeat(3);
   const after = "~SYNTHETIC_UNCLASSIFIED".repeat(3);
-  const { report, output } = inspect(`${baseline}\0${before}${fallback}${after}`);
+  const { report, output } = inspect(`${legacyBaseline}\0${before}${fallback}${after}`);
   const adjacency = report.sourceLiteralObservations.support_fallback.locations[0].adjacency;
   for (const side of Object.values(adjacency)) {
     assert.equal(side.classification, "unclassified");
@@ -104,7 +104,7 @@ test("changed or arbitrary adjacency stays unclassified with only bounded contex
   assert.equal(adjacency.after.contextSha256, sha256(after.slice(0, 32)));
   assert.equal(report.existingVerifier.passed, false);
   assert.equal(output.includes("SYNTHETIC_UNCLASSIFIED"), false);
-  const changed = inspect(`${baseline}\0Content-Security-Polic~${fallback}~Cache-Control`);
+  const changed = inspect(`${legacyBaseline}\0Content-Security-Polic~${fallback}~Cache-Control`);
   const changedAdjacency = changed.report.sourceLiteralObservations.support_fallback.locations[0].adjacency;
   assert.equal(changedAdjacency.before.classification, "unclassified");
   assert.equal(changedAdjacency.after.classification, "unclassified");
@@ -117,11 +117,11 @@ test("own-crate source set is pinned while comments, raw strings, and test-only 
   const testOnly = "SYNTHETIC_TEST_LITERAL";
   const extra = `// \"${ignored}\"\nconst RAW: &str = r#\"${raw}\"#;\nconst OWN: &str = \"${neighbor}\";\n#[cfg(test)]\nmod tests { const TEST: &str = \"${testOnly}\"; }`;
   const options = { adjacencySources: { "support_session.rs": support, "other.rs": extra } };
-  const { report, output } = inspect(`${baseline}\0${neighbor}${fallback}`, options);
+  const { report, output } = inspect(`${legacyBaseline}\0${neighbor}${fallback}`, options);
   assert.equal(report.adjacencySourceCatalog.sourceFileCount, 2);
   assert.equal(report.sourceLiteralObservations.support_fallback.locations[0].adjacency.before.matches[0].sha256, sha256(neighbor));
   for (const value of [ignored, raw, testOnly]) {
-    const observation = inspect(`${baseline}\0${value}${fallback}`, options).report;
+    const observation = inspect(`${legacyBaseline}\0${value}${fallback}`, options).report;
     assert.equal(observation.sourceLiteralObservations.support_fallback.locations[0].adjacency.before.classification, "unclassified");
   }
   const changed = inspect(baseline, { adjacencySources: { ...options.adjacencySources, "other.rs": `${extra}\n// changed` } }).report;
@@ -133,7 +133,7 @@ test("own-crate source set is pinned while comments, raw strings, and test-only 
 test("adjacency scanner skips continued byte strings without truncating later production literals", () => {
   const neighbor = "SYNTHETIC_PRODUCTION_AFTER_TEST_ATTRIBUTE";
   const extra = '#[cfg(test)]\nfn test_helper() {}\nconst BYTES: &[u8] = b"ignored\\\ncontinued";\nconst QUOTE: char = \'"\';\n' + `const OWN: &str = "${neighbor}";`;
-  const { report } = inspect(`${baseline}\0${neighbor}${fallback}`, { adjacencySources: { "other.rs": extra } });
+  const { report } = inspect(`${legacyBaseline}\0${neighbor}${fallback}`, { adjacencySources: { "other.rs": extra } });
   assert.equal(report.sourceLiteralObservations.support_fallback.locations[0].adjacency.before.matches[0].sha256, sha256(neighbor));
   assert.equal(report.existingVerifier.passed, false);
 });
@@ -143,7 +143,7 @@ test("adjacency candidate inventory and reported matches have explicit limits", 
   assert.equal(inspect(baseline, { adjacencySources: sources }).report.errorCategory, "source_adjacency_limit");
   const values = ["abcdefgh", "bcdefgh", "cdefgh", "defgh", "efgh", "fgh"];
   const extra = values.map((value, index) => `const A${index}: &str = "${value}";`).join("\n");
-  const { report } = inspect(`${baseline}\0${values[0]}${fallback}`, { adjacencySources: { "other.rs": extra } });
+  const { report } = inspect(`${legacyBaseline}\0${values[0]}${fallback}`, { adjacencySources: { "other.rs": extra } });
   const side = report.sourceLiteralObservations.support_fallback.locations[0].adjacency.before;
   assert.equal(side.matches.length, 4);
   assert.equal(side.matchesTruncated, true);
@@ -190,4 +190,12 @@ test("CLI observation does not override failure from the existing verifier", () 
   const failed = inspect(`${baseline}\0script-src-elem https:`, { operation: "main" });
   assert.equal(failed.status, 1);
   assert.equal(failed.report.slices[0].existingVerifier.passed, false);
+});
+
+test("source-derived observations never approve changed support literal semantics", () => {
+  const changedFallback = fallback.replace("script-src 'self'", "script-src https:");
+  const { report } = inspect(baseline.replace(fallback, changedFallback), { support: support.replace(fallback, changedFallback) });
+  assert.equal(report.sourceLiteralObservations.support_fallback.occurrences, 1);
+  assert.equal(report.existingVerifier.passed, false);
+  assert.equal(inspect(legacyBaseline).report.existingVerifier.passed, false);
 });
