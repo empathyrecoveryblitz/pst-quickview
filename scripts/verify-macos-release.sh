@@ -947,7 +947,12 @@ if "standaloneMessagePath=" in app_source or "previewWorkspaceId=" in app_source
 support_csp_start = support_rust_source.find("fn support_csp(")
 support_csp_end = support_rust_source.find("\nfn take_session(", support_csp_start)
 resource_start = support_rust_source.find(".on_web_resource_request(move |request, response| {")
-resource_end = support_rust_source.find("\n        .build();", resource_start)
+resource_end_match = re.search(
+    r"^[ \t]*\}\)[ \t]*\r?\n[ \t]*\.build\(\);[ \t]*\r?$",
+    support_rust_source[resource_start:] if resource_start >= 0 else "",
+    re.MULTILINE,
+)
+resource_end = resource_start + resource_end_match.start() if resource_end_match else -1
 if min(support_csp_start, support_csp_end, resource_start, resource_end) < 0:
     raise SystemExit("scoped support CSP implementation was not found")
 support_csp_source = support_rust_source[support_csp_start:support_csp_end]

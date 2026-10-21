@@ -117,7 +117,11 @@ except module.VerificationError as error:
 function sourceSection(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
-  const end = source.indexOf(endMarker, start + startMarker.length);
+  const remainderStart = start + startMarker.length;
+  const relativeEnd = endMarker instanceof RegExp
+    ? source.slice(remainderStart).search(endMarker)
+    : source.indexOf(endMarker, remainderStart) - remainderStart;
+  const end = relativeEnd < 0 ? -1 : remainderStart + relativeEnd;
   assert.notEqual(end, -1, `missing source marker: ${endMarker}`);
   return source.slice(start, end);
 }
@@ -447,8 +451,15 @@ test("support CSP exception is restricted to the fixed local session document an
   assert.match(csp, /if !allowed_origin\(origin\)/);
   assert.match(csp, /directive\.split_whitespace\(\)\.next\(\) != Some\("connect-src"\)/);
   assert.match(csp, /directives\.push\(format!\("connect-src ipc: http:\/\/ipc\.localhost \{origin\}"\)\)/);
-  const handler = sourceSection(supportRustSource, ".on_web_resource_request(move |request, response| {", "\n        .build();");
+  const startMarker = ".on_web_resource_request(move |request, response| {";
+  const endMarker = /^[ \t]*\}\)[ \t]*\r?\n[ \t]*\.build\(\);[ \t]*\r?$/m;
+  const handler = sourceSection(supportRustSource, startMarker, endMarker);
   assert.ok(handler.indexOf("if !local_document(&url, &resource_id)") < handler.indexOf("support_csp(existing, &origin)"));
+  for (const indent of ["    ", "\t"]) {
+    const formatted = supportRustSource.replace(endMarker, `${indent}})\n${indent}.build();`);
+    assert.equal(sourceSection(formatted, startMarker, endMarker), handler);
+  }
+  assert.throws(() => sourceSection(supportRustSource.replace(endMarker, "    })\n    .build(); arbitrary"), startMarker, endMarker));
   assert.match(supportRustSource, /const DOCUMENT: &str = "\/support\/session\.html"/);
   assert.match(supportRustSource, /strip_suffix\("\.run\.pinggy-free\.link"\)/);
   assert.match(supportRustSource, /\.on_navigation\(move \|url\| local_document\(url, &navigation_id\)\)/);
