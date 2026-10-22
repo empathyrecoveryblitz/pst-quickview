@@ -13826,7 +13826,10 @@ where
     let mut file = open_bounded_message_file(path)?;
     let before = file.metadata()?;
     let mut bytes = Vec::with_capacity((before.len() as usize).min(1024 * 1024));
-    let mut buffer = [0_u8; 1024 * 1024];
+    // Discovery and verification can be inlined into nested import/repair
+    // routines. Keep this buffer on the heap so each caller does not reserve
+    // another MiB of the blocking worker's stack, even before its first read.
+    let mut buffer = vec![0_u8; 1024 * 1024];
     let mut next_progress_bytes = DISCOVERY_HASH_PROGRESS_BYTES;
     loop {
         let bytes_read = file.read(&mut buffer)?;

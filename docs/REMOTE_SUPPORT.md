@@ -1,10 +1,15 @@
 # Approved app-only Remote Support
 
 This is an implementation candidate, not a packaged-Mac acceptance result.
-The current development version is `0.2.0-beta.3.support.2`. The verified
+The current development version is `0.2.0-beta.3.support.3`. The verified
 updater and update/resume revision still need fresh native, package, and
 genuine-Mac installation/restart validation. No current CI pass or readiness
 claim is implied by this document.
+This revision keeps the message-read scratch buffer off the blocking worker's
+stack. Nested optimized import/repair calls in the earlier build could exhaust
+that stack. A constrained-stack regression is required in both debug and release
+profiles; this source correction is not a claim of successful testing on a
+recipient's Mac. Existing source files and workspaces must be preserved.
 The automatic dashboard revision replaces invitation copying. Earlier
 invitation-based development ZIPs do not implement this workflow. Validate a
 fresh build containing the exact deployed service/key pins before sharing it.

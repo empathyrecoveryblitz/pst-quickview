@@ -54,6 +54,9 @@ jobs:
       - name: Native tests
         run: cargo test --locked
         working-directory: src-tauri
+      - name: Optimized constrained-stack reader and import regression
+        run: cargo test --release --locked constrained_stack_
+        working-directory: src-tauri
       - run: scripts/agent-check.sh
       - run: PST_QUICKVIEW_SECURITY_STRESS=1 scripts/security-regression-gate.sh
       - run: bash scripts/test-macos-dylib-validation.sh

@@ -8,8 +8,8 @@ test('development Mac build identity increments within the three significant bun
   const config = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const bundleVersion = config.bundle.macOS.bundleVersion;
   assert.match(bundleVersion, /^\d+\.\d+\.\d+$/);
-  assert.equal(bundleVersion, '0.2.302');
-  assert.equal(config.version, '0.2.0-beta.3.support.2');
+  assert.equal(bundleVersion, '0.2.303');
+  assert.equal(config.version, '0.2.0-beta.3.support.3');
   assert.ok(Number(bundleVersion.split('.')[2]) > 0);
 });
 test('development workflow is Mac app-only, unsigned, and has no release or tag authority', () => {
@@ -18,6 +18,7 @@ test('development workflow is Mac app-only, unsigned, and has no release or tag 
   assert.match(workflow, /contents: read/);
   assert.match(workflow, /persist-credentials: false/);
   assert.match(workflow, /--target universal-apple-darwin --bundles app --no-sign --ci/);
+  assert.match(workflow, /cargo test --release --locked constrained_stack_/);
   assert.match(workflow, /cargo test --locked --manifest-path scripts\/support-update-verifier\/Cargo.toml/);
   assert.match(workflow, /cargo clippy --locked --manifest-path scripts\/support-update-verifier\/Cargo.toml --all-targets -- -D warnings/);
   assert.match(workflow, /EXPECT_DMG=0 bash scripts\/verify-macos-release.sh/);

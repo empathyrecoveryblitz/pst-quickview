@@ -30,6 +30,95 @@ fn temporary_import_integrity_directory(name: &str) -> PathBuf {
     directory
 }
 
+#[test]
+fn constrained_stack_eml_snapshot_discovery_progress_and_cancellation() {
+    let root = temporary_import_integrity_directory("constrained-stack-reader");
+    let extract_dir = root.join("extracted");
+    let source = extract_dir.join("synthetic.eml");
+    let mut expected = b"Content-Type: text/plain\r\n\r\n".to_vec();
+    expected.resize((DISCOVERY_HASH_PROGRESS_BYTES + 1024 * 1024) as usize, b'x');
+    write_synthetic_message(&source, &expected);
+    let before = file_identity(&source, "synthetic EML").unwrap();
+    let worker_before = before.clone();
+    let worker_source = source.clone();
+
+    thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let mut progress = Vec::new();
+            let (bytes, identity) =
+                read_eml_candidate_snapshot_with_progress(&worker_source, |processed| {
+                    progress.push(processed);
+                    Ok(())
+                })
+                .expect("bounded-stack candidate read should succeed");
+            assert_eq!(bytes, expected);
+            assert_eq!(identity, worker_before);
+            assert_eq!(progress.len(), 1);
+            assert!((DISCOVERY_HASH_PROGRESS_BYTES..=expected.len() as u64).contains(&progress[0]));
+            drop(bytes);
+
+            let mut snapshot_progress = 0;
+            let snapshot = snapshot_eml_candidate_with_progress(&worker_source, || {
+                snapshot_progress += 1;
+                Ok(())
+            })
+            .expect("bounded-stack identity snapshot should succeed");
+            assert_eq!(snapshot, worker_before);
+            assert_eq!(snapshot_progress, 1);
+
+            let mut discovery_progress = 0;
+            let discovery = discover_eml_candidates_with_progress(&extract_dir, |_, activity| {
+                assert!(activity);
+                discovery_progress += 1;
+                Ok(())
+            })
+            .expect("bounded-stack discovery should succeed");
+            assert_eq!(discovery.count, 1);
+            assert_eq!(discovery.candidates[0].identity, worker_before);
+            assert!(discovery_progress >= 2);
+
+            let mut cancellation_checkpoints = 0;
+            let cancelled = read_eml_candidate_snapshot_with_progress(&worker_source, |_| {
+                cancellation_checkpoints += 1;
+                Err(import_cancelled_error(
+                    "Synthetic bounded-stack cancellation.",
+                ))
+            })
+            .expect_err("candidate reading must honor its progress cancellation");
+            assert_eq!(cancelled.code, Some(IMPORT_CANCELLED_CODE));
+            assert_eq!(cancellation_checkpoints, 1);
+            let cancelled_discovery =
+                discover_eml_candidates_with_progress(&extract_dir, |_, _| {
+                    Err(import_cancelled_error("Synthetic discovery cancellation."))
+                })
+                .expect_err("discovery must preserve candidate cancellation");
+            assert_eq!(cancelled_discovery.code, Some(IMPORT_CANCELLED_CODE));
+            assert_eq!(
+                file_identity(&worker_source, "synthetic EML").unwrap(),
+                worker_before
+            );
+        })
+        .expect("constrained-stack reader worker should start")
+        .join()
+        .expect("constrained-stack reader worker should finish");
+
+    assert_eq!(file_identity(&source, "synthetic EML").unwrap(), before);
+    fs::remove_dir_all(root).expect("synthetic constrained-stack reader fixture should be removed");
+}
+
+#[test]
+fn constrained_stack_interrupted_resume_and_reopen_lifecycle() {
+    // Exercise the actual discovery, indexing, cancellation, resume, promotion,
+    // and reopen paths with the default blocking-worker stack budget.
+    thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(interrupted_import_resumes_idempotently_across_reresume_and_reopen)
+        .expect("constrained-stack lifecycle worker should start")
+        .join()
+        .expect("constrained-stack lifecycle worker should finish");
+}
+
 fn write_synthetic_message(path: &Path, bytes: &[u8]) {
     fs::create_dir_all(path.parent().expect("synthetic message needs a parent"))
         .expect("synthetic message parent should be created");

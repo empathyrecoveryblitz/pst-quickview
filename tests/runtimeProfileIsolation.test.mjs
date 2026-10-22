@@ -176,11 +176,11 @@ test("next-to-PST and Local Trash remain workspace-local", () => {
 });
 
 test("runtime-profile isolation preserves the approved development version and source contracts", () => {
-  assert.equal(packageJson.version, "0.2.0-beta.3.support.2");
-  assert.equal(tauriConfig.version, "0.2.0-beta.3.support.2");
+  assert.equal(packageJson.version, "0.2.0-beta.3.support.3");
+  assert.equal(tauriConfig.version, "0.2.0-beta.3.support.3");
   assert.equal(tauriConfig.identifier, "com.local.pstquickview");
   assert.equal(tauriConfig.productName, "PST QuickView");
-  assert.match(cargoToml, /^version = "0\.2\.0-beta\.3\.support\.2"$/m);
+  assert.match(cargoToml, /^version = "0\.2\.0-beta\.3\.support\.3"$/m);
   assert.doesNotMatch(profileImplementation, /["'][^"']*\.(?:pst|eml|msg)["']/);
   assert.doesNotMatch(profileImplementation, /fs::(?:remove_file|remove_dir|rename)\s*\(/);
 });
