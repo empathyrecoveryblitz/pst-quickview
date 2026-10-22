@@ -307,8 +307,9 @@ test('peer starts STUN only after local and remote approval and Stop closes imme
   const cfg = config('controller');
   const remote = await createCipher({ ...cfg, role: 'guest' });
   const approval = await remote.seal('approved', null);
-  let peers = 0, closures = 0, releasePoll, negotiating;
+  let peers = 0, closures = 0, releasePoll, negotiating, stopped;
   const negotiation = new Promise(resolve => { negotiating = resolve; });
+  const stopDelivered = new Promise(resolve => { stopped = resolve; });
   const pendingPoll = new Promise(resolve => { releasePoll = resolve; });
   const makeResponse = value => new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } });
   class FakePeer {
@@ -327,7 +328,12 @@ test('peer starts STUN only after local and remote approval and Stop closes imme
   let peer;
   try {
     globalThis.RTCPeerConnection = FakePeer;
-    globalThis.fetch = async url => String(url).includes('/api/poll') ? pendingPoll : makeResponse({});
+    globalThis.fetch = async (url, options) => {
+      if (String(url).includes('/api/poll')) return pendingPoll;
+      const message = await remote.open(JSON.parse(options.body));
+      if (message.kind === 'stop') stopped();
+      return makeResponse({});
+    };
     const { createSupportPeer } = await import('../public/support/peer.js');
     const states = [], reasons = [];
     peer = await createSupportPeer({ config: cfg, onState: state => { states.push(state); if (state === 'negotiating') negotiating(); }, onClose: reason => reasons.push(reason) });
@@ -345,7 +351,7 @@ test('peer starts STUN only after local and remote approval and Stop closes imme
     assert.equal(await peer.approve(), false);
     peer.close();
     assert.deepEqual(reasons, ['stopped']);
-    await new Promise(resolve => setTimeout(resolve, 5));
+    await within(stopDelivered, 'negotiation Stop delivery');
   } finally {
     peer?.close();
     globalThis.RTCPeerConnection = originalRTC;
@@ -353,15 +359,17 @@ test('peer starts STUN only after local and remote approval and Stop closes imme
   }
 });
 
-test('queued trickle candidates stay ahead of end while the first delivery is pending', async () => {
+test('queued trickle candidates stay ordered and delayed Stop completes before teardown', async () => {
   const originalRTC = globalThis.RTCPeerConnection, originalFetch = globalThis.fetch;
+  const originalEncrypt = crypto.subtle.encrypt;
   const cfg = config('controller'), remote = await createCipher({ ...cfg, role: 'guest' });
   const approval = await remote.seal('approved', null);
   const kinds = [];
-  let pc, peer, firstCandidate, releaseCandidate, finished;
+  let pc, peer, firstCandidate, releaseCandidate, finished, stopped;
   const firstDelivery = new Promise(resolve => { firstCandidate = resolve; });
   const blockedDelivery = new Promise(resolve => { releaseCandidate = resolve; });
   const complete = new Promise(resolve => { finished = resolve; });
+  const stopDelivered = new Promise(resolve => { stopped = resolve; });
   const response = value => new Response(JSON.stringify(value), { status: 200 });
   class FakePeer {
     constructor() { pc = this; }
@@ -375,6 +383,14 @@ test('queued trickle candidates stay ahead of end while the first delivery is pe
     close() {}
   }
   try {
+    // A slow WebCrypto operation used to outlive the fixed 5ms teardown sleep
+    // and send this test's Stop into the next test's replacement fetch mock.
+    crypto.subtle.encrypt = async function(...args) {
+      if (JSON.parse(new TextDecoder().decode(args[2])).kind === 'stop') {
+        await new Promise(resolve => setTimeout(resolve, 30));
+      }
+      return originalEncrypt.apply(this, args);
+    };
     globalThis.RTCPeerConnection = FakePeer;
     globalThis.fetch = async (url, options) => {
       assert.equal(options.headers['X-Pinggy-No-Screen'], undefined);
@@ -385,6 +401,7 @@ test('queued trickle candidates stay ahead of end while the first delivery is pe
         firstCandidate(); await blockedDelivery;
       }
       if (message.kind === 'end') finished();
+      if (message.kind === 'stop') stopped();
       return response({});
     };
     const { createSupportPeer } = await import('../public/support/peer.js');
@@ -396,10 +413,16 @@ test('queued trickle candidates stay ahead of end while the first delivery is pe
     await within(complete, 'end of trickle delivery');
     assert.deepEqual(kinds, ['approved', 'offer', 'candidate', 'candidate', 'end']);
     peer.close();
-    await new Promise(resolve => setTimeout(resolve, 5));
+    await within(stopDelivered, 'delayed trickle Stop delivery');
+    assert.deepEqual([...kinds], ['approved', 'offer', 'candidate', 'candidate', 'end', 'stop']);
   } finally {
     releaseCandidate?.(); peer?.close();
-    globalThis.RTCPeerConnection = originalRTC; globalThis.fetch = originalFetch;
+    try {
+      if (kinds.includes('approved')) await within(stopDelivered, 'trickle teardown Stop delivery');
+    } finally {
+      crypto.subtle.encrypt = originalEncrypt;
+      globalThis.RTCPeerConnection = originalRTC; globalThis.fetch = originalFetch;
+    }
   }
 });
 
@@ -410,6 +433,12 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
   const guestConfig = { ...controllerConfig, role: 'guest', token: 'b'.repeat(64), origin: updating ? controllerConfig.origin : 'https://example.run.pinggy-free.link' };
   const queue = updating ? { origin: controllerConfig.origin, requestId: '1'.repeat(32) } : undefined;
   const queues = { controller: [], guest: [] }, pcs = [], frames = [], actions = [], reasons = [];
+  const stopSignals = {}, approvedRoles = new Set();
+  const stopDeliveries = Object.fromEntries(['controller', 'guest'].map(role => [role, new Promise(resolve => { stopSignals[role] = resolve; })]));
+  const observers = {
+    controller: await createCipher({ ...controllerConfig, role: 'guest' }),
+    guest: await createCipher({ ...guestConfig, role: 'controller' }),
+  };
   const handoffs = [], acks = [];
   let controller, guest, controllerConnected, guestConnected, frameReceived, actionReceived;
   let handoffReceived, ackReceived, updateRejected;
@@ -470,7 +499,11 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
       if (options.method === 'POST') {
         const envelope = JSON.parse(options.body);
         assert.equal(envelope.from, role);
-        if (!queues[role].some(message => message.seq === envelope.seq)) queues[role].push(envelope);
+        if (!queues[role].some(message => message.seq === envelope.seq)) {
+          const opened = await observers[role].open(envelope);
+          queues[role].push(envelope);
+          if (opened.kind === 'stop') stopSignals[role]();
+        }
         return response({});
       }
       const after = Number(new URL(url).searchParams.get('after'));
@@ -479,7 +512,8 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
     const { createSupportPeer } = await import('../public/support/peer.js');
     controller = await createSupportPeer({ config: controllerConfig, queue, onUpdateHandoff: value => { handoffs.push(value); handoffReceived(); }, onState: state => { if (state === 'connected') controllerConnected(); }, onFrame: value => { frames.push(value); frameReceived(); }, onClose: reason => reasons.push(['controller', reason]) });
     guest = await createSupportPeer({ config: guestConfig, queue, onUpdateHandoffAck: value => { acks.push(value); ackReceived(); }, onState: state => { if (state === 'connected') guestConnected(); }, onAction: value => { actions.push(value); actionReceived(); }, onClose: reason => { reasons.push(['guest', reason]); if (reason === 'update') updateRejected(); } });
-    await controller.approve(); await guest.approve();
+    assert.equal(await controller.approve(), true); approvedRoles.add('controller');
+    assert.equal(await guest.approve(), true); approvedRoles.add('guest');
     await within(Promise.all(connected), 'connected', () => JSON.stringify(reasons));
     assert.equal(controller.sendFrame(frame()), false);
     assert.equal(guest.sendAction(action('click')), false);
@@ -525,7 +559,7 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
     // A validated action queued before Stop must not reach a revoked receiver.
     assert.equal(controller.sendAction(action('click')), true);
     guest.close();
-    await new Promise(resolve => setTimeout(resolve, 5));
+    await within(stopDeliveries.guest, 'paired guest Stop delivery');
     assert.equal(actions.length, 1);
     assert.equal(guest.sendFrame(frame()), false);
     assert.equal(controller.sendAction(action('click')), false);
@@ -533,8 +567,12 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
     assert.ok(reasons.some(([role, reason]) => role === 'controller' && reason === 'disconnected'));
   } finally {
     controller?.close(); guest?.close();
-    await new Promise(resolve => setTimeout(resolve, 5));
-    globalThis.RTCPeerConnection = originalRTC; globalThis.fetch = originalFetch;
+    try {
+      const locallyStopped = reasons.filter(([role, reason]) => reason === 'stopped' && approvedRoles.has(role));
+      await within(Promise.all(locallyStopped.map(([role]) => stopDeliveries[role])), 'paired teardown Stop delivery');
+    } finally {
+      globalThis.RTCPeerConnection = originalRTC; globalThis.fetch = originalFetch;
+    }
   }
 });
 
@@ -544,6 +582,8 @@ async function setupDeliveryFailure(t, kind, connect) {
   const guestConfig = { ...controllerConfig, role: 'guest', token: 'b'.repeat(64), origin: 'https://example.run.pinggy-free.link' };
   const queues = { controller: [], guest: [] }, pcs = [], gathering = [], states = [], reasons = [], received = [];
   const observed = { controller: new Map(), guest: new Map() };
+  const stopSignals = {}, approvedRoles = new Set();
+  const stopDeliveries = Object.fromEntries(['controller', 'guest'].map(role => [role, new Promise(resolve => { stopSignals[role] = resolve; })]));
   const observers = {
     controller: await createCipher({ ...controllerConfig, role: 'guest' }),
     guest: await createCipher({ ...guestConfig, role: 'controller' }),
@@ -564,8 +604,12 @@ async function setupDeliveryFailure(t, kind, connect) {
   })]).finally(() => clearTimeout(guard));
   t.after(async () => {
     releaseFailure(); controller?.close(); guest?.close();
-    await new Promise(resolve => originalTimeout(resolve, 5));
-    globalThis.RTCPeerConnection = originalRTC; globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout;
+    try {
+      const locallyStopped = reasons.filter(([role, reason]) => reason === 'stopped' && approvedRoles.has(role));
+      await within(Promise.all(locallyStopped.map(([role]) => stopDeliveries[role])), 'setup-failure teardown Stop delivery');
+    } finally {
+      globalThis.RTCPeerConnection = originalRTC; globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout;
+    }
   });
   class FakeChannel {
     constructor(label, options) { Object.assign(this, { label, ...options, maxRetransmits: null, maxPacketLifeTime: null, readyState: 'connecting', bufferedAmount: 0 }); }
@@ -613,6 +657,7 @@ async function setupDeliveryFailure(t, kind, connect) {
       const envelope = JSON.parse(options.body);
       if (!observed[role].has(envelope.seq)) observed[role].set(envelope.seq, await observers[role].open(envelope));
       const message = observed[role].get(envelope.seq);
+      if (message.kind === 'stop') stopSignals[role]();
       if (role === 'guest' && message.kind === (kind === 'candidate' ? 'candidate' : 'end')) {
         attempts++; markPending(); await blocked;
         if (attempts === 3) markFinished();
@@ -634,7 +679,9 @@ async function setupDeliveryFailure(t, kind, connect) {
     onState: state => { states.push(['guest', state]); if (state === 'connected') guestConnected(); },
     onClose: reason => reasons.push(['guest', reason]), onAction: () => markAction?.(),
   });
-  await controller.approve(); await guest.approve(); await timed(ready); await tick();
+  assert.equal(await controller.approve(), true); approvedRoles.add('controller');
+  assert.equal(await guest.approve(), true); approvedRoles.add('guest');
+  await timed(ready); await tick();
   const candidate = { candidate: rawCandidate.replace(exit, '9.9.9.9') };
   pcs[1].onicecandidate({ candidate });
   if (kind !== 'candidate') {
