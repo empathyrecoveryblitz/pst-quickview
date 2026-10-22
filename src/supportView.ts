@@ -32,7 +32,19 @@ function intersect(a: Box, b: Box): Box | null {
   return w > 0 && h > 0 ? { x, y, w, h } : null;
 }
 function bounds(rect: DOMRect): Box { return { x: rect.x, y: rect.y, w: rect.width, h: rect.height }; }
-function color(value: string): string { return /^(?:#[a-f\d]{3,8}|rgba?\([\d.,% ]+\))$/i.test(value) ? value : "rgb(32, 32, 32)"; }
+function color(value: string): string | null {
+  if (value.length > 64) return null;
+  if (/^#(?:[a-f\d]{3}|[a-f\d]{4}|[a-f\d]{6}|[a-f\d]{8})$/i.test(value)) return value;
+  const match = /^(rgb|rgba)\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})(?:\s*,\s*(0(?:\.\d{1,4})?|1(?:\.0{1,4})?|\.\d{1,4}))?\s*\)$/.exec(value);
+  return match && Number(match[2]) <= 255 && Number(match[3]) <= 255 && Number(match[4]) <= 255 &&
+    ((match[1] === "rgb" && match[5] === undefined) || (match[1] === "rgba" && match[5] !== undefined)) ? value : null;
+}
+function invisibleColor(value: string): boolean {
+  return value === "transparent" || /rgba\([^)]*,\s*(?:0(?:\.0+)?|\.0+)\s*\)$/.test(value) || /^#(?:[a-f\d]{3}0|[a-f\d]{6}00)$/i.test(value);
+}
+function viewportDimension(value: number | undefined, maximum: number, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? Math.min(maximum, Math.max(1, value)) : fallback;
+}
 // Repair only the outgoing mirror copy, never the source DOM. Limits remain
 // UTF-16 units, but neither truncation nor replacement emits a lone surrogate.
 function safeText(value: string, maximum: number): string {
@@ -64,8 +76,13 @@ export function createSupportView(document: Document, now = () => performance.no
   const frames = new Map<string, { at: number; targets: Map<string, { element: Element; rect: Box; kind: SupportAction["kind"] }> }>();
   function capture(): SupportFrame {
     if (!active) throw Error("Support stopped.");
-    const width = Math.min(4096, document.defaultView?.innerWidth ?? 1280), height = Math.min(2160, document.defaultView?.innerHeight ?? 820);
-    const viewport: Box = { x: 0, y: 0, w: width, h: height };
+    const viewportWidth = document.defaultView?.innerWidth, viewportHeight = document.defaultView?.innerHeight;
+    const width = viewportDimension(viewportWidth, 4096, 1280), height = viewportDimension(viewportHeight, 2160, 820);
+    const viewport: Box = {
+      x: 0, y: 0,
+      w: viewportWidth !== undefined && Number.isFinite(viewportWidth) && viewportWidth > 0 ? Math.min(width, viewportWidth) : 0,
+      h: viewportHeight !== undefined && Number.isFinite(viewportHeight) && viewportHeight > 0 ? Math.min(height, viewportHeight) : 0,
+    };
     const frame: SupportFrame = { v: 1, id: identifier(), width, height, items: [], targets: [], truncated: false };
     const controls = new Map<string, { element: Element; rect: Box; kind: SupportAction["kind"] }>();
     let glyphs = 0, visited = 0, textUnits = 0;
@@ -87,7 +104,9 @@ export function createSupportView(document: Document, now = () => performance.no
       if (style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0) return;
       const rect = bounds(element.getBoundingClientRect()), visible = intersect(rect, clip);
       if (!visible && style.overflow !== "visible") return;
-      if (visible && style.backgroundColor !== "rgba(0, 0, 0, 0)") append({ kind: "box", ...visible, fill: color(style.backgroundColor) });
+      const background = color(style.backgroundColor), foreground = color(style.color) || "";
+      const textHidden = !foreground || invisibleColor(foreground) || invisibleColor(style.getPropertyValue("-webkit-text-fill-color")) || (style.clipPath && style.clipPath !== "none");
+      if (visible && background && !invisibleColor(background)) append({ kind: "box", ...visible, fill: background });
       let nextClip = /hidden|auto|scroll|clip/.test(`${style.overflowX} ${style.overflowY}`) ? visible : clip;
       if (nextClip && style.textOverflow === "ellipsis" && element instanceof HTMLElement && element.scrollWidth > element.clientWidth) {
         nextClip = { ...nextClip, w: Math.max(0, nextClip.w - (parseFloat(style.fontSize) || 14) * 2) };
@@ -105,12 +124,12 @@ export function createSupportView(document: Document, now = () => performance.no
       }
       if (visible && (element instanceof HTMLInputElement || element instanceof HTMLSelectElement)) {
         const top = document.elementFromPoint(visible.x + visible.w / 2, visible.y + visible.h / 2);
-        if (top !== element) return;
+        if (top !== element || textHidden) return;
         // Native inputs cannot provide clipped text ranges. Never export their
         // values/prefixes: horizontal scrolling could make those bytes hidden.
         const text = element instanceof HTMLSelectElement ? element.selectedOptions[0]?.textContent ?? "" : "Search input (technician can enter a query)";
         const size = Math.min(40, Math.max(8, parseFloat(style.fontSize) || 13));
-        append({ kind: "text", ...visible, text: safeText(text, Math.min(1000, Math.floor(visible.w / size))), color: color(style.color), size, weight: 400 });
+        append({ kind: "text", ...visible, text: safeText(text, Math.min(1000, Math.floor(visible.w / size))), color: foreground, size, weight: 400 });
         return;
       }
       for (const node of element.childNodes) {
@@ -119,13 +138,12 @@ export function createSupportView(document: Document, now = () => performance.no
         // An unknown computed color may contain an alpha channel (Color 4,
         // for example). Do not turn potentially invisible text opaque merely
         // because the bounded drawing protocol cannot represent that color.
-        if (!/^(?:#[a-f\d]{3,8}|rgba?\([\d., ]+\))$/i.test(style.color)) continue;
-        if (style.color === "transparent" || /rgba\([^)]*,\s*0\s*\)$/.test(style.color) || style.getPropertyValue("-webkit-text-fill-color") === "transparent" || /rgba\([^)]*,\s*0\s*\)$/.test(style.getPropertyValue("-webkit-text-fill-color")) || (style.clipPath && style.clipPath !== "none")) continue;
+        if (textHidden) continue;
         // Character ranges omit off-screen lines: a visible paragraph must not
         // accidentally disclose the remainder of a long message or raw source.
         const range = document.createRange(); let line: (Box & { text: string }) | null = null;
         const flush = () => {
-          if (line?.text.trim()) append({ kind: "text", ...line, color: color(style.color), size: Math.min(40, Math.max(8, parseFloat(style.fontSize) || 13)), weight: Math.min(900, Math.max(100, parseInt(style.fontWeight) || 400)) });
+          if (line?.text.trim()) append({ kind: "text", ...line, color: foreground, size: Math.min(40, Math.max(8, parseFloat(style.fontSize) || 13)), weight: Math.min(900, Math.max(100, parseInt(style.fontWeight) || 400)) });
           line = null;
         };
         const text = node.textContent;
@@ -140,7 +158,10 @@ export function createSupportView(document: Document, now = () => performance.no
           if (!shown || shown.h < charRect.h * 0.8 || shown.w < charRect.w * 0.8) { flush(); continue; }
           const top = document.elementFromPoint(shown.x + shown.w / 2, shown.y + shown.h / 2);
           if (top !== element) { flush(); continue; }
-          if (line && Math.abs(line.y - shown.y) < 2 && Math.abs(line.x + line.w - shown.x) < 3 && line.text.length + character.length <= 1000) { line.text += character; line.w = shown.x + shown.w - line.x; }
+          if (line && Math.abs(line.y - shown.y) < 2 && Math.abs(line.x + line.w - shown.x) < 3 && line.text.length + character.length <= 1000) {
+            const x = Math.min(line.x, shown.x), y = Math.min(line.y, shown.y);
+            line = { x, y, w: Math.max(line.x + line.w, shown.x + shown.w) - x, h: Math.max(line.y + line.h, shown.y + shown.h) - y, text: line.text + character };
+          }
           else { flush(); line = { ...shown, text: character }; }
         }
         flush();

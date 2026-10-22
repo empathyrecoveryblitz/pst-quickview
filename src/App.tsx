@@ -2333,6 +2333,8 @@ function App() {
     useState<PendingPreflightOpen | null>(null);
   const [pendingPlannedRepair, setPendingPlannedRepair] =
     useState<PendingPlannedRepair | null>(null);
+  const [pendingPlannedDelete, setPendingPlannedDelete] =
+    useState<PendingPlannedRepair | null>(null);
   const [pendingWorkspaceFlowOwnerId, setPendingWorkspaceFlowOwnerId] = useState<string | null>(
     null,
   );
@@ -2358,6 +2360,9 @@ function App() {
   const repairConfirmDialogRef = useRef<HTMLElement | null>(null);
   const repairConfirmCancelRef = useRef<HTMLButtonElement | null>(null);
   const repairConfirmReturnFocusRef = useRef<HTMLElement | null>(null);
+  const deleteConfirmDialogRef = useRef<HTMLElement | null>(null);
+  const deleteConfirmCancelRef = useRef<HTMLButtonElement | null>(null);
+  const deleteConfirmReturnFocusRef = useRef<HTMLElement | null>(null);
   const localTrashResetDialogRef = useRef<HTMLElement | null>(null);
   const localTrashResetCancelRef = useRef<HTMLButtonElement | null>(null);
   const localTrashResetReturnFocusRef = useRef<HTMLElement | null>(null);
@@ -3405,6 +3410,7 @@ function App() {
     setPendingOpenPlan(null);
     setPendingPreflightOpen(null);
     setPendingPlannedRepair(null);
+    setPendingPlannedDelete(null);
     repairConfirmReturnFocusRef.current = null;
     setPendingWorkspaceFlowOwnerId(null);
     finishExternalPstRequest(pstPath);
@@ -3513,6 +3519,7 @@ function App() {
     setPendingPreflightOpen(null);
     setPendingOpenPlan(null);
     setPendingPlannedRepair(null);
+    setPendingPlannedDelete(null);
     setPendingWorkspaceFlowOwnerId(null);
     setIsBusy(true);
 
@@ -4077,6 +4084,7 @@ function App() {
         setPendingOpenPlan(null);
         setPendingPreflightOpen(null);
         setPendingPlannedRepair(null);
+        setPendingPlannedDelete(null);
         repairConfirmReturnFocusRef.current = null;
         setPendingWorkspaceFlowOwnerId(null);
         if (pendingPstPath) finishExternalPstRequest(pendingPstPath);
@@ -4718,6 +4726,7 @@ function App() {
     setPendingOpenPlan(null);
     setPendingPreflightOpen(null);
     setPendingPlannedRepair(null);
+    setPendingPlannedDelete(null);
     setPendingWorkspaceFlowOwnerId(null);
   }
 
@@ -4742,6 +4751,7 @@ function App() {
     setPendingPreflightOpen(null);
     setPendingOpenPlan(null);
     setPendingPlannedRepair(null);
+    setPendingPlannedDelete(null);
     setPendingWorkspaceFlowOwnerId(null);
     setIsBusy(true);
 
@@ -4996,6 +5006,7 @@ function App() {
       rememberRecentPst(nextWorkspace.pstPath);
       setPendingOpenPlan(null);
       setPendingPlannedRepair(null);
+      setPendingPlannedDelete(null);
       setPendingWorkspaceFlowOwnerId(null);
       setReadpstStatus(await invoke<ReadpstStatus>("check_readpst"));
       if (nextWorkspace.id !== targetWorkspaceId) {
@@ -5308,8 +5319,8 @@ function App() {
   }
 
   function confirmPlannedWorkspaceRepair() {
-    if (!pendingPlannedRepair) return;
-    const pending = pendingPlannedRepair;
+    if (!visiblePendingPlannedRepair) return;
+    const pending = visiblePendingPlannedRepair;
     setPendingPlannedRepair(null);
     repairConfirmReturnFocusRef.current = null;
     void openPlannedPst(
@@ -5321,17 +5332,17 @@ function App() {
   }
 
   function closeVisibleRepairConfirmation() {
-    if (pendingPlannedRepair) {
+    if (visiblePendingPlannedRepair) {
       closePlannedWorkspaceRepairConfirmation();
-    } else if (workspace) {
+    } else if (workspace && repairConfirmOpen) {
       closeRepairWorkspaceConfirmation(workspace.id);
     }
   }
 
   function confirmVisibleRepair() {
-    if (pendingPlannedRepair) {
+    if (visiblePendingPlannedRepair) {
       confirmPlannedWorkspaceRepair();
-    } else if (workspace) {
+    } else if (workspace && repairConfirmOpen) {
       confirmRepairWorkspaceIndex(workspace.id);
     }
   }
@@ -6636,11 +6647,61 @@ function App() {
     }
   }
 
-  async function deletePlannedWorkspace(plan: PstOpenPlan, existing: ExistingWorkspace) {
-    const confirmed = window.confirm(
-      "Delete this PST QuickView workspace cache? Its app-only organization, including Local Trash state, will also be removed. The original PST will not be deleted.",
+  function requestPlannedWorkspaceDelete(
+    plan: PstOpenPlan,
+    existingWorkspace: ExistingWorkspace,
+    returnFocus: HTMLElement,
+  ) {
+    deleteConfirmReturnFocusRef.current = returnFocus;
+    setPendingPlannedDelete({ plan, existingWorkspace });
+    window.requestAnimationFrame(() => deleteConfirmCancelRef.current?.focus());
+  }
+
+  function closeVisibleDeleteConfirmation() {
+    if (visiblePendingPlannedDelete) setPendingPlannedDelete(null);
+    else if (workspace && deleteConfirmOpen) cancelDeleteCurrentWorkspace();
+    const returnFocus = deleteConfirmReturnFocusRef.current;
+    deleteConfirmReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) returnFocus.focus();
+    });
+  }
+
+  function confirmVisibleDelete() {
+    if (visiblePendingPlannedDelete) {
+      const pending = visiblePendingPlannedDelete;
+      setPendingPlannedDelete(null);
+      deleteConfirmReturnFocusRef.current = null;
+      void deletePlannedWorkspace(pending.plan, pending.existingWorkspace);
+    } else if (workspace && deleteConfirmOpen) {
+      deleteConfirmReturnFocusRef.current = null;
+      void confirmDeleteCurrentWorkspace();
+    }
+  }
+
+  function handleDeleteConfirmationKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeVisibleDeleteConfirmation();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(
+      deleteConfirmDialogRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled)") ?? [],
     );
-    if (!confirmed) return;
+    if (!focusable.length) return;
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  async function deletePlannedWorkspace(plan: PstOpenPlan, existing: ExistingWorkspace) {
     setError(null);
     setNotice(null);
     setForegroundOperationWorkspaceId(existing.workspaceId);
@@ -6695,7 +6756,7 @@ function App() {
     }
   }
 
-  async function deleteCurrentWorkspace() {
+  async function deleteCurrentWorkspace(returnFocus: HTMLElement) {
     if (!workspace) return;
     const workspaceId = workspace.id;
     if (isImporting || activeIntegrityOperationRunning) {
@@ -6714,6 +6775,8 @@ function App() {
       deleteStatuses: [],
       deleteConfirmOpen: true,
     });
+    deleteConfirmReturnFocusRef.current = returnFocus;
+    window.requestAnimationFrame(() => deleteConfirmCancelRef.current?.focus());
   }
 
   async function confirmDeleteCurrentWorkspace() {
@@ -7136,6 +7199,8 @@ function App() {
           {existing.canRepairIndex ? (
             <button
               type="button"
+              data-support-control="click"
+              data-support-recovery="open"
               onClick={(event) =>
                 requestPlannedWorkspaceRepair(plan, existing, event.currentTarget)
               }
@@ -7161,7 +7226,9 @@ function App() {
           <button
             type="button"
             className="danger-action"
-            onClick={() => void deletePlannedWorkspace(plan, existing)}
+            data-support-control="click"
+            data-support-recovery="open"
+            onClick={(event) => requestPlannedWorkspaceDelete(plan, existing, event.currentTarget)}
             disabled={isBusy || !existing.canReimport}
             title="Delete this workspace cache and its Local Trash state after confirmation. The original PST is not deleted."
           >
@@ -7401,6 +7468,9 @@ function App() {
   const visiblePendingPreflightOpen = pendingWorkspaceFlowVisible ? pendingPreflightOpen : null;
   const visiblePendingPlannedRepair = pendingWorkspaceFlowVisible
     ? pendingPlannedRepair
+    : null;
+  const visiblePendingPlannedDelete = pendingWorkspaceFlowVisible
+    ? pendingPlannedDelete
     : null;
   const pendingSelectedWorkspace =
     visiblePendingOpenPlan?.existingWorkspaces.find(
@@ -8062,9 +8132,12 @@ function App() {
                   <button
                     type="button"
                     className="danger-action"
-                    onClick={() => {
+                    data-support-control="click"
+                    data-support-recovery="open"
+                    onClick={(event) => {
+                      const returnFocus = activePopoverTriggerRef.current ?? event.currentTarget;
                       closeActivePopover();
-                      void deleteCurrentWorkspace();
+                      void deleteCurrentWorkspace(returnFocus);
                     }}
                     disabled={!workspace || isBusy || isImporting || activeIntegrityOperationRunning}
                     title={
@@ -8560,6 +8633,8 @@ function App() {
             {integrityActions.includes("repair_index") ? (
               <button
                 type="button"
+                data-support-control="click"
+                data-support-recovery="open"
                 aria-describedby={repairIndexDescriptionId}
                 onClick={(event) => requestRepairWorkspaceIndex(workspace.id, event.currentTarget)}
                 disabled={isBusy || isImporting || anyWorkspaceIntegrityOperationRunning}
@@ -8705,6 +8780,8 @@ function App() {
               <button
                 type="button"
                 ref={repairConfirmCancelRef}
+                data-support-control="click"
+                data-support-recovery="cancel"
                 onClick={closeVisibleRepairConfirmation}
               >
                 Cancel
@@ -8712,7 +8789,10 @@ function App() {
               <button
                 type="button"
                 className="primary-action"
-                onClick={confirmVisibleRepair}
+                data-support-recovery="confirm-local"
+                onClick={(event) => {
+                  if (event.nativeEvent.isTrusted) confirmVisibleRepair();
+                }}
               >
                 Repair Index
               </button>
@@ -9157,30 +9237,49 @@ function App() {
         </div>
       ) : null}
 
-      {deleteConfirmOpen && workspace ? (
-        <section className="delete-confirm-box" role="dialog" aria-label="Confirm workspace delete">
-          <div>
-            <strong>Delete current workspace?</strong>
-            <p>{workspace.workspacePath}</p>
-            <p>
-              The workspace cache, including its Local Trash sidecar and app-only organization,
-              will be removed. The original PST will not be deleted.
-            </p>
-          </div>
-          <div className="delete-confirm-actions">
-            <button type="button" onClick={cancelDeleteCurrentWorkspace} disabled={isBusy}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="danger-action"
-              onClick={() => void confirmDeleteCurrentWorkspace()}
-              disabled={isBusy}
-            >
-              Yes, delete workspace
-            </button>
-          </div>
-        </section>
+      {(deleteConfirmOpen && workspace) || visiblePendingPlannedDelete ? (
+        <div className="repair-confirm-backdrop">
+          <section
+            className="repair-confirm-dialog delete-confirm-box"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirm workspace delete"
+            ref={deleteConfirmDialogRef}
+            onKeyDown={handleDeleteConfirmationKeyDown}
+          >
+            <div>
+              <strong>Delete this workspace?</strong>
+              <p>{visiblePendingPlannedDelete?.existingWorkspace.workspacePath ?? workspace?.workspacePath}</p>
+              <p>
+                The workspace cache, including its Local Trash sidecar and app-only organization,
+                will be removed. The original PST will not be deleted.
+              </p>
+            </div>
+            <div className="delete-confirm-actions">
+              <button
+                type="button"
+                ref={deleteConfirmCancelRef}
+                data-support-control="click"
+                data-support-recovery="cancel"
+                onClick={closeVisibleDeleteConfirmation}
+                disabled={isBusy}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger-action"
+                data-support-recovery="confirm-local"
+                onClick={(event) => {
+                  if (event.nativeEvent.isTrusted) confirmVisibleDelete();
+                }}
+                disabled={isBusy}
+              >
+                Yes, delete workspace
+              </button>
+            </div>
+          </section>
+        </div>
       ) : null}
 
       {deleteResult ? (

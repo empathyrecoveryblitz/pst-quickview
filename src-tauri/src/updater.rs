@@ -23,6 +23,11 @@ const MANIFEST_LIMIT: usize = 64 * 1024;
 const ARTIFACT_LIMIT: usize = 25 * 1024 * 1024;
 const RESUME_MS: u64 = 90_000;
 const RESUME_CLOCK_MARGIN_MS: u64 = 5_000;
+// Private Keychain grants must not carry an older approval into a build with
+// wider controls. Revision 2 adds opening/cancelling recovery dialogs; grants
+// from support.1 (revision 1) require fresh local consent after installation.
+// This is independent of the unchanged v1 handoff/bootstrap wire contract.
+const CONTROL_APPROVAL_REVISION: u8 = 2;
 const CANDIDATE_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const KEYCHAIN_SERVICE: &str = "com.local.pstquickview.support-update-resume";
 const KEYCHAIN_ACCOUNT: &str = "single-use-v1";
@@ -540,7 +545,7 @@ fn grant_valid(
     executable_sha256: &str,
     identity: &(String, String, String),
 ) -> bool {
-    grant.v == 1
+    grant.v == CONTROL_APPROVAL_REVISION
         && grant.armed
         && valid_handoff(&grant.resume.handoff, now)
         && grant.boot == boot
@@ -920,7 +925,7 @@ fn prepare_handoff(
         resume_ticket_sha256: String::new(),
     };
     let grant = ResumeGrant {
-        v: 1,
+        v: CONTROL_APPROVAL_REVISION,
         armed: false,
         origin: parent.origin,
         operator_public_key: parent.operator_public_key,
@@ -1422,7 +1427,7 @@ mod tests {
         let version = value.target_version.clone();
         let executable = "b".repeat(64);
         let grant = ResumeGrant {
-            v: 1,
+            v: CONTROL_APPROVAL_REVISION,
             armed: true,
             origin: identity.0.clone(),
             operator_public_key: identity.1.clone(),
@@ -1450,6 +1455,20 @@ mod tests {
             &executable,
             &identity
         ));
+        for approval_revision in [0, 1, CONTROL_APPROVAL_REVISION + 1] {
+            let mut older_or_unknown_approval = grant.clone();
+            older_or_unknown_approval.v = approval_revision;
+            assert!(!grant_valid(
+                &older_or_unknown_approval,
+                "synthetic-boot",
+                1_001,
+                1_000_000,
+                &version,
+                &executable,
+                &identity
+            ));
+        }
+        assert_eq!(grant.resume.handoff.v, 1);
         assert!(launch_proof_valid(&grant, &"c".repeat(64)));
         assert!(!launch_proof_valid(&grant, ""));
         assert!(!launch_proof_valid(&grant, &"d".repeat(64)));

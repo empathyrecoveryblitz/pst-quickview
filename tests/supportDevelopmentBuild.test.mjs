@@ -8,8 +8,8 @@ test('development Mac build identity increments within the three significant bun
   const config = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const bundleVersion = config.bundle.macOS.bundleVersion;
   assert.match(bundleVersion, /^\d+\.\d+\.\d+$/);
-  assert.equal(bundleVersion, '0.2.301');
-  assert.equal(config.version, '0.2.0-beta.3.support.1');
+  assert.equal(bundleVersion, '0.2.302');
+  assert.equal(config.version, '0.2.0-beta.3.support.2');
   assert.ok(Number(bundleVersion.split('.')[2]) > 0);
 });
 test('development workflow is Mac app-only, unsigned, and has no release or tag authority', () => {

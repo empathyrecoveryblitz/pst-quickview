@@ -1,7 +1,7 @@
 # Approved app-only Remote Support
 
 This is an implementation candidate, not a packaged-Mac acceptance result.
-The current development version is `0.2.0-beta.3.support.1`. The verified
+The current development version is `0.2.0-beta.3.support.2`. The verified
 updater and update/resume revision still need fresh native, package, and
 genuine-Mac installation/restart validation. No current CI pass or readiness
 claim is implied by this document.
@@ -56,7 +56,11 @@ Private invitation/Stop UI is excluded. Ellipsized and occluded content is
 conservatively omitted. Complex CSS may be represented incompletely.
 
 The technician can use explicitly marked search, view/layout selectors, folder
-navigation, result/conversation selection, reader modes, and scrolling. No
+navigation, result/conversation selection, reader modes, and scrolling. The
+helper can also open and cancel the app's Repair/Delete recovery dialogs.
+Opening a dialog performs no repair or deletion. Confirmation requires trusted
+local input on the Mac; confirmation buttons are excluded from remote control.
+No
 arbitrary selector, script, key event, OS command, filesystem API, export,
 attachment opening, workspace mutation/deletion, or native-dialog operation is
 available through the support protocol. The owner must perform operations
@@ -65,12 +69,29 @@ arbitrary fix. The separately approved updater can install only a verified
 development app archive, not a script, terminal command, extension, or new
 remote-control permission.
 
+### Local sharing-failure notices
+
+The owner sees a fixed, theme-readable category if capture/publication fails:
+`S01` for a capture exception, `S02` for a native frame rejection, `S03` when the
+native session has already ended, and `S04` for an otherwise unclassified
+publication failure. These notices never include raw errors, paths or message
+content and are excluded from the shared view. A category identifies the failed
+operation, not necessarily the initial cause; for example, `S03` can follow a
+separate transport or watchdog shutdown. All such failures still revoke access
+and require fresh local approval. They do not enable automatic reconnection.
+
 ## Owner-approved development updates
 
 The first updater-capable PST QuickView build must be installed manually on
 the Mac. An older app cannot gain an updater merely because a server was
 changed. After that initial install, a future verified correction can be
 offered through the app without another manual replacement download.
+
+Upgrading from `support.1` to `support.2` requires fresh support approval after
+restart because recovery-dialog controls expand the approved app controls.
+Choose the update without resumption for this transition, then request support
+again. The local grant approval revision rejects older-scope grants; subsequent
+updates with the same approved control scope can still resume as described below.
 
 1. The owner opens **Help → About PST QuickView → Development updates** and
    chooses **Check for a development update**. There is no periodic update

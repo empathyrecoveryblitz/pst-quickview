@@ -26,6 +26,9 @@ run_frontend_security_tests() {
     tests/loggingPrivacy.test.mjs \
     tests/runtimeProfileIsolation.test.mjs \
     tests/remoteSupport.test.mjs \
+    tests/recoveryControls.test.mjs \
+    tests/pstPlanningDispatch.test.mjs \
+    tests/supportFailureNotice.test.mjs \
     tests/developmentUpdateUI.test.mjs \
     tests/developmentUpdateDispatch.test.mjs \
     tests/packagedCspInspection.test.mjs \

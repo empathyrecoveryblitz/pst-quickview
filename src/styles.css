@@ -3679,9 +3679,9 @@ label {
 .remote-support textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 8px; resize: vertical; }
 .support-approval { display: flex; align-items: flex-start; gap: 8px; }
 .support-approval input { flex-shrink: 0; margin-top: 4px; }
-.support-live-banner { position: fixed; inset: auto 12px 12px 12px; z-index: 2147483647; display: flex; gap: 16px; align-items: center; justify-content: space-between; padding: 12px 16px; color: var(--color-text-primary); background: var(--color-surface, #fff); border: 3px solid #bb5f00; border-radius: 8px; box-shadow: 0 2px 12px #0004; font-size: 13px; }
+.support-live-banner { position: fixed; inset: auto 12px 12px 12px; z-index: 2147483647; display: flex; gap: 16px; align-items: center; justify-content: space-between; padding: 12px 16px; color: var(--color-text-primary); background: var(--color-panel-background); border: 3px solid #bb5f00; border-radius: 8px; box-shadow: 0 2px 12px #0004; font-size: 13px; }
 .support-live-banner button { flex-shrink: 0; min-height: 40px; font-weight: 700; }
-.support-stop-notice { position: fixed; bottom: 4px; right: 12px; z-index: 2147483646; background: var(--color-surface, #fff); padding: 8px; }
+.support-stop-notice { position: fixed; bottom: 12px; right: 12px; z-index: 2147483646; max-width: min(560px, calc(100vw - 24px)); box-sizing: border-box; margin: 0; color: var(--color-text-primary); background: var(--color-panel-background); border: 1px solid var(--color-separator-strong); border-radius: 8px; padding: 12px; }
 
 .remote-support-content {
   display: grid;

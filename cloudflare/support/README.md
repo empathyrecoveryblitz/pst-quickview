@@ -36,7 +36,7 @@ Do not fetch replacement trust pins from this service. Rotation requires a
 separately reviewed app configuration update. Preserve disabled observability,
 invocation logs, Logpush, previews and CLI metrics; do not add log or tail sinks.
 
-The current development app version is `0.2.0-beta.3.support.1`. The update and
+The current development app version is `0.2.0-beta.3.support.2`. The update and
 continuity implementation is staged source, not evidence that its Mac build,
 packaged installation, Keychain, restart, or genuine-Mac support gates passed.
 The first updater-capable app needs a manual installation; only later verified
@@ -84,6 +84,9 @@ The owner must choose an update and confirm installation in a native dialog.
 These controls are not remotely actionable. Updating does not grant the helper
 a terminal, arbitrary code execution, desktop access, or additional app controls.
 Without explicit update-resume approval, support stops at the update.
+The local continuation grant also binds the approved control scope. The
+`support.1` to `support.2` transition requires a fresh owner approval after
+restart; changing that local approval revision does not change wire version 1.
 
 The canonical handoff order is
 `v,parentId,parentSid,nonce,targetVersion,artifactSha256,nativeSessionId,originalExpires,resumeDeadline,resumeTicketSha256`.

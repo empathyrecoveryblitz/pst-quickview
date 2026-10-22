@@ -2092,14 +2092,37 @@ fn focus_preview_window(window: &tauri::WebviewWindow) -> AppResult<()> {
 }
 
 #[tauri::command]
-fn plan_pst_open(
-    state: State<AppState>,
+async fn plan_pst_open(
+    state: State<'_, AppState>,
     path: String,
     workspace_location_mode: String,
 ) -> AppResult<PstOpenPlan> {
-    let profile_paths = state.runtime_profile()?.paths();
+    let profile_paths = state.runtime_profile()?.paths().clone();
     let mode = WorkspaceLocationMode::from_arg(&workspace_location_mode)?;
-    let identity = identify_pst(&PathBuf::from(path))?;
+    run_pst_planning_worker(move || {
+        plan_pst_open_blocking(&profile_paths, &PathBuf::from(path), mode)
+    })
+    .await
+}
+
+async fn run_pst_planning_worker<F>(work: F) -> AppResult<PstOpenPlan>
+where
+    F: FnOnce() -> AppResult<PstOpenPlan> + Send + 'static,
+{
+    // Fingerprinting and existing-index inspection can be slow on external
+    // storage. Keep them off the IPC dispatcher so support heartbeats and
+    // ordinary window interaction can continue while planning is in progress.
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|_| AppError::new("PST planning worker could not complete."))?
+}
+
+fn plan_pst_open_blocking(
+    profile_paths: &RuntimeProfilePaths,
+    path: &Path,
+    mode: WorkspaceLocationMode,
+) -> AppResult<PstOpenPlan> {
+    let identity = identify_pst(path)?;
     let selection = select_workspace(profile_paths, &identity, mode)?;
     let preflight = workspace_preflight(&identity, &selection);
     let mut existing_workspaces = find_existing_workspaces(profile_paths, &identity)?
@@ -20663,6 +20686,97 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn pst_planning_yields_while_the_storage_worker_is_busy() {
+        use std::{
+            future::Future,
+            sync::mpsc,
+            task::{Context, Waker},
+        };
+
+        let caller_thread = thread::current().id();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut planning = Box::pin(run_pst_planning_worker(move || {
+            started_tx.send(thread::current().id()).unwrap();
+            // Bound the wait so a regression that runs this closure inline
+            // fails the test instead of hanging the test process.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            Err(AppError::new("Synthetic planning result."))
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        let first_poll = planning.as_mut().poll(&mut context);
+        let worker_thread = started_rx.recv_timeout(Duration::from_secs(3));
+        let _ = release_tx.send(());
+
+        assert!(
+            first_poll.is_pending(),
+            "planning must release the IPC task"
+        );
+        assert_ne!(worker_thread.unwrap(), caller_thread);
+        let error = tauri::async_runtime::block_on(planning).err().unwrap();
+        assert_eq!(error.message, "Synthetic planning result.");
+    }
+
+    #[test]
+    fn pst_planning_worker_preserves_source_and_incomplete_index() {
+        let root = temporary_test_directory("synthetic-pst-planning-worker");
+        let profile = synthetic_runtime_profile(&root);
+        let source = root.join("synthetic.pst");
+        fs::write(&source, b"!BDNsynthetic source for workspace planning").unwrap();
+        let identity = identify_pst(&source).unwrap();
+        let workspace = workspaces_dir(profile.paths())
+            .unwrap()
+            .join(&identity.workspace_id);
+        ensure_workspace_marker(
+            &workspace,
+            &identity.workspace_id,
+            &identity,
+            WorkspaceLocationMode::AppSupport,
+        )
+        .unwrap();
+        let index = workspace.join("index.sqlite");
+        let connection = Connection::open(&index).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY);
+             INSERT INTO messages (id) VALUES (1), (2);
+             CREATE TABLE import_metadata (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO import_metadata (key, value) VALUES ('import_status', 'incomplete');",
+            )
+            .unwrap();
+        drop(connection);
+        let protected = [source.clone(), workspace.join(WORKSPACE_MARKER_FILE), index];
+        let file_identity = |path: &PathBuf| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                sha256_file(path).unwrap(),
+                metadata.len(),
+                metadata.modified().unwrap(),
+            )
+        };
+        let before = protected.iter().map(file_identity).collect::<Vec<_>>();
+        let profile_paths = profile.paths().clone();
+        let plan = tauri::async_runtime::block_on(run_pst_planning_worker(move || {
+            plan_pst_open_blocking(&profile_paths, &source, WorkspaceLocationMode::AppSupport)
+        }))
+        .unwrap();
+
+        assert_eq!(plan.workspace_id, identity.workspace_id);
+        assert_eq!(plan.fingerprint, identity.content_fingerprint);
+        assert_eq!(plan.selected_workspace_location_mode, "app_support");
+        assert_eq!(Path::new(&plan.selected_workspace_path), workspace);
+        assert_eq!(plan.existing_workspaces.len(), 1);
+        assert_eq!(plan.existing_workspaces[0].message_count, 2);
+        assert_eq!(plan.existing_workspaces[0].import_status, "incomplete");
+        assert!(!plan.existing_workspaces[0].is_complete);
+        assert_eq!(
+            before,
+            protected.iter().map(file_identity).collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn synthetic_workspace_delete_fixture(name: &str) -> (PathBuf, ActiveWorkspace) {

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createSupportView } from "./supportView";
+import { supportSharingFailureNotice } from "./supportFailureNotice";
 export type SupportSession = { sessionId: string; expiresAt: number; operatorLabel: string; updating?: boolean };
 export const SUPPORT_SESSION_CHANGED = "pst-support-session-changed";
 
@@ -39,8 +40,12 @@ export function RemoteSupportControl() {
     async function publish() {
       const current = active.current, capture = view.current;
       if (!current || current.updating || !capture || publishing || document.hidden || stopping.current || !listenerReady || !healthy) return; publishing = true;
-      try { await invoke("publish_support_frame", { sessionId: current.sessionId, frame: capture.capture() }); }
-      catch { revoked.current.add(current.sessionId); clear(); void invoke("stop_support_session", { sessionId: current.sessionId }).catch(() => {}); setNotice("Support sharing stopped. Open Help to start a new approved session."); }
+      let stage: "capture" | "publish" = "capture";
+      try {
+        const frame = capture.capture(); stage = "publish";
+        await invoke("publish_support_frame", { sessionId: current.sessionId, frame });
+      }
+      catch (error) { revoked.current.add(current.sessionId); clear(); void invoke("stop_support_session", { sessionId: current.sessionId }).catch(() => {}); setNotice(supportSharingFailureNotice(stage, error)); }
       finally { publishing = false; }
     }
     const statusTimer = window.setInterval(() => void status(), 1000), frameTimer = window.setInterval(() => void publish(), 550);

@@ -24,6 +24,15 @@ const pair = async (overrides = {}) => {
   ]);
 };
 
+async function within(promise, label, describe = () => '') {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Synthetic peer timed out: ${label}. ${describe()}`)), 5000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
 test('only canonical public IPv4 UDP srflx candidates leave the browser', () => {
   const clean = sanitizeCandidate(rawCandidate, { role: 'controller', expectedExit: exit });
   assert.deepEqual(clean, {
@@ -326,7 +335,7 @@ test('peer starts STUN only after local and remote approval and Stop closes imme
     assert.equal(await peer.approve(), true);
     assert.equal(peers, 0);
     releasePoll(makeResponse({ messages: [approval], expiresAt: cfg.expires }));
-    await negotiation;
+    await within(negotiation, 'negotiation', () => JSON.stringify(reasons));
     assert.equal(peers, 1);
     peer.close();
     assert.equal(closures, 1);
@@ -381,10 +390,10 @@ test('queued trickle candidates stay ahead of end while the first delivery is pe
     const { createSupportPeer } = await import('../public/support/peer.js');
     peer = await createSupportPeer({ config: cfg });
     await peer.approve();
-    await firstDelivery;
+    await within(firstDelivery, 'first trickle delivery');
     pc.onicecandidate({ candidate: null });
     releaseCandidate();
-    await complete;
+    await within(complete, 'end of trickle delivery');
     assert.deepEqual(kinds, ['approved', 'offer', 'candidate', 'candidate', 'end']);
     peer.close();
     await new Promise(resolve => setTimeout(resolve, 5));
@@ -403,9 +412,13 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
   const queues = { controller: [], guest: [] }, pcs = [], frames = [], actions = [], reasons = [];
   const handoffs = [], acks = [];
   let controller, guest, controllerConnected, guestConnected, frameReceived, actionReceived;
+  let handoffReceived, ackReceived, updateRejected;
   const connected = [new Promise(resolve => { controllerConnected = resolve; }), new Promise(resolve => { guestConnected = resolve; })];
   const nextFrame = new Promise(resolve => { frameReceived = resolve; });
   const nextAction = new Promise(resolve => { actionReceived = resolve; });
+  const nextHandoff = new Promise(resolve => { handoffReceived = resolve; });
+  const nextAck = new Promise(resolve => { ackReceived = resolve; });
+  const rejectedUpdate = new Promise(resolve => { updateRejected = resolve; });
   const response = value => new Response(JSON.stringify(value), { status: 200 });
   class FakeChannel {
     constructor(label, options) {
@@ -464,18 +477,18 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
       return response({ messages: queues[role === 'controller' ? 'guest' : 'controller'].filter(message => message.seq > after), expiresAt: controllerConfig.expires });
     };
     const { createSupportPeer } = await import('../public/support/peer.js');
-    controller = await createSupportPeer({ config: controllerConfig, queue, onUpdateHandoff: value => handoffs.push(value), onState: state => { if (state === 'connected') controllerConnected(); }, onFrame: value => { frames.push(value); frameReceived(); }, onClose: reason => reasons.push(['controller', reason]) });
-    guest = await createSupportPeer({ config: guestConfig, queue, onUpdateHandoffAck: value => acks.push(value), onState: state => { if (state === 'connected') guestConnected(); }, onAction: value => { actions.push(value); actionReceived(); }, onClose: reason => reasons.push(['guest', reason]) });
+    controller = await createSupportPeer({ config: controllerConfig, queue, onUpdateHandoff: value => { handoffs.push(value); handoffReceived(); }, onState: state => { if (state === 'connected') controllerConnected(); }, onFrame: value => { frames.push(value); frameReceived(); }, onClose: reason => reasons.push(['controller', reason]) });
+    guest = await createSupportPeer({ config: guestConfig, queue, onUpdateHandoffAck: value => { acks.push(value); ackReceived(); }, onState: state => { if (state === 'connected') guestConnected(); }, onAction: value => { actions.push(value); actionReceived(); }, onClose: reason => { reasons.push(['guest', reason]); if (reason === 'update') updateRejected(); } });
     await controller.approve(); await guest.approve();
-    await Promise.all(connected);
+    await within(Promise.all(connected), 'connected', () => JSON.stringify(reasons));
     assert.equal(controller.sendFrame(frame()), false);
     assert.equal(guest.sendAction(action('click')), false);
     assert.equal(guest.sendFrame(frame()), true);
     assert.equal(guest.sendFrame({ ...frame(), id: '3'.repeat(32) }), false);
-    await nextFrame;
+    await within(nextFrame, 'frame', () => JSON.stringify(reasons));
     assert.deepEqual(frames, [frame()]);
     assert.equal(controller.sendAction(action('input')), true);
-    await nextAction;
+    await within(nextAction, 'action', () => JSON.stringify(reasons));
     assert.deepEqual(actions, [action('input')]);
     assert.equal(controller.suspendForUpdate(), false); assert.equal(guest.suspendForUpdate(), false);
     if (updating) {
@@ -485,12 +498,12 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
       assert.equal(guest.sendUpdateHandoff({ ...packet, handoff: { ...packet.handoff, parentId: '0'.repeat(32) } }), false);
       assert.equal(guest.sendUpdateHandoff(packet), true);
       assert.equal(guest.sendFrame(frame()), false);
-      await new Promise(resolve => setTimeout(resolve, 5));
+      await within(nextHandoff, 'update handoff', () => JSON.stringify(reasons));
       assert.deepEqual(handoffs, [packet]); assert.equal(controller.sendAction(action('click')), false);
       assert.equal(guest.suspendForUpdate(), false);
       if (mode === 'forged ACK') {
         pcs[0].channel.send(JSON.stringify({ type: 'update-handoff-ack', nonce: packet.handoff.nonce, proof: '0'.repeat(64) }));
-        await new Promise(resolve => setTimeout(resolve, 10));
+        await within(rejectedUpdate, 'forged update rejection', () => JSON.stringify(reasons));
         assert.deepEqual(acks, []); assert.equal(guest.suspendForUpdate(), false);
         assert.ok(reasons.some(([role, reason]) => role === 'guest' && reason === 'update'));
         assert.equal(controller.sendAction(action('click')), false); return;
@@ -498,7 +511,7 @@ for (const mode of ['stop', 'update', 'forged ACK']) test(mode === 'forged ACK' 
       assert.equal(await controller.sendUpdateHandoffAck({ nonce: packet.handoff.nonce, proof: '0'.repeat(64) }), false);
       const ack = { nonce: packet.handoff.nonce, proof: await ackProof(packet.resumeAuth, packet.handoff) };
       assert.equal(await controller.sendUpdateHandoffAck(ack), true);
-      await new Promise(resolve => setTimeout(resolve, 5));
+      await within(nextAck, 'authenticated update ACK', () => JSON.stringify(reasons));
       assert.deepEqual(acks, [ack]); assert.equal(await controller.sendUpdateHandoffAck(ack), false);
       const setupCounts = [queues.controller.length, queues.guest.length];
       assert.equal(guest.suspendForUpdate(), true);

@@ -73,6 +73,42 @@ test('visible-only inert frame is accepted by the wire validator', () => {
   assert.equal(frame.targets.length, 1); assert.equal(frame.targets[0].kind, 'click');
   assert.equal(f.view.apply({ frame: frame.id, target: frame.targets[0].id, kind: 'click' }), true); assert.equal(f.button.clicks, 1);
 });
+test('capture keeps zero, nonfinite and oversized viewport dimensions within the protocol', () => {
+  for (const value of [0, -1, NaN, Infinity, -Infinity, undefined, 0.5, 8192]) {
+    const f = fixture();
+    f.doc.defaultView.innerWidth = value; f.doc.defaultView.innerHeight = value;
+    const frame = f.view.capture();
+    assertSafeFrame(frame);
+    const valid = Number.isFinite(value) && value > 0;
+    assert.equal(frame.width, valid ? Math.min(4096, Math.max(1, value)) : 1280);
+    assert.equal(frame.height, valid ? Math.min(2160, Math.max(1, value)) : 820);
+    if (!valid) { assert.deepEqual(frame.items, []); assert.deepEqual(frame.targets, []); }
+  }
+});
+test('capture omits unsupported colors without exporting potentially invisible text', () => {
+  for (const value of ['rgb(20%, 20%, 20%)', '#12345', '#1234567', 'rgb(256, 20, 20)', 'rgb(12.5, 20, 20)', 'rgb(20 20 20)', 'rgba(20, 20, 20, 1.1)', 'rgba(20, 20, 20, 0.123456)', 'color(srgb 0 0 0 / 0)']) {
+    const f = fixture('HIDDEN_UNSUPPORTED_COLOR');
+    f.body.style.backgroundColor = value; f.paragraph.style.color = value;
+    const frame = f.view.capture();
+    assertSafeFrame(frame);
+    assert.doesNotMatch(texts(frame), /HIDDEN_UNSUPPORTED_COLOR/);
+  }
+  for (const value of ['rgba(20, 20, 20, 0)', 'rgba(20, 20, 20, .0000)', 'transparent', 'color(srgb 0 0 0 / 0)']) {
+    const f = fixture();
+    const select = f.body.add(new S('select', 10, 110, 400, 30));
+    select.style.color = value; select.selectedOptions = [{ textContent: 'HIDDEN_SELECTED_TEXT' }];
+    const frame = f.view.capture();
+    assertSafeFrame(frame);
+    assert.doesNotMatch(texts(frame), /HIDDEN_SELECTED_TEXT/);
+  }
+});
+test('backward overlapping visible glyphs keep a nonnegative union rectangle', () => {
+  const f = fixture('AB'); f.button.style.display = 'none';
+  f.doc.rangeRect = (node, start) => ({ x: 30 - start, y: 20, width: 0.5, height: 16 });
+  const frame = f.view.capture();
+  assertSafeFrame(frame);
+  assert.deepEqual(frame.items.filter(item => item.kind === 'text').map(({ x, y, w, h, text }) => ({ x, y, w, h, text })), [{ x: 29, y: 20, w: 1.5, h: 16, text: 'AB' }]);
+});
 test('private, offscreen, transparent and occluded text is not exported', () => {
   const f = fixture('Visible');
   const add = (marker, y) => { const el = f.body.add(new E('p', 10, y, 400, 20)); el.add({ nodeType: 3, textContent: marker, x: 10, y }); return el; };
